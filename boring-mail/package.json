@@ -1,0 +1,38 @@
+{
+  "name": "@hachej/boring-mail",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "description": "Agent-native Boring UI mail workbench plugin with .mail.md draft surfaces and an agent mail tool.",
+  "exports": {
+    "./front": "./src/boring-ui/front.tsx",
+    "./server": "./src/boring-ui/server.ts",
+    "./mail-agent-tool": "./src/mail/server/mailAgentTool.ts"
+  },
+  "boring": {
+    "id": "boring-mail",
+    "label": "Mail",
+    "front": "src/boring-ui/front.tsx",
+    "server": "src/boring-ui/server.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run -c vitest.config.ts",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@hachej/boring-workspace": "workspace:*",
+    "lucide-react": "^1.21.0",
+    "react": "^19.2.7"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^22.20.0",
+    "@types/react": "^19.2.17",
+    "jsdom": "^29.0.2",
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

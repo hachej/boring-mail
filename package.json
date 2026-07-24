@@ -1,0 +1,15 @@
+{
+  "name": "boring-mail-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Workspace for the Boring Mail plugin and standalone playground.",
+  "scripts": {
+    "dev": "pnpm --filter @hachej/boring-mail-playground dev",
+    "build": "pnpm --filter @hachej/boring-mail-playground build",
+    "typecheck": "pnpm --filter @hachej/boring-mail typecheck && pnpm --filter @hachej/boring-mail-playground typecheck",
+    "test": "pnpm --filter @hachej/boring-mail test",
+    "lint": "pnpm run typecheck"
+  }
+}

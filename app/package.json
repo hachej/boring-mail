@@ -1,0 +1,31 @@
+{
+  "name": "@hachej/boring-mail-playground",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Standalone playground app for the Boring Mail workspace plugin.",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@hachej/boring-agent": "workspace:*",
+    "@hachej/boring-ask-user": "workspace:*",
+    "@hachej/boring-mail": "workspace:*",
+    "@hachej/boring-workspace": "workspace:*",
+    "@vitejs/plugin-react": "^4.0.0",
+    "lucide-react": "^1.21.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "typescript": "~6.0.3",
+    "vite": "^8.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.0.0"
+  }
+}

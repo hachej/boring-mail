@@ -1,0 +1,654 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-width: 980px;
+  overflow: hidden;
+}
+
+#root {
+  min-width: 0;
+  min-height: 0;
+}
+
+button, input, select, textarea { font: inherit; }
+button { cursor: pointer; }
+
+.app-shell { display: grid; grid-template-columns: 56px 360px minmax(0, 1fr); height: 100vh; background: #111; }
+.app-rail { border-right: 1px solid #2a2825; background: #0b0b0c; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 12px 8px; }
+.brand { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: #f97316; color: #180a02; font-weight: 800; letter-spacing: -0.08em; }
+.rail-button { width: 38px; height: 38px; border: 0; border-radius: 11px; background: transparent; color: #aaa29a; }
+.rail-button.active, .rail-button:hover { background: #27231f; color: #fff7ed; }
+
+.mail-source-pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid #2a2825; background: #181716; }
+.source-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px; border-bottom: 1px solid #2a2825; }
+.source-title { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+.secondary-button, .primary-button, .icon-button { border: 1px solid #3a352f; background: #211f1d; color: #f4f1ec; border-radius: 8px; padding: 7px 10px; display: inline-flex; align-items: center; gap: 6px; }
+.secondary-button:hover, .icon-button:hover { background: #2d2924; }
+.primary-button { border-color: #f97316; background: #f97316; color: #1c0a02; font-weight: 700; }
+.search-box { display: flex; align-items: center; gap: 8px; margin: 10px 12px; padding: 8px 10px; border: 1px solid #332f2b; border-radius: 9px; background: #100f0e; color: #948b82; }
+.search-box input { min-width: 0; flex: 1; color: #f4f1ec; background: transparent; border: 0; outline: 0; }
+.source-controls { display: flex; gap: 8px; padding: 0 12px 8px; }
+.source-controls select { flex: 1; min-width: 0; border: 1px solid #332f2b; border-radius: 8px; background: #100f0e; color: #f4f1ec; padding: 7px 8px; }
+.icon-button { padding: 6px; }
+.tag-scroll { display: flex; gap: 6px; overflow-x: auto; padding: 0 12px 10px; }
+.tag-chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; border: 1px solid #332f2b; border-radius: 999px; background: #100f0e; color: #a9a19a; padding: 4px 8px; font-size: 12px; }
+.tag-chip.selected { border-color: #f97316; color: #fed7aa; background: #431407; }
+.thread-list { min-height: 0; overflow: auto; }
+.thread-row { width: 100%; display: flex; gap: 8px; border: 0; border-bottom: 1px solid #2a2825; background: transparent; color: inherit; text-align: left; padding: 11px 12px; }
+.thread-row:hover { background: #22201d; }
+.unread-dot { width: 8px; height: 8px; border-radius: 999px; margin-top: 7px; background: #57504a; flex: 0 0 auto; }
+.unread-dot.active { background: #f97316; }
+.thread-row-main { min-width: 0; flex: 1; display: grid; gap: 3px; }
+.thread-row-meta { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+.thread-row-meta strong, .thread-subject { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-row-meta time { margin-left: auto; color: #8a8179; }
+.star { fill: #facc15; color: #facc15; }
+.thread-subject { font-size: 13px; color: #eee7df; }
+.thread-subject.unread { font-weight: 800; }
+.thread-snippet { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: #9b928a; font-size: 12px; line-height: 1.35; }
+.thread-tags { display: flex; gap: 4px; overflow: hidden; }
+.thread-tags small, .thread-panel-tags small { border: 1px solid #3a352f; border-radius: 999px; color: #b8afa6; padding: 1px 6px; font-size: 10px; }
+.empty-state { padding: 18px; color: #9b928a; font-size: 13px; text-align: center; }
+
+.workbench { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); background: #0f0f10; }
+.workbench-topbar { height: 48px; display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 0 16px; border-bottom: 1px solid #2a2825; }
+.workbench-topbar div { display: flex; gap: 10px; align-items: baseline; }
+.workbench-topbar span, .workbench-topbar small { color: #9b928a; font-size: 12px; }
+.tabbar { height: 39px; display: flex; align-items: end; gap: 2px; padding: 0 8px; border-bottom: 1px solid #2a2825; background: #141312; overflow-x: auto; }
+.tab { max-width: 260px; min-width: 120px; display: flex; justify-content: space-between; gap: 8px; align-items: center; border: 1px solid #2a2825; border-bottom: 0; border-radius: 8px 8px 0 0; background: #1a1816; color: #bfb7af; padding: 8px 10px; }
+.tab.active { background: #0f0f10; color: #fff7ed; }
+.tab span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab em { font-style: normal; color: #8a8179; }
+.no-tabs { color: #8a8179; font-size: 13px; padding: 0 8px 11px; }
+.tab-content { min-height: 0; overflow: hidden; }
+.empty-workbench { height: 100%; display: grid; place-content: center; text-align: center; color: #9b928a; padding: 32px; }
+.empty-workbench h1 { margin: 0 0 8px; color: #f4f1ec; }
+
+.mail-thread-panel { height: 100%; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.thread-panel-header { display: flex; justify-content: space-between; gap: 16px; padding: 18px 22px; border-bottom: 1px solid #2a2825; }
+.thread-panel-header h1 { margin: 0; font-size: 24px; letter-spacing: -0.03em; }
+.thread-panel-header p { margin: 5px 0; color: #9b928a; font-size: 13px; }
+.thread-panel-tags { display: flex; gap: 5px; flex-wrap: wrap; }
+.thread-panel-body { min-height: 0; overflow: auto; padding: 18px 22px 40px; }
+.message-card, .mail-draft-editor { border: 1px solid #2f2b27; border-radius: 14px; background: #181716; box-shadow: 0 12px 30px rgb(0 0 0 / 18%); margin-bottom: 16px; }
+.message-card { padding: 16px; }
+.message-header { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 14px; font-size: 14px; }
+.message-header span, .message-header p, .message-header time { color: #9b928a; font-size: 12px; margin: 2px 0 0; }
+.message-text { white-space: pre-wrap; line-height: 1.7; }
+.message-html { line-height: 1.65; }
+.attachment-list { display: grid; gap: 8px; margin-top: 14px; }
+.attachment-pill { display: flex; align-items: center; gap: 8px; border: 1px solid #3a352f; border-radius: 9px; background: #100f0e; padding: 9px 10px; font-size: 12px; }
+.attachment-pill span { margin-left: auto; color: #9b928a; }
+.missing-thread { height: 100%; display: grid; place-items: center; color: #9b928a; }
+
+.mail-draft-editor { overflow: hidden; }
+.draft-topbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; padding: 12px; border-bottom: 1px solid #2f2b27; }
+.draft-fields { display: grid; gap: 7px; }
+.address-field { display: flex; align-items: center; gap: 9px; }
+.address-field span { width: 56px; color: #9b928a; font-size: 12px; }
+.address-field input { flex: 1; min-width: 0; border: 1px solid #332f2b; border-radius: 8px; background: #100f0e; color: #f4f1ec; padding: 7px 9px; }
+.mock-sent-banner { margin: 10px 12px 0; border: 1px solid #f9731633; background: #431407; color: #fed7aa; border-radius: 9px; padding: 8px 10px; font-size: 12px; }
+.draft-body-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-height: 330px; }
+.draft-pane { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; border-right: 1px solid #2f2b27; }
+.draft-pane > span { padding: 9px 12px; color: #9b928a; font-size: 12px; border-bottom: 1px solid #2f2b27; }
+.draft-pane textarea { resize: none; width: 100%; min-height: 280px; border: 0; outline: 0; background: #100f0e; color: #f4f1ec; padding: 14px; line-height: 1.6; }
+.draft-preview { border-right: 0; }
+.draft-preview div { padding: 14px; line-height: 1.6; overflow: auto; }
+.draft-preview code { background: #2a2825; padding: 1px 4px; border-radius: 4px; }
+
+/* Native Boring workspace integration: use host tokens instead of custom app chrome colors. */
+.mail-source-pane {
+  border-right-color: var(--border);
+  background: var(--surface-workbench-left, var(--background));
+  color: var(--foreground);
+}
+.source-header,
+.thread-row,
+.thread-panel-header,
+.draft-topbar,
+.draft-file-label {
+  border-color: var(--border);
+}
+.secondary-button,
+.icon-button,
+.search-box,
+.source-controls select,
+.tag-chip,
+.address-field input,
+.attachment-pill {
+  border-color: var(--border);
+  background: var(--background);
+  color: var(--foreground);
+}
+.secondary-button:hover,
+.icon-button:hover,
+.thread-row:hover {
+  background: var(--muted);
+}
+.primary-button {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.search-box,
+.thread-snippet,
+.thread-row-meta time,
+.message-header span,
+.message-header p,
+.message-header time,
+.thread-panel-header p,
+.address-field span,
+.empty-state,
+.missing-thread {
+  color: var(--muted-foreground);
+}
+.thread-subject,
+.message-card,
+.mail-draft-editor {
+  color: var(--foreground);
+}
+.thread-tags small,
+.thread-panel-tags small {
+  border-color: var(--border);
+  color: var(--muted-foreground);
+}
+.message-card,
+.mail-draft-editor {
+  border-color: var(--border);
+  background: var(--card);
+  color: var(--card-foreground);
+  box-shadow: none;
+}
+.attachment-pill {
+  background: var(--background);
+}
+.mock-sent-banner {
+  border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary);
+}
+.draft-markdown-shell {
+  display: grid;
+  grid-template-rows: auto minmax(360px, 1fr);
+  min-height: 420px;
+}
+.draft-file-label {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.draft-markdown-editor {
+  min-height: 360px;
+  border: 0;
+  border-radius: 0;
+}
+
+.draft-save-state {
+  margin: 8px 12px 0;
+  border-radius: 9px;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+.draft-save-state.saved {
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, transparent);
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  color: var(--primary);
+}
+.draft-save-state.error {
+  border: 1px solid color-mix(in srgb, var(--destructive) 28%, transparent);
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+  color: var(--destructive);
+}
+
+/* Mail compose should be the normal Markdown editor with only a compact mail header above it. */
+.mail-draft-editor {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  overflow: hidden;
+}
+.draft-topbar {
+  align-items: start;
+  padding: 8px 10px;
+  gap: 10px;
+  background: var(--background);
+}
+.draft-fields {
+  gap: 4px;
+}
+.address-field {
+  min-height: 24px;
+}
+.address-field span {
+  width: 46px;
+  font-size: 11px;
+}
+.address-field input {
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  padding: 3px 5px;
+  font-size: 12px;
+}
+.address-field input:focus {
+  outline: 1px solid color-mix(in srgb, var(--primary) 55%, transparent);
+  outline-offset: 1px;
+  background: var(--muted);
+}
+.mail-send-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+}
+.mail-send-button:hover {
+  filter: brightness(1.04);
+}
+.mail-draft-editor > .markdown-editor,
+.mail-draft-editor [data-testid="markdown-editor"] {
+  min-height: 360px;
+}
+
+/* Compact, Boring-native mail source density. */
+.mail-source-pane {
+  background: var(--surface-workbench-left, var(--background));
+  color: var(--foreground);
+}
+.source-header {
+  min-height: 36px;
+  padding: 8px 10px;
+  gap: 8px;
+}
+.source-title {
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--muted-foreground);
+}
+.source-header .secondary-button {
+  height: 26px;
+  border-radius: 999px;
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border-color: color-mix(in srgb, var(--primary) 65%, var(--border));
+}
+.search-box {
+  margin: 8px 10px;
+  height: 30px;
+  border-radius: var(--radius, 8px);
+  background: var(--background);
+}
+.search-box input {
+  font-size: 12px;
+}
+.source-controls {
+  padding: 0 10px 8px;
+  gap: 6px;
+}
+.source-controls select,
+.tag-chip,
+.icon-button {
+  border-radius: var(--radius, 8px);
+  font-size: 12px;
+}
+.tag-scroll {
+  padding: 0 10px 8px;
+  gap: 5px;
+}
+.tag-chip {
+  height: 24px;
+  padding: 0 7px;
+  background: transparent;
+  color: var(--muted-foreground);
+}
+.tag-chip.selected {
+  background: var(--muted);
+  color: var(--foreground);
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+}
+.thread-list {
+  padding: 4px 6px 12px;
+}
+.thread-row {
+  border-radius: var(--radius, 8px);
+  padding: 8px 8px;
+  gap: 7px;
+  border-color: transparent;
+  background: transparent;
+}
+.thread-row:hover {
+  background: var(--muted);
+}
+.thread-row-meta,
+.thread-snippet,
+.thread-tags small {
+  font-size: 11px;
+}
+.thread-subject {
+  font-size: 12px;
+}
+.message-card,
+.mail-draft-editor {
+  border-radius: var(--radius, 10px);
+  border-color: var(--border);
+  background: var(--card, var(--background));
+}
+
+.mail-draft-file-panel {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  padding: 12px;
+  background: var(--background);
+}
+.mail-draft-file-panel .mail-draft-editor {
+  margin: 0;
+  min-height: 0;
+}
+.mail-draft-file-state {
+  padding: 16px;
+  color: var(--muted-foreground);
+}
+
+/* Make mail header fields clearly editable while staying compact/native. */
+.address-field input {
+  height: 24px;
+  border: 1px solid transparent;
+  background: color-mix(in srgb, var(--muted) 45%, transparent);
+  cursor: text;
+}
+.address-field input:hover {
+  border-color: var(--border);
+  background: var(--muted);
+}
+.address-field input:focus {
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+  outline: 2px solid color-mix(in srgb, var(--primary) 18%, transparent);
+  outline-offset: 0;
+  background: var(--background);
+}
+.address-field input::placeholder {
+  color: color-mix(in srgb, var(--muted-foreground) 72%, transparent);
+}
+
+/* Refined mail source header: avoid duplicating the global Mail title. */
+.source-header {
+  min-height: 44px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--background) 96%, var(--muted));
+}
+.source-title {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.source-title span {
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+.source-title small {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.1;
+}
+.mail-compose-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 8px);
+  background: var(--muted);
+  color: var(--foreground);
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+}
+.mail-compose-button:hover {
+  background: color-mix(in srgb, var(--muted) 78%, var(--foreground));
+}
+
+/* Iteration 1 UX pass: native Boring density/hierarchy for mail pane. */
+.mail-source-pane {
+  background: var(--surface-workbench-left, var(--background));
+  color: var(--foreground);
+  border-right: 1px solid var(--border);
+}
+.mail-source-pane .source-header {
+  min-height: 42px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+}
+.mail-source-pane .source-title {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.mail-source-pane .source-title span {
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+.mail-source-pane .source-title small {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 400;
+}
+.mail-compose-button {
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--muted);
+  color: var(--foreground);
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.mail-compose-button:hover { background: color-mix(in srgb, var(--muted) 82%, var(--foreground)); }
+.mail-source-pane .search-box {
+  height: 30px;
+  margin: 8px 10px;
+  padding: 0 9px;
+  border-color: var(--border);
+  border-radius: var(--radius, 10px);
+  background: color-mix(in srgb, var(--muted) 45%, transparent);
+  color: var(--muted-foreground);
+}
+.mail-source-pane .search-box:focus-within {
+  border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+  background: var(--background);
+}
+.source-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 0 10px 8px;
+  gap: 6px;
+}
+.mail-view-tabs {
+  min-width: 0;
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 10px);
+  background: color-mix(in srgb, var(--muted) 32%, transparent);
+  padding: 2px;
+}
+.mail-view-tab {
+  flex: 0 0 auto;
+  height: 24px;
+  border: 0;
+  border-radius: calc(var(--radius, 10px) - 3px);
+  background: transparent;
+  color: var(--muted-foreground);
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 500;
+}
+.mail-view-tab.active {
+  background: var(--background);
+  color: var(--foreground);
+  box-shadow: 0 1px 1px rgb(0 0 0 / 8%);
+}
+.mail-source-pane .icon-button {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-color: var(--border);
+  border-radius: var(--radius, 10px);
+  background: transparent;
+  color: var(--muted-foreground);
+}
+.tag-scroll {
+  padding: 0 10px 8px;
+  gap: 5px;
+}
+.tag-chip {
+  height: 24px;
+  border-color: var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
+  padding: 0 8px;
+  font-size: 11px;
+}
+.tag-chip.selected {
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  color: var(--foreground);
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+}
+.thread-list { padding: 4px 6px 12px; }
+.thread-row {
+  border: 1px solid transparent;
+  border-radius: var(--radius, 10px);
+  padding: 8px;
+  background: transparent;
+}
+.thread-row:hover {
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--muted) 60%, transparent);
+}
+.unread-dot.active { background: var(--primary); }
+.thread-row-meta { color: var(--muted-foreground); font-size: 11px; }
+.thread-row-meta strong { color: var(--foreground); font-weight: 600; }
+.thread-subject { color: var(--foreground); font-size: 13px; font-weight: 500; }
+.thread-subject.unread { font-weight: 650; }
+.thread-snippet { color: var(--muted-foreground); font-size: 12px; line-height: 1.35; }
+.thread-tags small {
+  border-color: var(--border);
+  color: var(--muted-foreground);
+  background: transparent;
+  font-size: 10px;
+}
+.star { fill: var(--primary); color: var(--primary); }
+
+/* Iteration 5 final polish: fit the narrow native workbench source pane. */
+.mail-source-pane .source-header {
+  min-height: 36px;
+  padding: 6px 10px;
+}
+.mail-source-pane .source-title small {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: none;
+}
+.mail-compose-button {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+.mail-source-pane .search-box {
+  height: 28px;
+  margin: 7px 10px;
+}
+.mail-view-tabs {
+  flex-wrap: wrap;
+  overflow: visible;
+  gap: 2px;
+}
+.mail-view-tab {
+  height: 22px;
+  padding: 0 7px;
+  font-size: 10.5px;
+}
+.tag-scroll {
+  flex-wrap: wrap;
+  overflow: visible;
+  max-height: 56px;
+}
+.tag-chip {
+  max-width: 100%;
+  height: 22px;
+  padding: 0 7px;
+  font-size: 10.5px;
+}
+.thread-row-meta strong {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.thread-row-meta time {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  margin-left: auto;
+}
+.thread-row {
+  padding: 7px 8px;
+}
+.thread-tags {
+  flex-wrap: wrap;
+}
+
+/* Iteration 5 correction: keep filters from overlapping thread rows. */
+.tag-scroll {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-height: none;
+  padding-bottom: 7px;
+  scrollbar-width: none;
+}
+.tag-scroll::-webkit-scrollbar { display: none; }
+.thread-list {
+  padding-top: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+}
