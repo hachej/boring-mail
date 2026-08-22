@@ -12,10 +12,10 @@
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@hachej/boring-agent": "workspace:*",
-    "@hachej/boring-ask-user": "workspace:*",
+    "@hachej/boring-agent": "0.1.103",
+    "@hachej/boring-ask-user": "0.1.103",
     "@hachej/boring-mail": "workspace:*",
-    "@hachej/boring-workspace": "workspace:*",
+    "@hachej/boring-workspace": "0.1.103",
     "@vitejs/plugin-react": "^4.0.0",
     "lucide-react": "^1.21.0",
     "react": "^19.2.7",

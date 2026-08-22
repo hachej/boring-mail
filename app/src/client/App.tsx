@@ -18,6 +18,7 @@ export function App() {
   return (
     <WorkspaceAgentFront
       workspaceId="boring-mail"
+      agentTypeId="default"
       apiBaseUrl=""
       persistenceEnabled={false}
       providerStorageKey="boring-mail:layout:v4"
@@ -34,7 +35,6 @@ export function App() {
       showPlugins={false}
       externalPlugins={false}
       frontPluginHotReload={false}
-      nativeSessionStartEnabled
       plugins={[askUserPlugin, boringMailBoringUiPlugin]}
       chatParams={{
         emptyState: {

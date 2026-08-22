@@ -48,7 +48,6 @@ export async function startBoringMailPlaygroundServer(): Promise<void> {
       appRoot: APP_ROOT,
       mode: localRuntimeMode,
       logger: true,
-      trustedDirectLocalNativeSessions: true,
       externalPlugins: false,
       installPluginAuthoring: false,
       plugins: [createBoringMailServerPlugin({ workspaceRoot: PLAYGROUND_WORKSPACE_ROOT })],

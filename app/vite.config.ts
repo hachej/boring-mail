@@ -24,7 +24,8 @@ export default defineConfig({
       allow: [
         resolve(__dirname),
         resolve(__dirname, '../boring-mail'),
-        resolve(__dirname, '../../boring-ui-v2-775-pr811-final'),
+        // published @hachej deps live in the workspace-root node_modules
+        resolve(__dirname, '..'),
       ],
     },
     proxy: {
