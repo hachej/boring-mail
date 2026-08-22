@@ -59,15 +59,18 @@ export async function startBoringMailPlaygroundServer(): Promise<void> {
       projectName: 'Boring Mail',
       workspaceId: 'boring-mail-playground',
       workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
-      nativeSessionStartEnabled: true,
     }))
 
-    const existingSessions = await app.inject({ method: 'GET', url: '/api/v1/agent/pi-chat/sessions' })
-    const sessions = existingSessions.statusCode === 200 ? JSON.parse(existingSessions.body) as unknown[] : []
+    // 0.1.103: session routes moved from /api/v1/agent/pi-chat/sessions to
+    // /api/v1/agents/:agentTypeId/sessions (front default agentTypeId: "default").
+    const existingSessions = await app.inject({ method: 'GET', url: '/api/v1/agents/default/sessions' })
+    const sessions = existingSessions.statusCode === 200
+      ? (JSON.parse(existingSessions.body) as { sessions?: unknown[] }).sessions ?? []
+      : []
     if (sessions.length === 0) {
       await app.inject({
         method: 'POST',
-        url: '/api/v1/agent/pi-chat/sessions',
+        url: '/api/v1/agents/default/sessions',
         payload: { title: 'Chief of Staff' },
       })
     }
