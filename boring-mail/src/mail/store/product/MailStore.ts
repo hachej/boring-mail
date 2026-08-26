@@ -1,4 +1,4 @@
-import { realpathSync } from 'node:fs'
+import { existsSync, realpathSync, statSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import type {
@@ -146,6 +146,10 @@ class RpcClient {
       else this.#readyResolve()
       return
     }
+    if (message.type === 'fatal') {
+      this.#fail(remoteError(message.error))
+      return
+    }
     const pending = this.#pending.get(message.id)
     if (!pending) return
     this.#pending.delete(message.id)
@@ -251,16 +255,28 @@ function limits(options: MailStoreOpenOptions): RpcLimits {
 function canonicalConfig(config: MailStoreWorkerConfig): MailStoreWorkerConfig {
   if (!config.productDbPath) throw new ProductStoreError('invalid_input', 'productDbPath is required')
   const absolute = resolve(config.productDbPath)
-  let directory: string
+  let productDbPath: string
   try {
-    directory = realpathSync.native(dirname(absolute))
-  } catch {
-    throw new ProductStoreError('invalid_input', 'product database directory must already exist')
+    if (existsSync(absolute)) {
+      const stat = statSync(absolute)
+      if (!stat.isFile() || stat.nlink !== 1) {
+        throw new ProductStoreError('invalid_input', 'product database must be a regular file with one hard link')
+      }
+      // Existing symlink aliases collapse to the target database and lock root.
+      productDbPath = realpathSync.native(absolute)
+    } else {
+      productDbPath = join(realpathSync.native(dirname(absolute)), basename(absolute))
+    }
+  } catch (error) {
+    if (error instanceof ProductStoreError) throw error
+    throw new ProductStoreError('invalid_input', 'product database path must have an existing canonical directory')
   }
-  return {
-    productDbPath: join(directory, basename(absolute)),
-    ...(config.msgvaultDbPath ? { msgvaultDbPath: resolve(config.msgvaultDbPath) } : {}),
+  let msgvaultDbPath: string | undefined
+  if (config.msgvaultDbPath) {
+    try { msgvaultDbPath = realpathSync.native(resolve(config.msgvaultDbPath)) }
+    catch { throw new ProductStoreError('invalid_input', 'msgvault database path must exist') }
   }
+  return { productDbPath, ...(msgvaultDbPath ? { msgvaultDbPath } : {}) }
 }
 function sameConfig(left: MailStoreWorkerConfig, right: MailStoreWorkerConfig): boolean {
   return left.productDbPath === right.productDbPath && left.msgvaultDbPath === right.msgvaultDbPath

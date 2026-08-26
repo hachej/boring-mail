@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { mkdtempSync } from 'node:fs'
+import { linkSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
@@ -147,15 +147,39 @@ describe('async MailStore worker RPC facade', () => {
     }
   })
 
+  it('canonicalizes symlink aliases to one database/worker and rejects hardlinks', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mail-alias-')),
+      targetDir = join(root, 'target'), aliasA = join(root, 'alias-a'), aliasB = join(root, 'alias-b')
+    mkdirSync(targetDir); mkdirSync(aliasA); mkdirSync(aliasB)
+    const target = join(targetDir, 'boring-mail.db')
+    writeFileSync(target, '')
+    symlinkSync(target, join(aliasA, 'db'))
+    symlinkSync(target, join(aliasB, 'db'))
+    const created: Worker[] = [], make = factory(created)
+    const [a, b] = await Promise.all([
+      openMailStore({ productDbPath: join(aliasA, 'db') }, { workerFactory: make }),
+      openMailStore({ productDbPath: join(aliasB, 'db') }, { workerFactory: make }),
+    ])
+    expect(created).toHaveLength(1)
+    await a.close(); await b.close()
+    const hardlink = join(targetDir, 'hardlink.db')
+    linkSync(target, hardlink)
+    await expect(openMailStore({ productDbPath: hardlink }, { workerFactory: make }))
+      .rejects.toMatchObject({ code: 'invalid_input' })
+  })
+
   it('rejects conflicting configuration within one canonical data directory', async () => {
-    const db = path(), make = factory([])
-    const store = await openMailStore({ productDbPath: db, msgvaultDbPath: '/vault/a' }, { workerFactory: make })
+    const root = mkdtempSync(join(tmpdir(), 'mail-config-')),
+      db = join(root, 'boring-mail.db'), vaultA = join(root, 'vault-a.db'), vaultB = join(root, 'vault-b.db'),
+      make = factory([])
+    writeFileSync(vaultA, ''); writeFileSync(vaultB, '')
+    const store = await openMailStore({ productDbPath: db, msgvaultDbPath: vaultA }, { workerFactory: make })
     try {
       await expect(openMailStore(
-        { productDbPath: db, msgvaultDbPath: '/vault/b' }, { workerFactory: make },
+        { productDbPath: db, msgvaultDbPath: vaultB }, { workerFactory: make },
       )).rejects.toMatchObject({ code: 'invalid_input' })
       await expect(openMailStore(
-        { productDbPath: join(db, '..', 'other.db'), msgvaultDbPath: '/vault/a' }, { workerFactory: make },
+        { productDbPath: join(root, 'other.db'), msgvaultDbPath: vaultA }, { workerFactory: make },
       )).rejects.toMatchObject({ code: 'invalid_input' })
     } finally {
       await store.close()

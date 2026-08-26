@@ -230,22 +230,25 @@ export class OutboxMachine {
       const now = this.c.now()
       // Validate before returning "no work" so invalid caller input never hides.
       this.c.deadline(now, leaseMs, 'send lease')
-      const rows = this.c.db.prepare(`
-        SELECT * FROM mail_outbox
-        WHERE status='approved' OR (status='claimed' AND lease_expires_ms<=?)
-        ORDER BY created_ms,id
-      `).all(now) as unknown as OutboxRow[]
-      for (const row of rows) {
-        try {
-          return this.claimRow(row, worker, now, leaseMs)
-        } catch (error) {
-          // Identity can be restored later; leave only that row eligible and
-          // continue so one disconnected account cannot starve all others.
-          if (error instanceof ProductStoreError && error.code === 'identity_revoked') continue
-          throw error
+      const pageSize = 100
+      for (let offset = 0; ; offset += pageSize) {
+        const rows = this.c.db.prepare(`
+          SELECT * FROM mail_outbox
+          WHERE status='approved' OR (status='claimed' AND lease_expires_ms<=?)
+          ORDER BY created_ms,id LIMIT ? OFFSET ?
+        `).all(now, pageSize, offset) as unknown as OutboxRow[]
+        for (const row of rows) {
+          try {
+            return this.claimRow(row, worker, now, leaseMs)
+          } catch (error) {
+            // Identity can be restored later; leave only that row eligible and
+            // continue so one disconnected account cannot starve all others.
+            if (error instanceof ProductStoreError && error.code === 'identity_revoked') continue
+            throw error
+          }
         }
+        if (rows.length < pageSize) return null
       }
-      return null
     })
   }
   private worker(worker: string): void {

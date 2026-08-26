@@ -54,6 +54,15 @@ async function start(): Promise<void> {
       resolveReplyTarget: (messageId) => vault ? resolveReplyTarget(vault.db, messageId) : null,
     })
     const productStore = store
+    const heldLock = lock
+    // Kernel lock loss is a fatal ownership violation. Close both databases
+    // before notifying the facade; the facade then terminates this worker.
+    void heldLock.lost.then(async (error) => {
+      if (closed) return
+      await close().catch(() => undefined)
+      port.postMessage({ type: 'fatal', error: serialized(error) } satisfies RpcResponse)
+      port.close()
+    })
     const handlers: RpcHandlers = {
       upsertAccount: (input) => productStore.upsertAccount(input),
       saveDraft: (input, id) => productStore.saveDraft(input, id),

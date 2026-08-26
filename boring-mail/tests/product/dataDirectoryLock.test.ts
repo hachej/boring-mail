@@ -22,4 +22,13 @@ describe('data-directory flock', () => {
     const next = await acquireDataDirectoryLock(directory)
     await next.release()
   })
+
+  it('reports unexpected helper loss before another owner can take over', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'mail-lock-loss-'))
+    const held = await acquireDataDirectoryLock(directory)
+    process.kill(held.helperPid, 'SIGKILL')
+    await expect(held.lost).resolves.toMatchObject({ code: 'mail_store_lock_lost' })
+    const replacement = await acquireDataDirectoryLock(directory)
+    await replacement.release()
+  })
 })

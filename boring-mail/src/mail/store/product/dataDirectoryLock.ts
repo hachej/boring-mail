@@ -7,6 +7,10 @@ const LOCK_FILENAME = '.boring-mail.lock'
 
 export interface DataDirectoryLock {
   readonly path: string
+  /** Internal helper PID is exposed for lock-loss health checks/tests only. */
+  readonly helperPid: number
+  /** Resolves only when kernel-backed ownership is lost unexpectedly. */
+  readonly lost: Promise<Error>
   release(): Promise<void>
 }
 
@@ -43,19 +47,22 @@ export function acquireDataDirectoryLock(directory: string): Promise<DataDirecto
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
-    let settled = false
+    let acquired = false
+    let intentionallyReleased = false
     let stderr = ''
+    let resolveLost!: (error: Error) => void
+    const lost = new Promise<Error>((resolveLoss) => { resolveLost = resolveLoss })
     const timeout = setTimeout(() => {
-      if (settled) return
-      settled = true
+      if (acquired) return
+      intentionallyReleased = true
       child.kill('SIGKILL')
       reject(new ProductStoreError('rpc_timeout', 'timed out while acquiring the mail store data-directory lock'))
     }, LOCK_READY_TIMEOUT_MS)
     timeout.unref()
 
-    const fail = (error: Error): void => {
-      if (settled) return
-      settled = true
+    const failBeforeAcquire = (error: Error): void => {
+      if (acquired || intentionallyReleased) return
+      intentionallyReleased = true
       clearTimeout(timeout)
       child.kill('SIGKILL')
       reject(error)
@@ -63,22 +70,23 @@ export function acquireDataDirectoryLock(directory: string): Promise<DataDirecto
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk: string) => { stderr += chunk })
     child.once('error', (error) => {
-      fail(new Error(`cannot execute flock for mail store lock: ${error.message}`))
+      failBeforeAcquire(new Error(`cannot execute flock for mail store lock: ${error.message}`))
     })
     child.stdout.setEncoding('utf8')
     let stdout = ''
     child.stdout.on('data', (chunk: string) => {
-      if (settled) return
+      if (acquired || intentionallyReleased) return
       stdout += chunk
       if (!stdout.includes('BORING_MAIL_LOCKED\n')) return
-      settled = true
+      acquired = true
       clearTimeout(timeout)
-      let released = false
       resolve({
         path,
+        helperPid: child.pid!,
+        lost,
         async release(): Promise<void> {
-          if (released) return
-          released = true
+          if (intentionallyReleased) return
+          intentionallyReleased = true
           child.stdin.end()
           const force = setTimeout(() => child.kill('SIGKILL'), LOCK_READY_TIMEOUT_MS)
           force.unref()
@@ -88,15 +96,23 @@ export function acquireDataDirectoryLock(directory: string): Promise<DataDirecto
       })
     })
     child.once('exit', (code, signal) => {
-      if (settled) return
+      clearTimeout(timeout)
+      if (acquired) {
+        if (!intentionallyReleased) {
+          const detail = stderr.trim() || (signal ? `signal ${signal}` : `exit ${code}`)
+          resolveLost(new ProductStoreError('mail_store_lock_lost', `mail store data-directory lock was lost (${detail})`))
+        }
+        return
+      }
+      if (intentionallyReleased) return
       const detail = stderr.trim() || (signal ? `signal ${signal}` : `exit ${code}`)
       if (code === 1) {
-        fail(new ProductStoreError(
+        failBeforeAcquire(new ProductStoreError(
           'mail_store_already_active',
           `MAIL_STORE_ALREADY_ACTIVE: another process owns ${path}`,
         ))
       } else {
-        fail(new Error(`mail store flock helper exited before acquiring the lock (${detail})`))
+        failBeforeAcquire(new Error(`mail store flock helper exited before acquiring the lock (${detail})`))
       }
     })
   })

@@ -75,6 +75,37 @@ try {
     throw new Error(`lock was not released for second process: ${reopened.stdout}${reopened.stderr}`)
   }
 
+  // Lock-health proof: killing the post-acquisition helper must fail-stop the
+  // database worker before a replacement owner is admitted.
+  const lossStore = await openMailStore({ productDbPath }, {
+    startupTimeoutMs: 3_000, requestTimeoutMs: 3_000,
+  })
+  const processes = spawnSync('ps', ['-eo', 'pid=,ppid=,comm='], { encoding: 'utf8' }).stdout
+    .trim().split('\n').map((line) => {
+      const [pid, ppid, ...command] = line.trim().split(/\s+/)
+      return { pid: Number(pid), ppid: Number(ppid), command: command.join(' ') }
+    })
+  const descendants = new Set([process.pid])
+  for (let pass = 0; pass < 4; pass++) {
+    for (const item of processes) if (descendants.has(item.ppid)) descendants.add(item.pid)
+  }
+  const holders = processes.filter((item) =>
+    descendants.has(item.pid) && ['cat', 'sh', 'flock'].includes(item.command))
+  if (!holders.some((item) => item.command === 'flock')) throw new Error('could not locate flock holder process')
+  for (const item of holders.reverse()) {
+    try { process.kill(item.pid, 'SIGKILL') } catch { /* descendant already exited */ }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  let lockLossObserved = false
+  try { await lossStore.getDraft('after-lock-loss') }
+  catch { lockLossObserved = true }
+  if (!lockLossObserved) throw new Error('store continued serving after kernel lock loss')
+  await lossStore.close()
+  const afterLockLoss = await openMailStore({ productDbPath }, {
+    startupTimeoutMs: 3_000, requestTimeoutMs: 3_000,
+  })
+  await afterLockLoss.close()
+
   // Crash proof: SIGKILL the host without closing; the flock helper must lose
   // its stdin and the kernel lock must become available without stale cleanup.
   const holder = spawn(process.execPath, ['-e', childSource, moduleUrl, productDbPath, 'hold'], {

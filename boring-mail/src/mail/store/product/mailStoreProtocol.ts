@@ -60,6 +60,7 @@ export interface SerializedError {
 export type RpcResponse =
   | { type: 'ready' }
   | { type: 'ready'; error: SerializedError }
+  | { type: 'fatal'; error: SerializedError }
   | { type: 'response'; id: number; value: unknown }
   | { type: 'response'; id: number; error: SerializedError }
 
