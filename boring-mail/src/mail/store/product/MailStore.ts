@@ -352,8 +352,15 @@ class RpcClient {
 }
 
 type RegistryState = 'starting' | 'ready' | 'closing' | 'dead'
+interface StorageIdentity {
+  directoryDev: number
+  directoryIno: number
+  databaseDev: number | null
+  databaseIno: number | null
+}
 interface RegistryEntry {
   config: MailStoreWorkerConfig
+  identity: StorageIdentity
   limits: RpcLimits
   factory: MailStoreWorkerFactory
   rpc: RpcClient
@@ -417,6 +424,20 @@ function canonicalConfig(config: MailStoreWorkerConfig): MailStoreWorkerConfig {
 function sameConfig(left: MailStoreWorkerConfig, right: MailStoreWorkerConfig): boolean {
   return left.productDbPath === right.productDbPath && left.msgvaultDbPath === right.msgvaultDbPath
 }
+function storageIdentity(config: MailStoreWorkerConfig): StorageIdentity {
+  const directory = statSync(dirname(config.productDbPath))
+  const database = lstatSync(config.productDbPath, { throwIfNoEntry: false })
+  return {
+    directoryDev: directory.dev,
+    directoryIno: directory.ino,
+    databaseDev: database?.dev ?? null,
+    databaseIno: database?.ino ?? null,
+  }
+}
+function sameIdentity(left: StorageIdentity, right: StorageIdentity): boolean {
+  return left.directoryDev === right.directoryDev && left.directoryIno === right.directoryIno &&
+    left.databaseDev === right.databaseDev && left.databaseIno === right.databaseIno
+}
 function sameLimits(left: RpcLimits, right: RpcLimits): boolean {
   return left.startupTimeoutMs === right.startupTimeoutMs &&
     left.requestTimeoutMs === right.requestTimeoutMs &&
@@ -443,12 +464,20 @@ function createEntry(
   factory: MailStoreWorkerFactory,
 ): RegistryEntry {
   let entry!: RegistryEntry
-  const rpc = new RpcClient(factory(config), selectedLimits, () => {
+  const transport = factory(config)
+  let identity: StorageIdentity
+  try { identity = storageIdentity(config) }
+  catch (error) {
+    void transport.terminate()
+    throw error
+  }
+  const rpc = new RpcClient(transport, selectedLimits, () => {
     // Keep a closing tombstone until termination has completed.
     queueMicrotask(() => { void beginDisposal(key, entry, false) })
   })
   entry = {
     config,
+    identity,
     limits: selectedLimits,
     factory,
     rpc,
@@ -527,6 +556,9 @@ export async function openMailStore(
     if (entry) {
       if (!sameConfig(entry.config, config)) {
         throw new ProductStoreError('invalid_input', 'mail store directory is already open with different database config')
+      }
+      if (!sameIdentity(entry.identity, storageIdentity(config))) {
+        throw new ProductStoreError('invalid_input', 'mail store path identity changed while its prior owner is open')
       }
       if (!sameLimits(entry.limits, selectedLimits) || entry.factory !== factory) {
         throw new ProductStoreError('invalid_input', 'mail store directory is already open with different RPC settings')

@@ -1,7 +1,15 @@
 // @vitest-environment node
-import { linkSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  linkSync,
+  mkdtempSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { describe, expect, it } from 'vitest'
 import * as publicStoreApi from '../../src/mail/store/productDb.js'
@@ -153,6 +161,21 @@ describe('async MailStore worker RPC facade', () => {
     symlinkSync(join(root, 'missing-target.db'), alias)
     await expect(openMailStore({ productDbPath: alias }, { workerFactory: factory([]) }))
       .rejects.toMatchObject({ code: 'invalid_input' })
+  })
+
+  it('refuses to reuse a path whose open directory inode was replaced', async () => {
+    const db = path(), directory = dirname(db), moved = `${directory}.moved`, make = factory([])
+    const store = await openMailStore({ productDbPath: db }, { workerFactory: make })
+    renameSync(directory, moved)
+    mkdirSync(directory)
+    try {
+      await expect(openMailStore({ productDbPath: db }, { workerFactory: make }))
+        .rejects.toThrow(/path identity changed/)
+    } finally {
+      await store.close()
+      rmSync(directory, { recursive: true, force: true })
+      renameSync(moved, directory)
+    }
   })
 
   it('canonicalizes symlink aliases to one database/worker and rejects hardlinks', async () => {

@@ -75,6 +75,8 @@ function assertCanonicalDatabasePath(path: string): void {
 async function start(): Promise<void> {
   let vault: ReturnType<typeof openMsgvaultStore> | null = null
   let store: ProductStore | null = null
+  let ownerMetadataPath: string | null = null
+  let lockedIdentity: { directoryDev: number; directoryIno: number; databaseDev: number; databaseIno: number } | null = null
   let closed = false
   const close = (): void => {
     if (closed) return
@@ -111,23 +113,46 @@ async function start(): Promise<void> {
           heldDatabase.dev !== namedDatabase.dev || heldDatabase.ino !== namedDatabase.ino) {
         throw new ProductStoreError('invalid_input', 'mail store database identity changed during acquisition')
       }
+      lockedIdentity = {
+        directoryDev: heldDirectory.dev,
+        directoryIno: heldDirectory.ino,
+        databaseDev: heldDatabase.dev,
+        databaseIno: heldDatabase.ino,
+      }
+      ownerMetadataPath = ownerPath
+    }
+    // Open SQLite immediately after inode verification while both inherited
+    // locks are held. Revalidate the pathname after open before any slower
+    // msgvault/schema work or readiness signal can create a TOCTOU window.
+    store = ProductStore.open(config.productDbPath, {
+      now: Date.now,
+      resolveReplyTarget: (messageId) => vault ? resolveReplyTarget(vault.db, messageId) : null,
+    })
+    assertCanonicalDatabasePath(config.productDbPath)
+    if (lockedIdentity) {
+      const directoryAfterOpen = statSync(dirname(config.productDbPath))
+      const databaseAfterOpen = statSync(config.productDbPath)
+      if (directoryAfterOpen.dev !== lockedIdentity.directoryDev ||
+          directoryAfterOpen.ino !== lockedIdentity.directoryIno ||
+          databaseAfterOpen.dev !== lockedIdentity.databaseDev ||
+          databaseAfterOpen.ino !== lockedIdentity.databaseIno) {
+        throw new ProductStoreError('invalid_input', 'mail store path identity changed while opening SQLite')
+      }
+    }
+    if (ownerMetadataPath) {
       const metadata = JSON.stringify({
         pid: process.pid,
         processStartedAt: new Date(Date.now() - Math.floor(process.uptime() * 1_000)).toISOString(),
       }) + '\n'
-      const temporaryOwnerPath = `${ownerPath}.${process.pid}.tmp`
+      const temporaryOwnerPath = `${ownerMetadataPath}.${process.pid}.tmp`
       try {
         writeFileSync(temporaryOwnerPath, metadata, { flag: 'wx', mode: 0o600 })
-        renameSync(temporaryOwnerPath, ownerPath)
+        renameSync(temporaryOwnerPath, ownerMetadataPath)
       } finally {
         rmSync(temporaryOwnerPath, { force: true })
       }
     }
     vault = config.msgvaultDbPath ? openMsgvaultStore(config.msgvaultDbPath) : null
-    store = ProductStore.open(config.productDbPath, {
-      now: Date.now,
-      resolveReplyTarget: (messageId) => vault ? resolveReplyTarget(vault.db, messageId) : null,
-    })
     const productStore = store
     const handlers: RpcHandlers = {
       upsertAccount: (input) => productStore.upsertAccount(input),
