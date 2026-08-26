@@ -49,8 +49,8 @@ export class StoreContext {
         'identity_revoked',
         `account ${content.accountId} is disconnected or unknown`,
       )
-    if (!Number.isSafeInteger(account.provider_source_id) || Number(account.provider_source_id) < 0) {
-      fail('corrupt_data', 'account provider source must be a non-negative safe integer')
+    if (!Number.isSafeInteger(account.provider_source_id) || Number(account.provider_source_id) <= 0) {
+      fail('corrupt_data', 'account provider source must be a positive safe integer')
     }
     if (!decodeStringArray(account.send_as_json, 'account.send_as').includes(content.sendAsAddress))
       fail('identity_revoked', `send-as identity ${content.sendAsAddress} is not provider-authorised`)

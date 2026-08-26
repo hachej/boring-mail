@@ -86,27 +86,31 @@ export interface ClaimedOutbox extends OutboxBase {
   approvalConsumedAt: number
   lease: { owner: string; expiresAt: number }
 }
-export interface DispatchedOutbox extends OutboxBase {
+interface PostDispatchEvidence {
+  /** Gmail history cursor captured in the same transaction that commits dispatch. */
+  readonly preDispatchHistoryId: string
+}
+export interface DispatchedOutbox extends OutboxBase, PostDispatchEvidence {
   status: 'dispatched'
   approvalConsumedAt: number
   lease: { owner: string; expiresAt: number }
 }
-export interface UnknownOutbox extends OutboxBase {
+export interface UnknownOutbox extends OutboxBase, PostDispatchEvidence {
   status: 'unknown'
   approvalConsumedAt: number
   reconciliation: { deadlineAt: number; nextAttemptAt: number; attempts: number; detail: string }
 }
-export interface HumanDecisionOutbox extends OutboxBase {
+export interface HumanDecisionOutbox extends OutboxBase, PostDispatchEvidence {
   status: 'human_decision'
   approvalConsumedAt: number
   reconciliation: { deadlineAt: number; attempts: number; detail: string }
 }
-export interface SentOutbox extends OutboxBase {
+export interface SentOutbox extends OutboxBase, PostDispatchEvidence {
   status: 'sent'
   approvalConsumedAt: number
   delivery: { basis: 'provider'; providerMessageId: string } | { basis: 'human'; providerMessageId: null }
 }
-export interface FailedOutbox extends OutboxBase {
+export interface FailedOutbox extends OutboxBase, PostDispatchEvidence {
   status: 'failed'
   approvalConsumedAt: number
   failure: { code: string; detail: string }
@@ -118,6 +122,8 @@ export interface CancelledOutbox extends OutboxBase {
   status: 'cancelled'
   approvalConsumedAt: number
   reason: 'cancelled' | 'retry'
+  /** Present only when a human chose retry after an ambiguous dispatch. */
+  preDispatchHistoryId: string | null
 }
 export interface StaleOutbox extends OutboxBase {
   status: 'stale'

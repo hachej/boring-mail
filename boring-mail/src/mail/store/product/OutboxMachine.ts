@@ -4,10 +4,18 @@ import { fail, StoreContext } from './context.js'
 import { createSendSnapshot, sendSnapshotDigest } from './sendSnapshot.js'
 import {
   ProductStoreError,
+  type ApprovedOutbox,
   type AttentionItem,
+  type CancelledOutbox,
+  type ClaimedOutbox,
+  type DispatchedOutbox,
+  type FailedOutbox,
+  type HumanDecisionOutbox,
   type OutboxRecord,
   type PendingOutbox,
+  type RejectedOutbox,
   type SendSnapshot,
+  type SentOutbox,
   type UnknownOutbox,
 } from './types.js'
 const APPROVAL_TTL = 300_000,
@@ -15,11 +23,13 @@ const APPROVAL_TTL = 300_000,
   RECONCILE_DEADLINE = 15 * 60_000,
   MAX_BACKOFF = 5 * 60_000
 const hash = (value: string): Buffer => createHash('sha256').update(value).digest()
-const same = (hex: string, value: string): boolean => {
-  const expected = Buffer.from(hex, 'hex'),
-    actual = hash(value)
+const sameBuffer = (hex: string, actual: Buffer): boolean => {
+  const expected = Buffer.from(hex, 'hex')
   return expected.length === actual.length && timingSafeEqual(expected, actual)
 }
+/** Domain-separated, unambiguous binding for the complete approval authority. */
+const approvalVerifier = (token: string, sessionId: string, outboxId: string, digest: string): Buffer =>
+  hash(JSON.stringify(['boring-mail.approval.v1', token, sessionId, outboxId, digest]))
 export class OutboxMachine {
   constructor(private readonly c: StoreContext) {}
   get(id: string): OutboxRecord | null {
@@ -120,21 +130,26 @@ export class OutboxMachine {
   }
   issueApprovalCapability(id: string, sessionId: string, ttl = APPROVAL_TTL): string {
     if (!sessionId.trim()) fail('invalid_input', 'authenticated session id is required')
-    const token = randomBytes(32).toString('base64url'),
-      now = this.c.now(),
-      expires = this.c.deadline(now, ttl, 'approval TTL')
-    const result = this.c.db
-      .prepare(
-        `UPDATE mail_outbox SET approval_cap_hash=?,approval_session_hash=?,approval_expires_ms=?,updated_ms=? WHERE id=? AND status='pending_approval'`,
+    return this.c.transaction(() => {
+      const { row } = this.c.require(id, 'pending_approval')
+      this.digest(row)
+      const token = randomBytes(32).toString('base64url'),
+        now = this.c.now(),
+        expires = this.c.deadline(now, ttl, 'approval TTL')
+      this.c.db.prepare(
+        `UPDATE mail_outbox SET approval_cap_hash=?,approval_session_hash=?,approval_expires_ms=?,updated_ms=? WHERE id=?`,
+      ).run(
+        approvalVerifier(token, sessionId, id, String(row.content_digest)).toString('hex'),
+        hash(sessionId).toString('hex'), expires, now, id,
       )
-      .run(hash(token).toString('hex'), hash(sessionId).toString('hex'), expires, now, id)
-    if (result.changes !== 1) fail('invalid_transition', 'outbox is not pending approval')
-    return token
+      return token
+    })
   }
-  approve(id: string, token: string, sessionId: string): OutboxRecord {
+  approve(id: string, token: string, sessionId: string): ApprovedOutbox {
     return this.c.transaction(() => {
       if (!sessionId.trim()) fail('approval_invalid', 'authenticated session id is required')
       const { row, record } = this.c.require(id, 'pending_approval')
+      this.digest(row)
       this.c.assertIdentity(record.snapshot)
       const now = this.c.now(),
         expires = row.approval_expires_ms
@@ -143,22 +158,24 @@ export class OutboxMachine {
       if (typeof row.approval_cap_hash !== 'string' || typeof row.approval_session_hash !== 'string') {
         fail('approval_invalid', 'approval capability was not issued')
       }
-      const tokenMatches = same(row.approval_cap_hash, token)
-      const sessionMatches = same(row.approval_session_hash, sessionId)
-      if (!tokenMatches || !sessionMatches) {
+      const verifierMatches = sameBuffer(
+        row.approval_cap_hash,
+        approvalVerifier(token, sessionId, id, String(row.content_digest)),
+      )
+      const sessionMatches = sameBuffer(row.approval_session_hash, hash(sessionId))
+      if (!verifierMatches || !sessionMatches) {
         fail('approval_invalid', 'approval capability or session binding invalid')
       }
-      this.digest(row)
       this.c.db
         .prepare(
           `UPDATE mail_outbox SET status='approved',approval_cap_hash=NULL,approval_session_hash=NULL,approval_expires_ms=NULL,approval_consumed_ms=?,updated_ms=? WHERE id=?`,
         )
         .run(now, now, id)
       this.resolve(id, 'approval_required', now)
-      return this.c.outbox(id)!
+      return this.c.require(id, 'approved').record
     })
   }
-  reject(id: string): OutboxRecord {
+  reject(id: string): RejectedOutbox {
     return this.c.transaction(() => {
       this.c.require(id, 'pending_approval')
       const now = this.c.now()
@@ -168,10 +185,10 @@ export class OutboxMachine {
         )
         .run(now, id)
       this.resolve(id, 'approval_required', now)
-      return this.c.outbox(id)!
+      return this.c.require(id, 'rejected').record
     })
   }
-  claim(id: string, worker: string, leaseMs = LEASE): OutboxRecord {
+  claim(id: string, worker: string, leaseMs = LEASE): ClaimedOutbox {
     if (!worker.trim()) fail('invalid_input', 'worker id is required')
     return this.c.transaction(() => {
       const { row, record } = this.c.require(id)
@@ -187,25 +204,27 @@ export class OutboxMachine {
           `UPDATE mail_outbox SET status='claimed',lease_owner=?,lease_expires_ms=?,updated_ms=? WHERE id=?`,
         )
         .run(worker, expires, now, id)
-      return this.c.outbox(id)!
+      return this.c.require(id, 'claimed').record
     })
   }
-  markDispatched(id: string, worker: string): OutboxRecord {
+  markDispatched(id: string, worker: string, preDispatchHistoryId: string): DispatchedOutbox {
+    if (!/^\d+$/.test(preDispatchHistoryId)) fail('invalid_input', 'pre-dispatch history id must be nonempty numeric text')
     return this.c.transaction(() => {
       const { row, record } = this.c.require(id, 'claimed')
-      if (record.lease.owner !== worker || record.lease.expiresAt <= this.c.now())
+      const now = this.c.now()
+      if (record.lease.owner !== worker || record.lease.expiresAt <= now)
         fail('lease_invalid', 'send claim is not held by this worker or has expired')
       this.c.assertIdentity(record.snapshot)
       this.digest(row)
-      this.c.db
-        .prepare(`UPDATE mail_outbox SET status='dispatched',updated_ms=? WHERE id=?`)
-        .run(this.c.now(), id)
-      return this.c.outbox(id)!
+      this.c.db.prepare(
+        `UPDATE mail_outbox SET status='dispatched',pre_dispatch_history_id=?,updated_ms=? WHERE id=?`,
+      ).run(preDispatchHistoryId, now, id)
+      return this.c.require(id, 'dispatched').record
     })
   }
-  markSent(id: string, worker: string, providerId: string): OutboxRecord {
+  markSent(id: string, worker: string, providerId: string): SentOutbox {
     if (!providerId.trim()) fail('invalid_input', 'provider message id is required')
-    return this.dispatchedResult(id, worker, () =>
+    return this.dispatchedResult(id, worker, 'sent', () =>
       this.c.db
         .prepare(
           `UPDATE mail_outbox SET status='sent',lease_owner=NULL,lease_expires_ms=NULL,provider_message_id=?,delivery_basis='provider',updated_ms=? WHERE id=?`,
@@ -213,9 +232,9 @@ export class OutboxMachine {
         .run(providerId, this.c.now(), id),
     )
   }
-  markFailed(id: string, worker: string, code: string, detail: string): OutboxRecord {
+  markFailed(id: string, worker: string, code: string, detail: string): FailedOutbox {
     if (!code.trim()) fail('invalid_input', 'failure code is required')
-    return this.dispatchedResult(id, worker, () =>
+    return this.dispatchedResult(id, worker, 'failed', () =>
       this.c.db
         .prepare(
           `UPDATE mail_outbox SET status='failed',lease_owner=NULL,lease_expires_ms=NULL,failure_code=?,failure_detail=?,updated_ms=? WHERE id=?`,
@@ -223,8 +242,8 @@ export class OutboxMachine {
         .run(code, detail, this.c.now(), id),
     )
   }
-  markUnknown(id: string, worker: string, detail: string, deadlineMs = RECONCILE_DEADLINE): OutboxRecord {
-    return this.dispatchedResult(id, worker, () => {
+  markUnknown(id: string, worker: string, detail: string, deadlineMs = RECONCILE_DEADLINE): UnknownOutbox {
+    return this.dispatchedResult(id, worker, 'unknown', () => {
       const now = this.c.now(),
         deadline = this.c.deadline(now, deadlineMs, 'reconciliation deadline')
       this.c.db
@@ -234,15 +253,17 @@ export class OutboxMachine {
         .run(deadline, now, detail, now, id)
     })
   }
-  private dispatchedResult(id: string, worker: string, mutate: () => unknown): OutboxRecord {
+  private dispatchedResult<S extends 'sent' | 'failed' | 'unknown'>(
+    id: string, worker: string, status: S, mutate: () => unknown,
+  ): Extract<OutboxRecord, { status: S }> {
     return this.c.transaction(() => {
       const { record } = this.c.require(id, 'dispatched')
       if (record.lease.owner !== worker) fail('lease_invalid', 'dispatched send is owned by another worker')
       mutate()
-      return this.c.outbox(id)!
+      return this.c.require(id, status).record
     })
   }
-  cancel(id: string): OutboxRecord {
+  cancel(id: string): CancelledOutbox {
     return this.c.transaction(() => {
       const { record } = this.c.require(id)
       if (record.status !== 'approved' && record.status !== 'claimed')
@@ -253,10 +274,10 @@ export class OutboxMachine {
           `UPDATE mail_outbox SET status='cancelled',lease_owner=NULL,lease_expires_ms=NULL,terminal_reason='cancelled',updated_ms=? WHERE id=?`,
         )
         .run(now, id)
-      return this.c.outbox(id)!
+      return this.c.require(id, 'cancelled').record
     })
   }
-  recoverExpired(): OutboxRecord[] {
+  recoverExpired(): UnknownOutbox[] {
     return this.c.transaction(() => {
       const now = this.c.now(),
         rows = this.c.db
@@ -272,7 +293,7 @@ export class OutboxMachine {
           )
           .run(deadline, now, now, record.id)
       }
-      return rows.map((row) => this.c.outbox(String(row.id))!)
+      return rows.map((row) => this.c.require(String(row.id), 'unknown').record)
     })
   }
   dueReconciliations(limit = 100): UnknownOutbox[] {
@@ -284,7 +305,7 @@ export class OutboxMachine {
       .all(this.c.now(), limit) as unknown as OutboxRow[]
     return rows.map(decodeOutbox).filter((x): x is UnknownOutbox => x.status === 'unknown')
   }
-  reconciliationFound(id: string, providerId: string): OutboxRecord {
+  reconciliationFound(id: string, providerId: string): SentOutbox {
     if (!providerId.trim()) fail('invalid_input', 'provider message id is required')
     return this.c.transaction(() => {
       const { record } = this.c.require(id)
@@ -298,10 +319,10 @@ export class OutboxMachine {
         )
         .run(providerId, now, id)
       if (record.status === 'human_decision') this.resolve(id, 'send_unknown', now)
-      return this.c.outbox(id)!
+      return this.c.require(id, 'sent').record
     })
   }
-  reconciliationMiss(id: string, backoffMs: number): OutboxRecord {
+  reconciliationMiss(id: string, backoffMs: number): UnknownOutbox | HumanDecisionOutbox {
     return this.c.transaction(() => {
       const { record } = this.c.require(id, 'unknown')
       const now = this.c.now()
@@ -329,10 +350,13 @@ export class OutboxMachine {
           .prepare(`UPDATE mail_outbox SET reconcile_next_ms=?,reconcile_attempts=?,updated_ms=? WHERE id=?`)
           .run(next, attempts, now, id)
       }
-      return this.c.outbox(id)!
+      const updated = this.c.outbox(id)!
+      if (updated.status !== 'unknown' && updated.status !== 'human_decision')
+        fail('corrupt_data', 'invalid reconciliation result')
+      return updated
     })
   }
-  keepWaiting(id: string, durationMs = RECONCILE_DEADLINE): OutboxRecord {
+  keepWaiting(id: string, durationMs = RECONCILE_DEADLINE): UnknownOutbox {
     return this.c.transaction(() => {
       const { record } = this.c.require(id, 'human_decision')
       const now = this.c.now(),
@@ -343,10 +367,10 @@ export class OutboxMachine {
         )
         .run(deadline, now, now, id)
       this.resolve(id, 'send_unknown', now)
-      return this.c.outbox(id)!
+      return this.c.require(id, 'unknown').record
     })
   }
-  markHumanSent(id: string): OutboxRecord {
+  markHumanSent(id: string): SentOutbox {
     return this.c.transaction(() => {
       this.c.require(id, 'human_decision')
       const now = this.c.now()
@@ -356,7 +380,7 @@ export class OutboxMachine {
         )
         .run(now, id)
       this.resolve(id, 'send_unknown', now)
-      return this.c.outbox(id)!
+      return this.c.require(id, 'sent').record
     })
   }
   retry(id: string): PendingOutbox {

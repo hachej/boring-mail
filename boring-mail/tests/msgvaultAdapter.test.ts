@@ -183,6 +183,20 @@ describe('msgvaultAdapter', () => {
     db.close() // store.db aliases the same connection
   })
 
+  it('rejects an all-column archive whose trusted messages.id is not the single integer PK', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'msgvault-bad-identity-')), 'bad.db')
+    const bad = new DatabaseSync(path)
+    bad.exec(
+      SCHEMA.replace('id INTEGER PRIMARY KEY,\n  conversation_id', 'id TEXT,\n  conversation_id')
+        .replace(/ REFERENCES messages\(id\)( ON DELETE CASCADE)?/g, ''),
+    )
+    bad.exec(`INSERT INTO sources(id,kind,email) VALUES(1,'gmail','fixture@example.com');
+      INSERT INTO conversations(id,source_id,conversation_type) VALUES(1,1,'email_thread');
+      INSERT INTO messages(id,conversation_id,source_id) VALUES('duplicate',1,1),('duplicate',1,1)`)
+    bad.close()
+    expect(() => openMsgvaultStore(path)).toThrow(/messages\.id must have INTEGER affinity and be the single primary key/)
+  })
+
   it('opens read-only and rejects schema drift', async () => {
     const opened = openMsgvaultStore(dbPath)
     expect(opened.db.prepare('SELECT COUNT(*) c FROM messages').get()).toEqual({ c: 3 })

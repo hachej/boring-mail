@@ -5,6 +5,7 @@ import {
   draftContentDigest,
   openProductStore,
   ProductStoreError,
+  sendSnapshotDigest,
   type ReplyDraftInput,
 } from '../../src/mail/store/productDb.js'
 import { draft, reply, scenario, UI_SESSION, type Scenario } from './scenario.js'
@@ -84,6 +85,26 @@ describe('ProductStore drafts and approvals', () => {
     expect(store.outbox.approve(q.id, fresh, 'session-a').status).toBe('approved')
     expect(() => store.outbox.approve(q.id, fresh, 'session-a')).toThrow(/must be pending/)
   })
+  it('binds approval verifier to token, session, outbox and issued digest', () => {
+    const { store, save, path } = open(),
+      queued = store.outbox.enqueue(save().id),
+      token = store.outbox.issueApprovalCapability(queued.id, UI_SESSION),
+      altered = { ...queued.snapshot, subject: 'bait-and-switch' },
+      alteredDigest = draftContentDigest(altered) // snapshot digest differs by Message-ID coverage below
+    const raw = new DatabaseSync(path)
+    raw.exec(`DROP TRIGGER mail_outbox_snapshot_immutable;
+      CREATE TRIGGER mail_outbox_snapshot_immutable BEFORE UPDATE OF subject ON mail_outbox BEGIN SELECT 1; END`)
+    // Use the exact altered snapshot digest; this defeats a plain digest-equality check.
+    raw.prepare(`UPDATE mail_outbox SET subject=?,content_digest=? WHERE id=?`)
+      .run(altered.subject, sendSnapshotDigest(altered), queued.id)
+    raw.close()
+    expect(alteredDigest).not.toBe(queued.contentDigest)
+    expect(() => store.outbox.approve(queued.id, token, UI_SESSION)).toThrow(/capability or session binding invalid/)
+    store.close()
+    s = undefined
+    expect(() => openProductStore(path, { now: () => 1, resolveReplyTarget: () => null }))
+      .toThrow(/definition mismatch: trigger:mail_outbox_snapshot_immutable/)
+  })
   it('revalidates trusted row and identity at approval', () => {
     const { store, save, targets } = open(),
       q = store.outbox.enqueue(save().id),
@@ -135,6 +156,34 @@ describe('ProductStore drafts and approvals', () => {
     } finally {
       reopened.close()
     }
+  })
+  it('rejects valid-JSON durable rows with invalid mail semantics', () => {
+    const { store, save, path } = open(),
+      saved = save({}, 'semantic')
+    const raw = new DatabaseSync(path)
+    const cases: Array<[string, string, string]> = [
+      ['to_json', '[]', JSON.stringify(saved.to)],
+      ['to_json', '[""]', JSON.stringify(saved.to)],
+      ['attachments_json', '[{"name":"x","mimeType":"text/plain","contentHash":"","size":1}]', JSON.stringify(saved.attachments)],
+      ['send_as_address', ' Work@Example.com ', saved.sendAsAddress],
+      ['path', './drafts/reply.mail.md', saved.path],
+      ['content_digest', 'bad', saved.contentDigest],
+    ]
+    for (const [column, invalid, valid] of cases) {
+      raw.prepare(`UPDATE mail_drafts SET ${column}=? WHERE id=?`).run(invalid, saved.id)
+      expect(() => store.getDraft(saved.id)).toThrowError(expect.objectContaining({ code: 'corrupt_data' }))
+      expect(() => store.outbox.enqueue(saved.id)).toThrowError(expect.objectContaining({ code: 'corrupt_data' }))
+      raw.prepare(`UPDATE mail_drafts SET ${column}=? WHERE id=?`).run(valid, saved.id)
+    }
+    const queued = store.outbox.enqueue(saved.id)
+    raw.exec(`DROP TRIGGER mail_outbox_snapshot_immutable;
+      CREATE TRIGGER mail_outbox_snapshot_immutable BEFORE UPDATE OF subject ON mail_outbox BEGIN SELECT 1; END`)
+    raw.prepare(`UPDATE mail_outbox SET message_id='bad-message-id' WHERE id=?`).run(queued.id)
+    expect(() => store.outbox.get(queued.id)).toThrowError(expect.objectContaining({ code: 'corrupt_data' }))
+    raw.prepare(`UPDATE mail_outbox SET message_id=?,content_digest='BAD' WHERE id=?`)
+      .run(queued.snapshot.messageId, queued.id)
+    expect(() => store.outbox.get(queued.id)).toThrowError(expect.objectContaining({ code: 'corrupt_data' }))
+    raw.close()
   })
   it('validates inputs, JSON constraints, and malformed durable capability state', () => {
     const { store, save, path } = open()

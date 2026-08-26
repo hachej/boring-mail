@@ -5,7 +5,8 @@
 // product data happen by rfc822_message_id (+ source_id) at the product layer.
 //
 // msgvault is alpha software: this adapter is the ONLY module allowed to know
-// its schema. Pin-checked on open; schema drift fails loudly here, nowhere else.
+// its schema. Shape-checked on open and tested against 0.19; schema drift fails
+// loudly here. msgvault exposes no runtime release-version metadata to pin.
 import { DatabaseSync } from 'node:sqlite'
 import { inflateSync } from 'node:zlib'
 import { join } from 'node:path'
@@ -14,7 +15,7 @@ import { join } from 'node:path'
 export const MSGVAULT_TESTED_MAJOR_MINOR = '0.19'
 
 export interface MsgvaultStoreOptions {
-  /** Fail open if the archive's schema version is not the tested one. Default true. */
+  /** Fail open if the archive shape differs from the tested contract. Default true. */
   strictSchema?: boolean
 }
 
@@ -102,10 +103,27 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
   const columnErrors: string[] = []
   for (const [table, required] of Object.entries(REQUIRED_SCHEMA)) {
     if (!have.has(table)) continue
-    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+      name: string; type: string; notnull: number; pk: number
+    }>
     const names = new Set(columns.map((column) => column.name))
     const missing = required.filter((column) => !names.has(column))
     if (missing.length) columnErrors.push(`${table} missing column(s): ${missing.join(', ')}`)
+    if (table === 'messages') {
+      const id = columns.find((column) => column.name === 'id')
+      const source = columns.find((column) => column.name === 'source_id')
+      const rfc822 = columns.find((column) => column.name === 'rfc822_message_id')
+      const primaryKeys = columns.filter((column) => column.pk > 0)
+      if (!id || !/int/i.test(id.type) || id.pk !== 1 || primaryKeys.length !== 1) {
+        columnErrors.push('messages.id must have INTEGER affinity and be the single primary key')
+      }
+      if (!source || !/int/i.test(source.type) || source.notnull !== 1) {
+        columnErrors.push('messages.source_id must be a NOT NULL integer')
+      }
+      if (!rfc822 || !/(char|clob|text)/i.test(rfc822.type)) {
+        columnErrors.push('messages.rfc822_message_id must have TEXT affinity')
+      }
+    }
   }
   const ftsRow = db.prepare(`SELECT sql FROM sqlite_master WHERE name='messages_fts'`).get() as
     | { sql: string | null }
@@ -222,10 +240,17 @@ export interface ResolvedMsgvaultReply {
 }
 /** Resolve the immutable msgvault row key to server-owned reply identity. */
 export function resolveReplyTarget(db: DatabaseSync, messageId: number): ResolvedMsgvaultReply | null {
+  if (!Number.isSafeInteger(messageId) || messageId <= 0) throw new Error('msgvault message id must be a positive safe integer')
   const row = db
     .prepare(`SELECT rfc822_message_id,source_id FROM messages WHERE id=? AND deleted_at IS NULL`)
-    .get(messageId) as { rfc822_message_id: string | null; source_id: number } | undefined
-  return row?.rfc822_message_id ? { rfc822MessageId: row.rfc822_message_id, sourceId: row.source_id } : null
+    .get(messageId) as Record<string, unknown> | undefined
+  if (!row || row.rfc822_message_id === null) return null
+  if (typeof row.rfc822_message_id !== 'string' || !row.rfc822_message_id.trim() ||
+      row.rfc822_message_id !== row.rfc822_message_id.trim() ||
+      !Number.isSafeInteger(row.source_id) || Number(row.source_id) <= 0) {
+    throw new Error('msgvault reply identity row has invalid RFC822/source values')
+  }
+  return { rfc822MessageId: row.rfc822_message_id, sourceId: row.source_id as number }
 }
 
 /** Trusted ownership check retained for read-side callers. */

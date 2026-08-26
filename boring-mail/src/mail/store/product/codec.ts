@@ -1,3 +1,4 @@
+import { isContentDigest, isGeneratedMessageId, normalizeDraftPath, sendContentIssue } from './sendSnapshot.js'
 import {
   ProductStoreError,
   type AttentionItem,
@@ -50,6 +51,7 @@ export interface OutboxRow extends SendRow {
   failure_detail: unknown
   terminal_reason: unknown
   retry_of: unknown
+  pre_dispatch_history_id: unknown
 }
 function corrupt(message: string): never {
   throw new ProductStoreError('corrupt_data', message)
@@ -120,7 +122,7 @@ export function decodeSendContent(row: SendRow): SendContent {
     s = nullableInt(row.reply_source_id, 'reply_source_id')
   if ((m === null) !== (r === null) || (m === null) !== (s === null))
     corrupt('reply target columns must be all null or all present')
-  return {
+  const content: SendContent = {
     accountId: str(row.account_id, 'account_id'),
     sendAsAddress: str(row.send_as_address, 'send_as_address'),
     ...(m !== null ? { reply: { messageId: m, rfc822MessageId: r!, sourceId: s! } } : {}),
@@ -131,14 +133,41 @@ export function decodeSendContent(row: SendRow): SendContent {
     bodyMarkdown: str(row.body_markdown, 'body_markdown'),
     attachments: attachmentArray(row.attachments_json),
   }
+  const issue = sendContentIssue(content)
+  if (issue) corrupt(issue)
+  return content
+}
+function nonempty(v: unknown, name: string): string {
+  const value = str(v, name)
+  if (!value) corrupt(`${name} must be nonempty`)
+  return value
+}
+function positive(v: unknown, name: string): number {
+  const value = integer(v, name)
+  if (value <= 0) corrupt(`${name} must be positive`)
+  return value
+}
+function durablePath(v: unknown): string {
+  const value = str(v, 'draft.path')
+  try {
+    if (normalizeDraftPath(value) !== value) corrupt('draft.path must be canonical')
+  } catch {
+    corrupt('draft.path must be a canonical safe .mail.md path')
+  }
+  return value
+}
+function digest(v: unknown, name: string): string {
+  const value = str(v, name)
+  if (!isContentDigest(value)) corrupt(`${name} must be a lowercase SHA-256 digest`)
+  return value
 }
 export function decodeDraft(row: DraftRow): DraftRecord {
   return {
-    id: str(row.id, 'draft.id'),
-    path: str(row.path, 'draft.path'),
-    revision: nonnegative(row.revision, 'draft.revision'),
+    id: nonempty(row.id, 'draft.id'),
+    path: durablePath(row.path),
+    revision: positive(row.revision, 'draft.revision'),
     ...decodeSendContent(row),
-    contentDigest: str(row.content_digest, 'draft.content_digest'),
+    contentDigest: digest(row.content_digest, 'draft.content_digest'),
   }
 }
 const statuses = new Set<OutboxStatus>([
@@ -157,13 +186,17 @@ const statuses = new Set<OutboxStatus>([
 export function decodeOutbox(row: OutboxRow): OutboxRecord {
   const status = str(row.status, 'status') as OutboxStatus
   if (!statuses.has(status)) corrupt(`unknown outbox status ${status}`)
+  const messageId = str(row.message_id, 'message_id')
+  if (!isGeneratedMessageId(messageId)) corrupt('message_id has invalid generated shape')
+  const retryOf = nullableStr(row.retry_of, 'retry_of')
+  if (retryOf === '') corrupt('retry_of must be null or nonempty')
   const base = {
-    id: str(row.id, 'outbox.id'),
-    draftId: str(row.draft_id, 'draft_id'),
-    draftRevision: nonnegative(row.draft_revision, 'draft_revision'),
-    snapshot: { ...decodeSendContent(row), messageId: str(row.message_id, 'message_id') } as SendSnapshot,
-    contentDigest: str(row.content_digest, 'content_digest'),
-    retryOf: nullableStr(row.retry_of, 'retry_of'),
+    id: nonempty(row.id, 'outbox.id'),
+    draftId: nonempty(row.draft_id, 'draft_id'),
+    draftRevision: positive(row.draft_revision, 'draft_revision'),
+    snapshot: { ...decodeSendContent(row), messageId } as SendSnapshot,
+    contentDigest: digest(row.content_digest, 'content_digest'),
+    retryOf,
   }
   const capHash = nullableStr(row.approval_cap_hash, 'approval_cap_hash'),
     sessionHash = nullableStr(row.approval_session_hash, 'approval_session_hash'),
@@ -174,7 +207,9 @@ export function decodeOutbox(row: OutboxRow): OutboxRecord {
     deadline = nullableNonnegative(row.reconcile_deadline_ms, 'reconcile_deadline_ms'),
     next = nullableNonnegative(row.reconcile_next_ms, 'reconcile_next_ms'),
     attempts = nullableNonnegative(row.reconcile_attempts, 'reconcile_attempts'),
-    detail = nullableStr(row.reconcile_detail, 'reconcile_detail')
+    detail = nullableStr(row.reconcile_detail, 'reconcile_detail'),
+    historyId = nullableStr(row.pre_dispatch_history_id, 'pre_dispatch_history_id')
+  if (historyId !== null && !/^\d+$/.test(historyId)) corrupt('pre_dispatch_history_id must be numeric text')
   const capabilityParts = [capHash, sessionHash, approvalExpiry]
   if (capabilityParts.some((value) => value !== null) && capabilityParts.some((value) => value === null)) {
     corrupt('approval capability columns must be all null or all present')
@@ -187,16 +222,22 @@ export function decodeOutbox(row: OutboxRow): OutboxRecord {
   }
   switch (status) {
     case 'pending_approval':
+      if (historyId !== null) corrupt('pending row may not contain dispatch history')
       return { ...base, status, approvalExpiresAt: approvalExpiry }
     case 'approved': {
+      if (historyId !== null) corrupt('approved row may not contain dispatch history')
       if (consumed === null) corrupt('approved row lacks approval consumption')
       return { ...base, status, approvalConsumedAt: consumed! }
     }
-    case 'claimed':
+    case 'claimed': {
+      if (consumed === null || owner === null || lease === null || historyId !== null)
+        corrupt('claimed row has invalid approval, lease or dispatch history')
+      return { ...base, status, approvalConsumedAt: consumed, lease: { owner, expiresAt: lease } }
+    }
     case 'dispatched': {
-      if (consumed === null || owner === null || lease === null)
-        corrupt(`${status} row lacks approval or lease`)
-      return { ...base, status, approvalConsumedAt: consumed!, lease: { owner: owner!, expiresAt: lease! } }
+      if (consumed === null || owner === null || lease === null || historyId === null)
+        corrupt('dispatched row lacks approval, lease or history cursor')
+      return { ...base, status, approvalConsumedAt: consumed, lease: { owner, expiresAt: lease }, preDispatchHistoryId: historyId }
     }
     case 'unknown': {
       if (consumed === null || deadline === null || next === null || attempts === null || detail === null)
@@ -205,6 +246,7 @@ export function decodeOutbox(row: OutboxRow): OutboxRecord {
         ...base,
         status,
         approvalConsumedAt: consumed!,
+        preDispatchHistoryId: historyId ?? corrupt('unknown row lacks history cursor'),
         reconciliation: { deadlineAt: deadline!, nextAttemptAt: next!, attempts: attempts!, detail: detail! },
       }
     }
@@ -215,6 +257,7 @@ export function decodeOutbox(row: OutboxRow): OutboxRecord {
         ...base,
         status,
         approvalConsumedAt: consumed!,
+        preDispatchHistoryId: historyId ?? corrupt('human-decision row lacks history cursor'),
         reconciliation: { deadlineAt: deadline!, attempts: attempts!, detail: detail! },
       }
     }
@@ -227,6 +270,7 @@ export function decodeOutbox(row: OutboxRow): OutboxRecord {
           ...base,
           status,
           approvalConsumedAt: consumed!,
+          preDispatchHistoryId: historyId ?? corrupt('sent row lacks history cursor'),
           delivery: { basis, providerMessageId: provider },
         }
       if (basis === 'human' && provider === null)
@@ -234,6 +278,7 @@ export function decodeOutbox(row: OutboxRow): OutboxRecord {
           ...base,
           status,
           approvalConsumedAt: consumed!,
+          preDispatchHistoryId: historyId ?? corrupt('sent row lacks history cursor'),
           delivery: { basis, providerMessageId: null },
         }
       return corrupt('sent row has invalid delivery evidence')
@@ -246,18 +291,21 @@ export function decodeOutbox(row: OutboxRow): OutboxRecord {
         ...base,
         status,
         approvalConsumedAt: consumed!,
+        preDispatchHistoryId: historyId ?? corrupt('failed row lacks history cursor'),
         failure: { code: code!, detail: failureDetail! },
       }
     }
     case 'rejected':
+      if (consumed !== null || historyId !== null) corrupt('rejected row has approval or dispatch evidence')
       return { ...base, status }
     case 'cancelled': {
       const reason = nullableStr(row.terminal_reason, 'terminal_reason')
-      if (consumed === null || (reason !== 'cancelled' && reason !== 'retry'))
-        corrupt('cancelled row lacks valid reason')
-      return { ...base, status, approvalConsumedAt: consumed!, reason: reason as 'cancelled' | 'retry' }
+      if (consumed === null || (reason !== 'cancelled' && reason !== 'retry') ||
+          (reason === 'retry') !== (historyId !== null)) corrupt('cancelled row lacks valid reason/history evidence')
+      return { ...base, status, approvalConsumedAt: consumed, reason, preDispatchHistoryId: historyId }
     }
     case 'stale':
+      if (historyId !== null) corrupt('stale row may not contain dispatch history')
       return { ...base, status, approvalConsumedAt: consumed }
   }
 }
@@ -266,10 +314,10 @@ export function decodeAttention(row: Record<string, unknown>): AttentionItem {
   if (raw !== 'approval_required' && raw !== 'send_unknown') corrupt('unknown attention kind')
   const kind = raw as AttentionItem['kind']
   return {
-    id: str(row.id, 'attention.id'),
+    id: nonempty(row.id, 'attention.id'),
     kind,
-    accountId: str(row.account_id, 'attention.account_id'),
-    outboxId: str(row.outbox_id, 'attention.outbox_id'),
+    accountId: nonempty(row.account_id, 'attention.account_id'),
+    outboxId: nonempty(row.outbox_id, 'attention.outbox_id'),
     title: str(row.title, 'attention.title'),
     detail: str(row.detail, 'attention.detail'),
     createdAt: nonnegative(row.created_ms, 'attention.created_ms'),

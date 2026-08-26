@@ -53,20 +53,34 @@ describe('product migrations', () => {
       expect(() => openProductStore(path, deps)).toThrow(fake === 'future' ? /newer/ : /missing table/)
     }
   })
-  it('validates every current column, index, and trigger on open', () => {
-    const triggerPath = temp()
-    openProductStore(triggerPath, deps).close()
-    const triggerDb = new DatabaseSync(triggerPath)
-    triggerDb.exec(`DROP TRIGGER mail_outbox_snapshot_immutable`)
-    triggerDb.close()
-    expect(() => openProductStore(triggerPath, deps)).toThrow(/missing trigger/)
-
-    const columnPath = temp()
-    openProductStore(columnPath, deps).close()
-    const columnDb = new DatabaseSync(columnPath)
-    columnDb.exec(`ALTER TABLE mail_attention RENAME COLUMN detail TO broken_detail`)
-    columnDb.close()
-    expect(() => openProductStore(columnPath, deps)).toThrow(/mail_attention missing columns: detail/)
+  it('compares exact definitions for every table, index, and trigger', () => {
+    const cases: Array<{ mutate: string; expected: RegExp }> = [
+      {
+        mutate: `DROP TRIGGER mail_outbox_snapshot_immutable;
+          CREATE TRIGGER mail_outbox_snapshot_immutable BEFORE UPDATE OF subject ON mail_outbox BEGIN SELECT 1; END`,
+        expected: /definition mismatch: trigger:mail_outbox_snapshot_immutable/,
+      },
+      {
+        mutate: `DROP INDEX idx_mail_attention_open`,
+        expected: /missing index:idx_mail_attention_open/,
+      },
+      {
+        mutate: `DROP INDEX idx_mail_outbox_status; CREATE INDEX idx_mail_outbox_status ON mail_outbox(status)`,
+        expected: /definition mismatch: index:idx_mail_outbox_status/,
+      },
+      {
+        mutate: `ALTER TABLE mail_attention RENAME COLUMN detail TO broken_detail`,
+        expected: /definition mismatch: table:mail_attention/,
+      },
+    ]
+    for (const { mutate, expected } of cases) {
+      const path = temp()
+      openProductStore(path, deps).close()
+      const db = new DatabaseSync(path)
+      db.exec(mutate)
+      db.close()
+      expect(() => openProductStore(path, deps)).toThrow(expected)
+    }
   })
   it('rejects current schemas with foreign-key corruption', () => {
     const path = temp()

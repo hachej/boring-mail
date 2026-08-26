@@ -4,7 +4,7 @@ import { decodeDraft, type DraftRow } from './codec.js'
 import { StoreContext, fail } from './context.js'
 import { migrateProductDatabase } from './migrations.js'
 import { OutboxMachine } from './OutboxMachine.js'
-import { draftContentDigest, normalizeDraftFields, resolvedReply } from './sendSnapshot.js'
+import { assertValidSendContent, draftContentDigest, normalizeDraftFields, resolvedReply } from './sendSnapshot.js'
 import {
   ProductStoreError,
   type AccountInput,
@@ -39,7 +39,7 @@ export class ProductStore {
   upsertAccount(input: AccountInput): void {
     const id = input.accountId.trim(),
       primary = input.primaryAddress.trim().toLowerCase()
-    if (!id || !primary || !Number.isSafeInteger(input.providerSourceId) || input.providerSourceId < 0)
+    if (!id || !primary || !Number.isSafeInteger(input.providerSourceId) || input.providerSourceId <= 0)
       fail('invalid_input', 'account id, primary address and integer source are required')
     const sendAs = [...new Set(input.sendAs.map((x) => x.trim().toLowerCase()).filter(Boolean))]
     if (!sendAs.includes(primary)) sendAs.unshift(primary)
@@ -65,7 +65,7 @@ export class ProductStore {
       accountId = input.accountId.trim()
       if (!accountId) fail('invalid_input', 'account id is required')
     } else {
-      if (!Number.isSafeInteger(input.replyToMessageId) || input.replyToMessageId < 0)
+      if (!Number.isSafeInteger(input.replyToMessageId) || input.replyToMessageId <= 0)
         fail('invalid_input', 'reply message id must be a safe integer')
       const target = this.#c.deps.resolveReplyTarget(input.replyToMessageId)
       if (!target)
@@ -89,6 +89,7 @@ export class ProductStore {
       bodyMarkdown: fields.bodyMarkdown,
       attachments: fields.attachments,
     }
+    assertValidSendContent(content)
     this.#c.assertIdentity(content)
     const digest = draftContentDigest(content)
     return this.#c.transaction(() => {

@@ -28,7 +28,7 @@ const address = (input: string): string => {
   if (!value) invalid('mail address may not be empty')
   return value
 }
-function path(input: string): string {
+export function normalizeDraftPath(input: string): string {
   const slash = input.replace(/\\/g, '/')
   if (!slash || slash.startsWith('/') || slash.split('/').includes('..'))
     invalid('draft path must be workspace-relative and may not escape')
@@ -48,7 +48,7 @@ function attachments(input: MailAttachment[]): MailAttachment[] {
 export function normalizeDraftFields(input: DraftInput): NormalizedDraftFields {
   if (!Array.isArray(input.to) || input.to.length === 0) invalid('at least one To recipient is required')
   return {
-    path: path(input.path),
+    path: normalizeDraftPath(input.path),
     sendAsAddress: address(input.sendAsAddress),
     to: input.to.map(address),
     cc: (input.cc ?? []).map(address),
@@ -58,6 +58,48 @@ export function normalizeDraftFields(input: DraftInput): NormalizedDraftFields {
     attachments: attachments(input.attachments ?? []),
   }
 }
+
+function canonicalAddress(value: string): boolean {
+  return value.length > 0 && value === value.trim().toLowerCase()
+}
+
+/** Returns the first semantic violation shared by input and durable-row validation. */
+export function sendContentIssue(input: SendContent): string | null {
+  if (!input.accountId || input.accountId !== input.accountId.trim()) return 'account id must be nonempty and canonical'
+  if (!canonicalAddress(input.sendAsAddress)) return 'send-as address must be nonempty and canonical'
+  if (!Array.isArray(input.to) || input.to.length === 0) return 'at least one To recipient is required'
+  for (const [name, values] of [['to', input.to], ['cc', input.cc], ['bcc', input.bcc]] as const) {
+    if (!Array.isArray(values) || values.some((value) => !canonicalAddress(value))) {
+      return `${name} recipients must be nonempty canonical addresses`
+    }
+  }
+  if (typeof input.subject !== 'string' || typeof input.bodyMarkdown !== 'string') return 'subject and body must be text'
+  if (input.reply) {
+    if (!Number.isSafeInteger(input.reply.messageId) || input.reply.messageId <= 0 ||
+        !Number.isSafeInteger(input.reply.sourceId) || input.reply.sourceId <= 0 ||
+        !input.reply.rfc822MessageId || input.reply.rfc822MessageId !== input.reply.rfc822MessageId.trim()) {
+      return 'reply target must contain positive row/source ids and a canonical RFC822 message id'
+    }
+  }
+  if (!Array.isArray(input.attachments)) return 'attachments must be an array'
+  for (const item of input.attachments) {
+    if (!item.name || !item.mimeType || !item.contentHash ||
+        item.name !== item.name.trim() || item.mimeType !== item.mimeType.trim() ||
+        item.contentHash !== item.contentHash.trim() ||
+        !Number.isSafeInteger(item.size) || item.size < 0) {
+      return 'attachments require canonical name/type/hash and nonnegative safe size'
+    }
+  }
+  return null
+}
+
+export function assertValidSendContent(input: SendContent): void {
+  const issue = sendContentIssue(input)
+  if (issue) invalid(issue)
+}
+
+export const isContentDigest = (value: string): boolean => /^[0-9a-f]{64}$/.test(value)
+export const isGeneratedMessageId = (value: string): boolean => /^<out-[0-9a-f]{32}@boring-mail\.invalid>$/.test(value)
 
 /** The only allowlist of bytes/identity covered by approval. */
 export function projectSendContent(input: SendContent): SendContent {
