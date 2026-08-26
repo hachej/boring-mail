@@ -71,25 +71,21 @@ const openEventually = async () => {
 }
 
 try {
-  const lockPath = join(directory, '.boring-mail.lock')
-  const victim = join(directory, 'lock-victim.txt')
+  const ownerPath = join(directory, '.boring-mail.owner.json')
+  const victim = join(directory, 'owner-victim.txt')
   writeFileSync(victim, 'do-not-truncate')
-  symlinkSync(victim, lockPath)
-  await openMailStore({ productDbPath }).then(
-    (store) => store.close().then(() => { throw new Error('symlink lock unexpectedly opened') }),
-    () => undefined,
-  )
-  if (readFileSync(victim, 'utf8') !== 'do-not-truncate') throw new Error('lock symlink target was modified')
-  rmSync(lockPath)
-  linkSync(victim, lockPath)
-  await openMailStore({ productDbPath }).then(
-    (store) => store.close().then(() => { throw new Error('hardlink lock unexpectedly opened') }),
-    () => undefined,
-  )
-  if (readFileSync(victim, 'utf8') !== 'do-not-truncate') throw new Error('lock hardlink target was modified')
-  rmSync(lockPath)
-  await openMailStore({ productDbPath: lockPath }).then(
-    (store) => store.close().then(() => { throw new Error('reserved lock path opened as database') }),
+  symlinkSync(victim, ownerPath)
+  const symlinkOwnerStore = await openMailStore({ productDbPath })
+  await symlinkOwnerStore.close()
+  if (readFileSync(victim, 'utf8') !== 'do-not-truncate') throw new Error('owner symlink target was modified')
+  rmSync(ownerPath)
+  linkSync(victim, ownerPath)
+  const hardlinkOwnerStore = await openMailStore({ productDbPath })
+  await hardlinkOwnerStore.close()
+  if (readFileSync(victim, 'utf8') !== 'do-not-truncate') throw new Error('owner hardlink target was modified')
+  rmSync(ownerPath)
+  await openMailStore({ productDbPath: ownerPath }).then(
+    (store) => store.close().then(() => { throw new Error('reserved owner path opened as database') }),
     () => undefined,
   )
 
@@ -119,11 +115,15 @@ try {
   const queued = await store.outbox.enqueue(draft.id, 'smoke-operation')
   if (queued.status !== 'pending_approval') throw new Error(`unexpected outbox state ${queued.status}`)
 
-  const metadata = JSON.parse(readFileSync(join(directory, '.boring-mail.lock'), 'utf8'))
+  const metadata = JSON.parse(readFileSync(ownerPath, 'utf8'))
   if (!Number.isSafeInteger(metadata.pid) || metadata.pid <= 0 || metadata.pid === process.pid ||
       typeof metadata.processStartedAt !== 'string') {
-    throw new Error('lock metadata lacks storage-owner pid/start time')
+    throw new Error('owner metadata lacks storage pid/start time')
   }
+  // Metadata is not lock authority: unlinking/replacing it cannot admit a
+  // second owner because the canonical directory inode remains locked.
+  rmSync(ownerPath)
+  writeFileSync(ownerPath, 'non-authoritative replacement')
   const blocked = childOpen()
   if (!blocked.stdout.includes('ERROR:mail_store_already_active')) {
     throw new Error(`second process was not locked out: ${blocked.stdout}${blocked.stderr}`)
@@ -141,7 +141,7 @@ try {
   const lossStore = await openMailStore({ productDbPath }, {
     startupTimeoutMs: 3_000, requestTimeoutMs: 3_000,
   })
-  const owner = JSON.parse(readFileSync(join(directory, '.boring-mail.lock'), 'utf8')).pid
+  const owner = JSON.parse(readFileSync(ownerPath, 'utf8')).pid
   let oldResolved = false
   const inFlight = lossStore.saveDraft({
     kind: 'compose', path: 'large.mail.md', accountId: 'smoke',

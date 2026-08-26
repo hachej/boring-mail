@@ -118,22 +118,23 @@ class StorageProcessTransport extends EventEmitter {
   constructor(config: MailStoreWorkerConfig) {
     super()
     const workerPath = fileURLToPath(new URL('./mailStoreWorker.js', import.meta.url))
-    const lockPath = join(dirname(config.productDbPath), '.boring-mail.lock')
+    const dataDirectory = dirname(config.productDbPath)
+    const ownerMetadataPath = join(dataDirectory, '.boring-mail.owner.json')
     let lockFd: number
     try {
+      // Lock the canonical directory inode itself. Unlike a sidecar lock file,
+      // its pathname cannot be unlinked/recreated to manufacture a second lock.
       lockFd = openSync(
-        lockPath,
-        fsConstants.O_CREAT | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
-        0o600,
+        dataDirectory,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
       )
-      const lockStat = fstatSync(lockFd)
-      if (!lockStat.isFile() || lockStat.nlink !== 1) {
+      if (!fstatSync(lockFd).isDirectory()) {
         closeSync(lockFd)
-        throw new ProductStoreError('invalid_input', 'mail store lock must be a single-link regular file')
+        throw new ProductStoreError('invalid_input', 'mail store data root must be a directory')
       }
     } catch (error) {
       if (error instanceof ProductStoreError) throw error
-      throw new ProductStoreError('invalid_input', `cannot safely open mail store lock: ${(error as Error).message}`)
+      throw new ProductStoreError('invalid_input', `cannot safely open mail store data root: ${(error as Error).message}`)
     }
     try {
       this.#child = spawn('/bin/sh', [
@@ -145,7 +146,8 @@ class StorageProcessTransport extends EventEmitter {
         env: {
           ...process.env,
           BORING_MAIL_WORKER_CONFIG: JSON.stringify(config),
-          BORING_MAIL_LOCK_PATH: lockPath,
+          BORING_MAIL_DATA_DIRECTORY: dataDirectory,
+          BORING_MAIL_OWNER_METADATA_PATH: ownerMetadataPath,
           BORING_MAIL_LOCK_FD: '4',
         },
         // fd 4 is the already-opened O_NOFOLLOW lock. The child inherits the
@@ -176,7 +178,7 @@ class StorageProcessTransport extends EventEmitter {
           error: {
             name: 'ProductStoreError',
             code: 'mail_store_already_active',
-            message: `MAIL_STORE_ALREADY_ACTIVE: another process owns ${lockPath}`,
+            message: `MAIL_STORE_ALREADY_ACTIVE: another process owns ${dataDirectory}`,
           },
         } satisfies RpcResponse)
       } else if (!this.#readySeen && this.#stderr.trim()) {
@@ -388,16 +390,16 @@ function canonicalConfig(config: MailStoreWorkerConfig): MailStoreWorkerConfig {
     if (error instanceof ProductStoreError) throw error
     throw new ProductStoreError('invalid_input', 'product database path must have an existing canonical directory')
   }
-  const reservedLockPath = join(dirname(productDbPath), '.boring-mail.lock')
-  if (productDbPath === reservedLockPath) {
-    throw new ProductStoreError('invalid_input', 'product database may not use the reserved .boring-mail.lock path')
+  const reservedMetadataPath = join(dirname(productDbPath), '.boring-mail.owner.json')
+  if (productDbPath === reservedMetadataPath) {
+    throw new ProductStoreError('invalid_input', 'product database may not use the reserved owner-metadata path')
   }
   let msgvaultDbPath: string | undefined
   if (config.msgvaultDbPath) {
     try { msgvaultDbPath = realpathSync.native(resolve(config.msgvaultDbPath)) }
     catch { throw new ProductStoreError('invalid_input', 'msgvault database path must exist') }
-    if (msgvaultDbPath === reservedLockPath) {
-      throw new ProductStoreError('invalid_input', 'msgvault database may not use the reserved .boring-mail.lock path')
+    if (msgvaultDbPath === reservedMetadataPath) {
+      throw new ProductStoreError('invalid_input', 'msgvault database may not use the reserved owner-metadata path')
     }
   }
   return { productDbPath, ...(msgvaultDbPath ? { msgvaultDbPath } : {}) }

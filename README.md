@@ -110,7 +110,7 @@ Product storage consumers import the compiled worker-backed entry:
 import { openMailStore } from '@hachej/boring-mail/mail-store'
 ```
 
-Do not import `src/mail/store/productDb.ts` from application code. It is compile input; the package export keeps the emitted `mailStoreWorker.js` adjacent to the RPC facade. The storage process inherits a pre-opened, `O_NOFOLLOW` descriptor, locks it with util-linux `flock`, then `exec`s Node while retaining that descriptor. The only synchronous SQLite owner and the OS lock therefore have the same lifetime.
+Do not import `src/mail/store/productDb.ts` from application code. It is compile input; the package export keeps the emitted `mailStoreWorker.js` adjacent to the RPC facade. The storage process inherits an `O_DIRECTORY | O_NOFOLLOW` descriptor for the canonical data root, locks that directory inode with util-linux `flock`, then `exec`s Node while retaining the descriptor. The only synchronous SQLite owner and the OS lock therefore have the same lifetime; the owner JSON sidecar is informational only.
 
 ## Security / repo hygiene
 
