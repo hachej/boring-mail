@@ -187,10 +187,14 @@ while being the one this deployment actually needs.
 
 ---
 
-## D8 — Storage: `node:sqlite` on a dedicated worker thread; `MailStore` is a driver-agnostic async RPC facade — **LOCKED**
+## D8 — Storage: `node:sqlite` in one lock-owning storage process; `MailStore` is a driver-agnostic async RPC facade — **LOCKED, amended during bm-8ae review**
 
-**What.** One storage worker per data directory, one `DatabaseSync` connection,
-all writes serialised. `MailStore` on the main thread is a typed async RPC facade.
+**What.** One storage process per canonical data directory, one `DatabaseSync`
+connection, all writes serialised. `MailStore` on the host thread is a typed
+async RPC facade. The process inherits and exclusively locks both the canonical
+data-directory inode and product-database inode before opening SQLite. IPC uses
+Node's advanced V8 serialization so omitted optional arguments remain
+`undefined` rather than becoming JSON `null`.
 
 **Why.** `DatabaseSync` is synchronous; on the Fastify thread a large ingest, an
 FTS `MATCH`, a migration, or a rebuild freezes every route, both syncs, and the
@@ -199,18 +203,21 @@ fix is *where* the store runs.
 
 **Rationale.** `node:sqlite` avoids a native build step in a plugin meant to be
 `npm install`-able. Verified: unflagged on Node 22.22.1, SQLite 3.51.2, FTS5 and
-JSON1 present.
+JSON1 present. The original worker-thread topology was replaced after review
+proved that an external lock helper could lose its kernel lock while a
+non-interruptible synchronous SQLite call continued. Executing SQLite in the
+same process that retains the inherited flock descriptors makes owner death and
+lock release one OS lifetime. Request deadlines therefore fail-stop that whole
+process rather than pretending to cancel one statement.
 
-**Known limits (measured, round 4).** The worker moves the *query* off the main
-thread but not the *result*: deserialising 5,000 rows costs ~92 ms median /
-286 ms p95 on the receiving thread, and `structuredClone` alone accounts for
-nearly all of it — so the worker buys little on the read path. There is **no**
-`sqlite3_interrupt` in `node:sqlite`, so a single long statement cannot be
-cancelled; `'rebuild'`, `VACUUM`, `PRAGMA optimize`, and the snapshot sweep are
-un-chunkable and need an explicit maintenance mode.
+**Known limits.** Process IPC still deserialises results on the receiving thread;
+large result sets must remain bounded. There is no `sqlite3_interrupt` in
+`node:sqlite`, so a single long statement cannot be cancelled in place;
+`'rebuild'`, `VACUUM`, `PRAGMA optimize`, and snapshot sweeps need explicit
+maintenance mode or chunking where available.
 
 **Re-evaluate when.** `node:sqlite` stabilises, or a **measured** need for a
-second read-only connection or a JSON-string transport appears.
+second read-only connection appears.
 
 ---
 

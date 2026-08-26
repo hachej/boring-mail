@@ -103,9 +103,10 @@ const LOCK_CONFLICT_EXIT = 73
 const TERMINATE_GRACE_MS = 5_000
 
 /**
- * Default storage transport. A shell locks inherited fd 4, then `exec`s Node;
- * the storage process keeps that same open-file description for its lifetime,
- * so SQLite ownership and the kernel lock end atomically.
+ * Default storage transport. A shell locks inherited directory fd 4 and DB
+ * fd 5, then `exec`s Node. The storage process retains both open-file
+ * descriptions, so path replacement cannot create a second owner of the same
+ * database inode and SQLite ownership ends atomically with both kernel locks.
  */
 class StorageProcessTransport extends EventEmitter {
   readonly #child: ChildProcess
@@ -120,26 +121,30 @@ class StorageProcessTransport extends EventEmitter {
     const workerPath = fileURLToPath(new URL('./mailStoreWorker.js', import.meta.url))
     const dataDirectory = dirname(config.productDbPath)
     const ownerMetadataPath = join(dataDirectory, '.boring-mail.owner.json')
-    let lockFd: number
+    let directoryFd = -1
+    let databaseFd = -1
     try {
-      // Lock the canonical directory inode itself. Unlike a sidecar lock file,
-      // its pathname cannot be unlinked/recreated to manufacture a second lock.
-      lockFd = openSync(
+      directoryFd = openSync(
         dataDirectory,
         fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
       )
-      if (!fstatSync(lockFd).isDirectory()) {
-        closeSync(lockFd)
+      if (!fstatSync(directoryFd).isDirectory()) {
         throw new ProductStoreError('invalid_input', 'mail store data root must be a directory')
       }
-    } catch (error) {
-      if (error instanceof ProductStoreError) throw error
-      throw new ProductStoreError('invalid_input', `cannot safely open mail store data root: ${(error as Error).message}`)
-    }
-    try {
+      // Create/open the final database inode before spawning. Locking both the
+      // directory and this inode closes rename/recreate/move alias attacks.
+      databaseFd = openSync(
+        config.productDbPath,
+        fsConstants.O_CREAT | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+        0o600,
+      )
+      const databaseStat = fstatSync(databaseFd)
+      if (!databaseStat.isFile() || databaseStat.nlink !== 1) {
+        throw new ProductStoreError('invalid_input', 'product database must be a single-link regular file')
+      }
       this.#child = spawn('/bin/sh', [
         '-c',
-        `flock -n -E ${LOCK_CONFLICT_EXIT} 4 || exit $?; exec "$@"`,
+        `flock -n -E ${LOCK_CONFLICT_EXIT} 4 || exit $?; flock -n -E ${LOCK_CONFLICT_EXIT} 5 || exit $?; exec "$@"`,
         'boring-mail-storage',
         process.execPath, '--disable-warning=ExperimentalWarning', workerPath,
       ], {
@@ -148,15 +153,20 @@ class StorageProcessTransport extends EventEmitter {
           BORING_MAIL_WORKER_CONFIG: JSON.stringify(config),
           BORING_MAIL_DATA_DIRECTORY: dataDirectory,
           BORING_MAIL_OWNER_METADATA_PATH: ownerMetadataPath,
-          BORING_MAIL_LOCK_FD: '4',
+          BORING_MAIL_DIRECTORY_LOCK_FD: '4',
+          BORING_MAIL_DATABASE_LOCK_FD: '5',
         },
-        // fd 4 is the already-opened O_NOFOLLOW lock. The child inherits the
-        // same open-file description; closing our copy makes its lifetime the
-        // storage process lifetime.
-        stdio: ['ignore', 'ignore', 'pipe', 'ipc', lockFd],
+        // Advanced V8 serialization preserves omitted optional arguments as
+        // undefined; JSON IPC would silently turn array holes into null.
+        serialization: 'advanced',
+        stdio: ['ignore', 'ignore', 'pipe', 'ipc', directoryFd, databaseFd],
       })
+    } catch (error) {
+      if (error instanceof ProductStoreError) throw error
+      throw new ProductStoreError('invalid_input', `cannot safely start mail store owner: ${(error as Error).message}`)
     } finally {
-      closeSync(lockFd)
+      if (databaseFd >= 0) closeSync(databaseFd)
+      if (directoryFd >= 0) closeSync(directoryFd)
     }
     this.#closed = new Promise((resolveClosed) => {
       this.#child.once('close', (code, signal) => {

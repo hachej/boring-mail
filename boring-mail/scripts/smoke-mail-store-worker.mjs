@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -114,6 +115,36 @@ try {
   }, 'smoke-draft')
   const queued = await store.outbox.enqueue(draft.id, 'smoke-operation')
   if (queued.status !== 'pending_approval') throw new Error(`unexpected outbox state ${queued.status}`)
+  const autoIdDraft = await store.saveDraft({
+    kind: 'compose', path: 'auto-id.mail.md', accountId: 'smoke',
+    sendAsAddress: 'smoke@example.test', to: ['recipient@example.test'],
+    subject: 'optional argument smoke', bodyMarkdown: 'ok',
+  })
+  if (!autoIdDraft.id) throw new Error('omitted requestedId did not generate an id')
+  const token = await store.outbox.issueApprovalCapability(queued.id, 'smoke-session')
+  await store.outbox.approve(queued.id, token, 'smoke-session')
+  if ((await store.outbox.listAttention()).length !== 0) throw new Error('omitted openOnly did not default true')
+  const claimed = await store.outbox.claimNext('smoke-worker')
+  if (!claimed) throw new Error('omitted lease did not claim approved work')
+  await store.outbox.markDispatched(claimed.id, 'smoke-worker', '100')
+  await store.outbox.markUnknown(claimed.id, 'smoke-worker', 'smoke ambiguity')
+  if ((await store.outbox.dueReconciliations()).length !== 1) {
+    throw new Error('omitted reconciliation limit did not use its default')
+  }
+
+  // Renaming/recreating the configured root and moving the same DB inode must
+  // not bypass ownership: fd 5 remains locked by the original SQLite process.
+  const movedDirectory = `${directory}.moved`
+  renameSync(directory, movedDirectory)
+  mkdirSync(directory)
+  renameSync(join(movedDirectory, 'boring-mail.db'), productDbPath)
+  const movedDbBlocked = childOpen()
+  if (!movedDbBlocked.stdout.includes('ERROR:mail_store_already_active')) {
+    throw new Error(`moved database inode bypassed lock: ${movedDbBlocked.stdout}${movedDbBlocked.stderr}`)
+  }
+  renameSync(productDbPath, join(movedDirectory, 'boring-mail.db'))
+  rmSync(directory, { recursive: true, force: true })
+  renameSync(movedDirectory, directory)
 
   const metadata = JSON.parse(readFileSync(ownerPath, 'utf8'))
   if (!Number.isSafeInteger(metadata.pid) || metadata.pid <= 0 || metadata.pid === process.pid ||
@@ -190,7 +221,7 @@ try {
   })
   rmSync(consumer, { recursive: true, force: true })
   if (tsc.status !== 0) throw new Error(`strict mail-store type consumer failed:\n${tsc.stdout}${tsc.stderr}`)
-  console.log('✓ emitted mail-store process, atomic flock, RPC, and strict declaration smoke')
+  console.error('✓ emitted mail-store process, atomic flock, RPC, and strict declaration smoke')
 } finally {
   rmSync(directory, { recursive: true, force: true })
 }

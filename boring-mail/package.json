@@ -4,6 +4,9 @@
   "private": false,
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.22 <23"
+  },
   "description": "Agent-native Boring UI mail workbench plugin with .mail.md draft surfaces and an agent mail tool.",
   "exports": {
     "./front": "./src/boring-ui/front.tsx",
@@ -26,7 +29,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run -c vitest.config.ts",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json && node scripts/smoke-mail-store-worker.mjs"
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json && node scripts/smoke-mail-store-worker.mjs",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@hachej/boring-workspace": "0.1.103",

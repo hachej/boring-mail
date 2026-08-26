@@ -91,17 +91,25 @@ async function start(): Promise<void> {
     if (processMode) {
       const dataDirectory = process.env.BORING_MAIL_DATA_DIRECTORY
       const ownerPath = process.env.BORING_MAIL_OWNER_METADATA_PATH
-      const lockFd = Number(process.env.BORING_MAIL_LOCK_FD)
-      if (!dataDirectory || !ownerPath || !Number.isSafeInteger(lockFd) || lockFd < 0) {
-        throw new Error('data-directory lock environment is incomplete')
+      const directoryFd = Number(process.env.BORING_MAIL_DIRECTORY_LOCK_FD)
+      const databaseFd = Number(process.env.BORING_MAIL_DATABASE_LOCK_FD)
+      if (!dataDirectory || !ownerPath || !Number.isSafeInteger(directoryFd) || directoryFd < 0 ||
+          !Number.isSafeInteger(databaseFd) || databaseFd < 0) {
+        throw new Error('mail store lock environment is incomplete')
       }
-      // The shell locked the inherited canonical directory fd and exec'd this
-      // process. Verify inode identity under lock. Owner metadata is explicitly
-      // non-authoritative and replaced atomically, so symlinks are never followed.
-      const held = fstatSync(lockFd)
-      const named = statSync(dataDirectory)
-      if (!held.isDirectory() || !named.isDirectory() || held.dev !== named.dev || held.ino !== named.ino) {
+      // The shell locked both inherited fds and exec'd this process. Verify the
+      // canonical directory and database inode identities under those locks.
+      const heldDirectory = fstatSync(directoryFd)
+      const namedDirectory = statSync(dataDirectory)
+      const heldDatabase = fstatSync(databaseFd)
+      const namedDatabase = statSync(config.productDbPath)
+      if (!heldDirectory.isDirectory() || !namedDirectory.isDirectory() ||
+          heldDirectory.dev !== namedDirectory.dev || heldDirectory.ino !== namedDirectory.ino) {
         throw new ProductStoreError('invalid_input', 'mail store data-directory identity changed during acquisition')
+      }
+      if (!heldDatabase.isFile() || !namedDatabase.isFile() || heldDatabase.nlink !== 1 ||
+          heldDatabase.dev !== namedDatabase.dev || heldDatabase.ino !== namedDatabase.ino) {
+        throw new ProductStoreError('invalid_input', 'mail store database identity changed during acquisition')
       }
       const metadata = JSON.stringify({
         pid: process.pid,
