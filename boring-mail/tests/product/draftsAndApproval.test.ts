@@ -105,6 +105,16 @@ describe('ProductStore drafts and approvals', () => {
     expect(() => openProductStore(path, { now: () => 1, resolveReplyTarget: () => null }))
       .toThrow(/definition mismatch: trigger:mail_outbox_snapshot_immutable/)
   })
+  it('binds approval verifier to the issued expiry', () => {
+    const { store, save, path } = open(),
+      queued = store.outbox.enqueue(save({ path: 'drafts/expiry-binding.mail.md' }, 'expiry-binding').id),
+      token = store.outbox.issueApprovalCapability(queued.id, UI_SESSION, 100)
+    const raw = new DatabaseSync(path)
+    raw.prepare(`UPDATE mail_outbox SET approval_expires_ms=approval_expires_ms+10000 WHERE id=?`)
+      .run(queued.id)
+    raw.close()
+    expect(() => store.outbox.approve(queued.id, token, UI_SESSION)).toThrow(/capability or session binding invalid/)
+  })
   it('revalidates trusted row and identity at approval', () => {
     const { store, save, targets } = open(),
       q = store.outbox.enqueue(save().id),
@@ -166,6 +176,7 @@ describe('ProductStore drafts and approvals', () => {
       ['to_json', '[""]', JSON.stringify(saved.to)],
       ['attachments_json', '[{"name":"x","mimeType":"text/plain","contentHash":"","size":1}]', JSON.stringify(saved.attachments)],
       ['send_as_address', ' Work@Example.com ', saved.sendAsAddress],
+      ['subject', 'changed without its digest', saved.subject],
       ['path', './drafts/reply.mail.md', saved.path],
       ['content_digest', 'bad', saved.contentDigest],
     ]

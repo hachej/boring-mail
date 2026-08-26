@@ -72,6 +72,19 @@ describe('product migrations', () => {
         mutate: `ALTER TABLE mail_attention RENAME COLUMN detail TO broken_detail`,
         expected: /definition mismatch: table:mail_attention/,
       },
+      {
+        mutate: `CREATE TRIGGER unexpected_auto_approve AFTER INSERT ON mail_outbox BEGIN
+          UPDATE mail_outbox SET status='approved',approval_consumed_ms=0 WHERE id=NEW.id;
+        END`,
+        expected: /unexpected trigger:unexpected_auto_approve/,
+      },
+      {
+        mutate: `DROP TRIGGER mail_outbox_history_immutable;
+          CREATE TRIGGER mail_outbox_history_immutable BEFORE UPDATE OF pre_dispatch_history_id ON mail_outbox
+          WHEN OLD.pre_dispatch_history_id IS NOT NULL OR NEW.status!='DISPATCHED'
+          BEGIN SELECT RAISE(ABORT,'mail_outbox dispatch history is immutable'); END`,
+        expected: /definition mismatch: trigger:mail_outbox_history_immutable/,
+      },
     ]
     for (const { mutate, expected } of cases) {
       const path = temp()

@@ -1,4 +1,10 @@
-import { isContentDigest, isGeneratedMessageId, normalizeDraftPath, sendContentIssue } from './sendSnapshot.js'
+import {
+  draftContentDigest,
+  isContentDigest,
+  isGeneratedMessageId,
+  normalizeDraftPath,
+  sendContentIssue,
+} from './sendSnapshot.js'
 import {
   ProductStoreError,
   type AttentionItem,
@@ -162,13 +168,15 @@ function digest(v: unknown, name: string): string {
   return value
 }
 export function decodeDraft(row: DraftRow): DraftRecord {
-  return {
+  const record: DraftRecord = {
     id: nonempty(row.id, 'draft.id'),
     path: durablePath(row.path),
     revision: positive(row.revision, 'draft.revision'),
     ...decodeSendContent(row),
     contentDigest: digest(row.content_digest, 'draft.content_digest'),
   }
+  if (draftContentDigest(record) !== record.contentDigest) corrupt('draft content digest mismatch')
+  return record
 }
 const statuses = new Set<OutboxStatus>([
   'pending_approval',

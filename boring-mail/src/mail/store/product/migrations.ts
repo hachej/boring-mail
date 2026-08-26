@@ -89,7 +89,9 @@ CREATE UNIQUE INDEX idx_mail_attention_unique_open ON mail_attention(outbox_id,k
 
 interface SchemaObject { type: string; name: string; sql: string }
 function canonicalSql(sql: string): string {
-  return sql.trim().replace(/\s+/g, ' ').toLowerCase()
+  // Preserve string-literal and identifier case: SQL keywords are insensitive,
+  // but CHECK/status literals are not. Only formatting whitespace is ignored.
+  return sql.trim().replace(/\s+/g, ' ')
 }
 function manifest(db: DatabaseSync): Map<string, string> {
   const rows = db.prepare(`
@@ -113,10 +115,14 @@ function expected(): Map<string, string> {
 }
 function validate(db: DatabaseSync): void {
   const actual = manifest(db)
-  for (const [object, definition] of expected()) {
+  const wanted = expected()
+  for (const [object, definition] of wanted) {
     const found = actual.get(object)
     if (found === undefined) throw new ProductStoreError('unsupported_schema', `current schema missing ${object}`)
     if (found !== definition) throw new ProductStoreError('unsupported_schema', `current schema definition mismatch: ${object}`)
+  }
+  for (const object of actual.keys()) {
+    if (!wanted.has(object)) throw new ProductStoreError('unsupported_schema', `current schema has unexpected ${object}`)
   }
   const integrity = db.prepare('PRAGMA integrity_check').all() as Array<{ integrity_check: string }>
   if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {

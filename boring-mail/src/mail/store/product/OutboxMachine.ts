@@ -28,8 +28,11 @@ const sameBuffer = (hex: string, actual: Buffer): boolean => {
   return expected.length === actual.length && timingSafeEqual(expected, actual)
 }
 /** Domain-separated, unambiguous binding for the complete approval authority. */
-const approvalVerifier = (token: string, sessionId: string, outboxId: string, digest: string): Buffer =>
-  hash(JSON.stringify(['boring-mail.approval.v1', token, sessionId, outboxId, digest]))
+const approvalVerifier = (
+  token: string, sessionId: string, outboxId: string, digest: string, expiresAt: number,
+): Buffer => hash(JSON.stringify([
+  'boring-mail.approval.v1', token, sessionId, outboxId, digest, expiresAt,
+]))
 export class OutboxMachine {
   constructor(private readonly c: StoreContext) {}
   get(id: string): OutboxRecord | null {
@@ -115,7 +118,7 @@ export class OutboxMachine {
       retryOf ? 'Human-authorised retry; duplicate delivery is possible' : draftId,
       now,
     )
-    return this.get(id) as PendingOutbox
+    return this.c.require(id, 'pending_approval').record
   }
   enqueue(draftId: string): PendingOutbox {
     return this.c.transaction(() => {
@@ -139,7 +142,7 @@ export class OutboxMachine {
       this.c.db.prepare(
         `UPDATE mail_outbox SET approval_cap_hash=?,approval_session_hash=?,approval_expires_ms=?,updated_ms=? WHERE id=?`,
       ).run(
-        approvalVerifier(token, sessionId, id, String(row.content_digest)).toString('hex'),
+        approvalVerifier(token, sessionId, id, String(row.content_digest), expires).toString('hex'),
         hash(sessionId).toString('hex'), expires, now, id,
       )
       return token
@@ -160,7 +163,7 @@ export class OutboxMachine {
       }
       const verifierMatches = sameBuffer(
         row.approval_cap_hash,
-        approvalVerifier(token, sessionId, id, String(row.content_digest)),
+        approvalVerifier(token, sessionId, id, String(row.content_digest), Number(expires)),
       )
       const sessionMatches = sameBuffer(row.approval_session_hash, hash(sessionId))
       if (!verifierMatches || !sessionMatches) {
