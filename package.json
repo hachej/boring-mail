@@ -5,7 +5,12 @@
   "type": "module",
   "license": "MIT",
   "description": "Workspace for the Boring Mail plugin and standalone playground.",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=22.22 <23"
+  },
   "scripts": {
+    "check-env": "node scripts/check-env.mjs",
     "dev": "pnpm --filter @hachej/boring-mail-playground dev",
     "build": "pnpm --filter @hachej/boring-mail-playground build",
     "typecheck": "pnpm --filter @hachej/boring-mail typecheck && pnpm --filter @hachej/boring-mail-playground typecheck",
