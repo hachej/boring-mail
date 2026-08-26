@@ -22,7 +22,7 @@
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@hachej/boring-workspace": "workspace:*",
+    "@hachej/boring-workspace": "0.1.103",
     "lucide-react": "^1.21.0",
     "react": "^19.2.7"
   },

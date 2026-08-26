@@ -27,6 +27,10 @@ export default function createBoringMailServerPlugin(
   return defineServerPlugin({
     id: 'boring-mail',
     label: 'Mail',
+    // Identity pin for the prebuilt-plugin path (required since workspace 0.1.103
+    // for any plugin contributing agentTools/systemPrompt). Bump when the
+    // executable contribution changes materially.
+    contentDigest: 'boring-mail-server-plugin-v1',
     routes: async (app) => {
       app.post('/api/boring-mail/drafts', async (request, reply) => {
         const body = request.body as { path?: unknown; to?: unknown; cc?: unknown; subject?: unknown; bodyMarkdown?: unknown } | undefined
