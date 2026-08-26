@@ -40,6 +40,7 @@ export interface OutboxRow extends SendRow {
   draft_revision: unknown
   message_id: unknown
   content_digest: unknown
+  operation_key: unknown
   status: unknown
   approval_cap_hash: unknown
   approval_session_hash: unknown
@@ -167,6 +168,13 @@ function digest(v: unknown, name: string): string {
   if (!isContentDigest(value)) corrupt(`${name} must be a lowercase SHA-256 digest`)
   return value
 }
+function durableOperationKey(v: unknown): string {
+  const value = str(v, 'operation_key')
+  if (!value || value.length > 200 || value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value)) {
+    corrupt('operation_key must be nonempty canonical text of at most 200 characters')
+  }
+  return value
+}
 export function decodeDraft(row: DraftRow): DraftRecord {
   const record: DraftRecord = {
     id: nonempty(row.id, 'draft.id'),
@@ -204,6 +212,7 @@ export function decodeOutbox(row: OutboxRow): OutboxRecord {
     draftRevision: positive(row.draft_revision, 'draft_revision'),
     snapshot: { ...decodeSendContent(row), messageId } as SendSnapshot,
     contentDigest: digest(row.content_digest, 'content_digest'),
+    operationKey: durableOperationKey(row.operation_key),
     retryOf,
   }
   const capHash = nullableStr(row.approval_cap_hash, 'approval_cap_hash'),

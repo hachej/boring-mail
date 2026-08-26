@@ -6,7 +6,7 @@ import {
   type ProductStore,
   type ProductStoreDependencies,
   type ReplyDraftInput,
-} from '../../src/mail/store/productDb.js'
+} from '../../src/mail/store/internalProductStore.js'
 export const UI_SESSION = 'host-session-a'
 export const reply = { messageId: 101, rfc822MessageId: '<inbound@example.net>', sourceId: 7 }
 export function draft(overrides: Partial<ReplyDraftInput> = {}): ReplyDraftInput {
@@ -39,6 +39,7 @@ export function scenario(deps: Partial<ProductStoreDependencies> = {}): Scenario
     targets = new Map([
       [reply.messageId, { rfc822MessageId: reply.rfc822MessageId, sourceId: reply.sourceId }],
     ])
+  let operation = 0
   const store = openProductStore(path, {
     now: () => clock.now,
     resolveReplyTarget: (id) => targets.get(id) ?? null,
@@ -58,7 +59,7 @@ export function scenario(deps: Partial<ProductStoreDependencies> = {}): Scenario
     close: () => store.close(),
     save: (o = {}, id) => store.saveDraft(draft(o), id),
     enqueueApproved: (o = {}) => {
-      const queued = store.outbox.enqueue(store.saveDraft(draft(o)).id),
+      const queued = store.outbox.enqueue(store.saveDraft(draft(o)).id, `scenario-${++operation}`),
         token = store.outbox.issueApprovalCapability(queued.id, UI_SESSION)
       return store.outbox.approve(queued.id, token, UI_SESSION)
     },

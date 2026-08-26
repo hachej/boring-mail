@@ -14,6 +14,7 @@ import {
   type SendContent,
 } from './types.js'
 
+/** @internal Synchronous worker-owned implementation; never expose to host runtime callers. */
 export class ProductStore {
   readonly outbox: OutboxMachine
   readonly #c: StoreContext

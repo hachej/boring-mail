@@ -19,7 +19,8 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run -c vitest.config.ts",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.worker.json"
   },
   "dependencies": {
     "@hachej/boring-workspace": "0.1.103",

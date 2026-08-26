@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { decodeAttention, decodeDraft, decodeOutbox, type DraftRow, type OutboxRow } from './codec.js'
 import { fail, StoreContext } from './context.js'
-import { createSendSnapshot, sendSnapshotDigest } from './sendSnapshot.js'
+import { createSendSnapshot, draftContentDigest, sendSnapshotDigest } from './sendSnapshot.js'
 import {
   ProductStoreError,
   type ApprovedOutbox,
@@ -28,6 +28,12 @@ const sameBuffer = (hex: string, actual: Buffer): boolean => {
   return expected.length === actual.length && timingSafeEqual(expected, actual)
 }
 /** Domain-separated, unambiguous binding for the complete approval authority. */
+function operationKey(value: string): string {
+  if (!value || value.length > 200 || value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value)) {
+    fail('invalid_input', 'operation key must be nonempty canonical text of at most 200 characters')
+  }
+  return value
+}
 const approvalVerifier = (
   token: string, sessionId: string, outboxId: string, digest: string, expiresAt: number,
 ): Buffer => hash(JSON.stringify([
@@ -79,6 +85,7 @@ export class OutboxMachine {
     revision: number,
     snapshot: SendSnapshot,
     retryOf: string | null,
+    key: string,
     now: number,
   ): PendingOutbox {
     if (this.pendingCount(snapshot.accountId) >= 5)
@@ -87,7 +94,7 @@ export class OutboxMachine {
       digest = sendSnapshotDigest(snapshot)
     this.c.db
       .prepare(
-        `INSERT INTO mail_outbox(id,draft_id,draft_revision,account_id,send_as_address,reply_message_id,reply_rfc822_message_id,reply_source_id,to_json,cc_json,bcc_json,subject,body_markdown,attachments_json,message_id,content_digest,status,retry_of,created_ms,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending_approval',?,?,?)`,
+        `INSERT INTO mail_outbox(id,draft_id,draft_revision,account_id,send_as_address,reply_message_id,reply_rfc822_message_id,reply_source_id,to_json,cc_json,bcc_json,subject,body_markdown,attachments_json,message_id,content_digest,operation_key,status,retry_of,created_ms,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending_approval',?,?,?)`,
       )
       .run(
         id,
@@ -106,6 +113,7 @@ export class OutboxMachine {
         JSON.stringify(snapshot.attachments),
         snapshot.messageId,
         digest,
+        key,
         retryOf,
         now,
         now,
@@ -120,7 +128,8 @@ export class OutboxMachine {
     )
     return this.c.require(id, 'pending_approval').record
   }
-  enqueue(draftId: string): PendingOutbox {
+  enqueue(draftId: string, requestedOperationKey: string): OutboxRecord {
+    const key = operationKey(requestedOperationKey)
     return this.c.transaction(() => {
       const row = this.c.db.prepare(`SELECT * FROM mail_drafts WHERE id=?`).get(draftId) as unknown as
         | DraftRow
@@ -128,8 +137,23 @@ export class OutboxMachine {
       if (!row) throw new ProductStoreError('not_found', `draft ${draftId} not found`)
       const draft = decodeDraft(row)
       this.c.assertIdentity(draft)
-      return this.insert(draft.id, draft.revision, createSendSnapshot(draft), null, this.c.now())
+      const existing = this.operation(draft.accountId, key)
+      if (existing) {
+        if (existing.draftId !== draft.id || existing.draftRevision !== draft.revision ||
+            existing.retryOf !== null || draftContentDigest(existing.snapshot) !== draft.contentDigest) {
+          fail('idempotency_conflict', 'operation key was already used for different draft content')
+        }
+        return existing
+      }
+      return this.insert(draft.id, draft.revision, createSendSnapshot(draft), null, key, this.c.now())
     })
+  }
+  private operation(accountId: string, key: string): OutboxRecord | null {
+    const row = this.c.db.prepare(`SELECT * FROM mail_outbox WHERE account_id=? AND operation_key=?`)
+      .get(accountId, key) as unknown as OutboxRow | undefined
+    if (!row) return null
+    this.digest(row)
+    return decodeOutbox(row)
   }
   issueApprovalCapability(id: string, sessionId: string, ttl = APPROVAL_TTL): string {
     if (!sessionId.trim()) fail('invalid_input', 'authenticated session id is required')
@@ -192,23 +216,43 @@ export class OutboxMachine {
     })
   }
   claim(id: string, worker: string, leaseMs = LEASE): ClaimedOutbox {
-    if (!worker.trim()) fail('invalid_input', 'worker id is required')
+    this.worker(worker)
     return this.c.transaction(() => {
-      const { row, record } = this.c.require(id)
-      const now = this.c.now(),
-        reclaim = record.status === 'claimed' && record.lease.expiresAt <= now
-      if (record.status !== 'approved' && !reclaim)
-        fail('invalid_transition', 'outbox is not approved or an expired claim')
-      this.c.assertIdentity(record.snapshot)
-      this.digest(row)
-      const expires = this.c.deadline(now, leaseMs, 'send lease')
-      this.c.db
-        .prepare(
-          `UPDATE mail_outbox SET status='claimed',lease_owner=?,lease_expires_ms=?,updated_ms=? WHERE id=?`,
-        )
-        .run(worker, expires, now, id)
-      return this.c.require(id, 'claimed').record
+      const row = this.c.row(id)
+      if (!row) fail('not_found', `outbox ${id} not found`)
+      return this.claimRow(row, worker, this.c.now(), leaseMs)
     })
+  }
+  /** Discover and atomically claim the oldest durable work after restart. */
+  claimNext(worker: string, leaseMs = LEASE): ClaimedOutbox | null {
+    this.worker(worker)
+    return this.c.transaction(() => {
+      const now = this.c.now()
+      // Validate before returning "no work" so invalid caller input never hides.
+      this.c.deadline(now, leaseMs, 'send lease')
+      const row = this.c.db.prepare(`
+        SELECT * FROM mail_outbox
+        WHERE status='approved' OR (status='claimed' AND lease_expires_ms<=?)
+        ORDER BY created_ms,id LIMIT 1
+      `).get(now) as unknown as OutboxRow | undefined
+      return row ? this.claimRow(row, worker, now, leaseMs) : null
+    })
+  }
+  private worker(worker: string): void {
+    if (!worker.trim()) fail('invalid_input', 'worker id is required')
+  }
+  private claimRow(row: OutboxRow, worker: string, now: number, leaseMs: number): ClaimedOutbox {
+    const record = decodeOutbox(row)
+    const reclaim = record.status === 'claimed' && record.lease.expiresAt <= now
+    if (record.status !== 'approved' && !reclaim)
+      fail('invalid_transition', 'outbox is not approved or an expired claim')
+    this.c.assertIdentity(record.snapshot)
+    this.digest(row)
+    const expires = this.c.deadline(now, leaseMs, 'send lease')
+    this.c.db.prepare(
+      `UPDATE mail_outbox SET status='claimed',lease_owner=?,lease_expires_ms=?,updated_ms=? WHERE id=?`,
+    ).run(worker, expires, now, record.id)
+    return this.c.require(record.id, 'claimed').record
   }
   markDispatched(id: string, worker: string, preDispatchHistoryId: string): DispatchedOutbox {
     if (!/^\d+$/.test(preDispatchHistoryId)) fail('invalid_input', 'pre-dispatch history id must be nonempty numeric text')
@@ -386,19 +430,35 @@ export class OutboxMachine {
       return this.c.require(id, 'sent').record
     })
   }
-  retry(id: string): PendingOutbox {
+  retry(id: string, requestedOperationKey: string): OutboxRecord {
+    const key = operationKey(requestedOperationKey)
     return this.c.transaction(() => {
-      const { record } = this.c.require(id, 'human_decision')
-      const now = this.c.now(),
-        snapshot = createSendSnapshot(record.snapshot)
-      this.c.db
-        .prepare(
-          `UPDATE mail_outbox SET status='cancelled',reconcile_deadline_ms=NULL,reconcile_next_ms=NULL,reconcile_attempts=NULL,reconcile_detail=NULL,terminal_reason='retry',updated_ms=? WHERE id=?`,
-        )
-        .run(now, id)
+      const { record } = this.c.require(id)
+      if (record.status === 'cancelled' && record.reason === 'retry') {
+        const replay = this.operation(record.snapshot.accountId, key)
+        if (replay && this.sameRetry(replay, record, id)) return replay
+        fail('idempotency_conflict', 'retry operation key does not identify the original retry child')
+      }
+      if (record.status !== 'human_decision') {
+        fail('invalid_transition', `outbox must be human_decision; found ${record.status}`)
+      }
+      const existing = this.operation(record.snapshot.accountId, key)
+      if (existing) {
+        if (this.sameRetry(existing, record, id)) return existing
+        fail('idempotency_conflict', 'operation key was already used for a different retry')
+      }
+      const now = this.c.now(), snapshot = createSendSnapshot(record.snapshot)
+      this.c.db.prepare(
+        `UPDATE mail_outbox SET status='cancelled',reconcile_deadline_ms=NULL,reconcile_next_ms=NULL,reconcile_attempts=NULL,reconcile_detail=NULL,terminal_reason='retry',updated_ms=? WHERE id=?`,
+      ).run(now, id)
       this.resolve(id, 'send_unknown', now)
-      return this.insert(record.draftId, record.draftRevision, snapshot, id, now)
+      return this.insert(record.draftId, record.draftRevision, snapshot, id, key, now)
     })
+  }
+  private sameRetry(child: OutboxRecord, original: OutboxRecord, originalId: string): boolean {
+    return child.retryOf === originalId && child.draftId === original.draftId &&
+      child.draftRevision === original.draftRevision &&
+      draftContentDigest(child.snapshot) === draftContentDigest(original.snapshot)
   }
   private digest(row: OutboxRow): void {
     const decoded = decodeOutbox(row)

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
 import { openMsgvaultStore, resolveReplyTarget } from '../../src/mail/store/msgvaultAdapter.js'
-import { openProductStore } from '../../src/mail/store/productDb.js'
+import { openProductStore } from '../../src/mail/store/internalProductStore.js'
 const schema = `CREATE TABLE conversations(id INTEGER,conversation_type TEXT,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER,source_id INTEGER NOT NULL,rfc822_message_id TEXT,subject TEXT,snippet TEXT,sent_at TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT);CREATE TABLE message_labels(message_id INTEGER,label_id INTEGER);CREATE TABLE labels(id INTEGER,name TEXT);CREATE TABLE message_raw(message_id INTEGER,raw_data BLOB,raw_format TEXT,compression TEXT);CREATE TABLE attachments(id INTEGER,message_id INTEGER,filename TEXT,mime_type TEXT,size INTEGER,content_hash TEXT,storage_path TEXT);CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED,subject);`
 describe('trusted msgvault integration', () => {
   it('derives account from selected immutable row even when RFC822 ID is duplicated', () => {

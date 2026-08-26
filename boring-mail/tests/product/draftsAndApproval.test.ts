@@ -7,7 +7,7 @@ import {
   ProductStoreError,
   sendSnapshotDigest,
   type ReplyDraftInput,
-} from '../../src/mail/store/productDb.js'
+} from '../../src/mail/store/internalProductStore.js'
 import { draft, reply, scenario, UI_SESSION, type Scenario } from './scenario.js'
 describe('ProductStore drafts and approvals', () => {
   let s: Scenario | undefined
@@ -50,9 +50,9 @@ describe('ProductStore drafts and approvals', () => {
     const { store, save } = open(),
       saved = save({}, 'd')
     const ids = [
-      store.outbox.enqueue(saved.id),
-      store.outbox.enqueue(saved.id),
-      store.outbox.enqueue(saved.id),
+      store.outbox.enqueue(saved.id, 'edit-1'),
+      store.outbox.enqueue(saved.id, 'edit-2'),
+      store.outbox.enqueue(saved.id, 'edit-3'),
     ]
     store.outbox.approve(ids[1].id, store.outbox.issueApprovalCapability(ids[1].id, UI_SESSION), UI_SESSION)
     store.outbox.approve(ids[2].id, store.outbox.issueApprovalCapability(ids[2].id, UI_SESSION), UI_SESSION)
@@ -62,9 +62,42 @@ describe('ProductStore drafts and approvals', () => {
     expect(ids.map((x) => store.outbox.get(x.id)?.status)).toEqual(['stale', 'stale', 'stale'])
     expect(store.outbox.listAttention()).toEqual([])
   })
+  it('deduplicates enqueue by stable operation key and rejects conflicting reuse', () => {
+    const x = open(), saved = x.save({}, 'idempotent-draft')
+    const first = x.store.outbox.enqueue(saved.id, 'host-operation-1')
+    expect(x.store.outbox.enqueue(saved.id, 'host-operation-1')).toEqual(first)
+    expect(x.store.outbox.listAttention()).toHaveLength(1)
+    const approved = x.store.outbox.approve(
+      first.id, x.store.outbox.issueApprovalCapability(first.id, UI_SESSION), UI_SESSION,
+    )
+    expect(x.store.outbox.enqueue(saved.id, 'host-operation-1')).toEqual(approved)
+    const different = x.save({ path: 'drafts/different.mail.md' }, 'different-draft')
+    expect(() => x.store.outbox.enqueue(different.id, 'host-operation-1')).toThrowError(
+      expect.objectContaining({ code: 'idempotency_conflict' }),
+    )
+    x.save({ bodyMarkdown: 'new revision' })
+    expect(() => x.store.outbox.enqueue(saved.id, 'host-operation-1')).toThrowError(
+      expect.objectContaining({ code: 'idempotency_conflict' }),
+    )
+    expect(() => x.store.outbox.enqueue(different.id, ' ')).toThrow(/operation key/)
+  })
+  it('serializes enqueue replay across independent handles', () => {
+    const x = open(), saved = x.save({}, 'race-draft')
+    const other = openProductStore(x.path, {
+      now: () => x.clock.now,
+      resolveReplyTarget: (id) => x.targets.get(id) ?? null,
+    })
+    try {
+      const first = x.store.outbox.enqueue(saved.id, 'raced-operation')
+      expect(other.outbox.enqueue(saved.id, 'raced-operation')).toEqual(first)
+      expect(x.store.outbox.listAttention()).toHaveLength(1)
+    } finally {
+      other.close()
+    }
+  })
   it('binds capability to authenticated session and consumes it once', () => {
     const { store, save, clock, path } = open(),
-      q = store.outbox.enqueue(save().id)
+      q = store.outbox.enqueue(save().id, 'capability')
     expect(() => store.outbox.issueApprovalCapability(q.id, '')).toThrow(/session/)
     const first = store.outbox.issueApprovalCapability(q.id, 'session-a', 10)
     const raw = new DatabaseSync(path)
@@ -87,7 +120,7 @@ describe('ProductStore drafts and approvals', () => {
   })
   it('binds approval verifier to token, session, outbox and issued digest', () => {
     const { store, save, path } = open(),
-      queued = store.outbox.enqueue(save().id),
+      queued = store.outbox.enqueue(save().id, 'digest-binding'),
       token = store.outbox.issueApprovalCapability(queued.id, UI_SESSION),
       altered = { ...queued.snapshot, subject: 'bait-and-switch' },
       alteredDigest = draftContentDigest(altered) // snapshot digest differs by Message-ID coverage below
@@ -107,7 +140,7 @@ describe('ProductStore drafts and approvals', () => {
   })
   it('binds approval verifier to the issued expiry', () => {
     const { store, save, path } = open(),
-      queued = store.outbox.enqueue(save({ path: 'drafts/expiry-binding.mail.md' }, 'expiry-binding').id),
+      queued = store.outbox.enqueue(save({ path: 'drafts/expiry-binding.mail.md' }, 'expiry-binding').id, 'expiry-binding'),
       token = store.outbox.issueApprovalCapability(queued.id, UI_SESSION, 100)
     const raw = new DatabaseSync(path)
     raw.prepare(`UPDATE mail_outbox SET approval_expires_ms=approval_expires_ms+10000 WHERE id=?`)
@@ -117,7 +150,7 @@ describe('ProductStore drafts and approvals', () => {
   })
   it('revalidates trusted row and identity at approval', () => {
     const { store, save, targets } = open(),
-      q = store.outbox.enqueue(save().id),
+      q = store.outbox.enqueue(save().id, 'identity'),
       token = store.outbox.issueApprovalCapability(q.id, UI_SESSION)
     targets.delete(reply.messageId)
     expect(() => store.outbox.approve(q.id, token, UI_SESSION)).toThrow(/trusted msgvault/)
@@ -128,16 +161,16 @@ describe('ProductStore drafts and approvals', () => {
       other = openProductStore(a.path, deps)
     try {
       for (let i = 0; i < 5; i++)
-        a.store.outbox.enqueue(a.store.saveDraft(draft({ path: `drafts/${i}.mail.md` }), `d${i}`).id)
+        a.store.outbox.enqueue(a.store.saveDraft(draft({ path: `drafts/${i}.mail.md` }), `d${i}`).id, `backlog-${i}`)
       const sixth = a.store.saveDraft(draft({ path: 'drafts/6.mail.md' }), 'd6')
-      expect(() => other.outbox.enqueue(sixth.id)).toThrow(/maximum 5/)
+      expect(() => other.outbox.enqueue(sixth.id, 'backlog-6')).toThrow(/maximum 5/)
     } finally {
       other.close()
     }
   })
   it('rejects approval and only lifecycle transitions resolve attention', () => {
     const { store, save } = open(),
-      q = store.outbox.enqueue(save().id),
+      q = store.outbox.enqueue(save().id, 'reject'),
       item = store.outbox.listAttention()[0]
     expect(store.outbox).not.toHaveProperty('resolveAttention')
     expect(store.outbox.reject(q.id).status).toBe('rejected')
@@ -183,10 +216,10 @@ describe('ProductStore drafts and approvals', () => {
     for (const [column, invalid, valid] of cases) {
       raw.prepare(`UPDATE mail_drafts SET ${column}=? WHERE id=?`).run(invalid, saved.id)
       expect(() => store.getDraft(saved.id)).toThrowError(expect.objectContaining({ code: 'corrupt_data' }))
-      expect(() => store.outbox.enqueue(saved.id)).toThrowError(expect.objectContaining({ code: 'corrupt_data' }))
+      expect(() => store.outbox.enqueue(saved.id, `corrupt-${column}`)).toThrowError(expect.objectContaining({ code: 'corrupt_data' }))
       raw.prepare(`UPDATE mail_drafts SET ${column}=? WHERE id=?`).run(valid, saved.id)
     }
-    const queued = store.outbox.enqueue(saved.id)
+    const queued = store.outbox.enqueue(saved.id, 'semantic-valid')
     raw.exec(`DROP TRIGGER mail_outbox_snapshot_immutable;
       CREATE TRIGGER mail_outbox_snapshot_immutable BEFORE UPDATE OF subject ON mail_outbox BEGIN SELECT 1; END`)
     raw.prepare(`UPDATE mail_outbox SET message_id='bad-message-id' WHERE id=?`).run(queued.id)
@@ -200,7 +233,7 @@ describe('ProductStore drafts and approvals', () => {
     const { store, save, path } = open()
     expect(() => store.saveDraft(draft({ path: '../x.mail.md' }))).toThrow(/escape/)
     expect(() => store.saveDraft(draft({ replyToMessageId: Number.NaN }))).toThrow(/safe integer/)
-    const q = store.outbox.enqueue(save().id)
+    const q = store.outbox.enqueue(save().id, 'malformed-capability')
     store.outbox.issueApprovalCapability(q.id, UI_SESSION)
     const raw = new DatabaseSync(path)
     expect(() => raw.prepare(`UPDATE mail_outbox SET to_json='{}' WHERE id=?`).run(q.id)).toThrow()

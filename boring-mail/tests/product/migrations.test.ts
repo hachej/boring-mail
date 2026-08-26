@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
-import { openProductStore, PRODUCT_SCHEMA_VERSION } from '../../src/mail/store/productDb.js'
+import { openProductStore, PRODUCT_SCHEMA_VERSION } from '../../src/mail/store/internalProductStore.js'
 import { migrateProductDatabase } from '../../src/mail/store/product/migrations.js'
 const deps = { now: () => 1_800_000_000_000, resolveReplyTarget: () => null }
 const temp = () => join(mkdtempSync(join(tmpdir(), 'product-migration-')), 'db.sqlite')
@@ -83,6 +83,17 @@ describe('product migrations', () => {
           CREATE TRIGGER mail_outbox_history_immutable BEFORE UPDATE OF pre_dispatch_history_id ON mail_outbox
           WHEN OLD.pre_dispatch_history_id IS NOT NULL OR NEW.status!='DISPATCHED'
           BEGIN SELECT RAISE(ABORT,'mail_outbox dispatch history is immutable'); END`,
+        expected: /definition mismatch: trigger:mail_outbox_history_immutable/,
+      },
+      {
+        mutate: `CREATE VIEW unexpected_outbox_view AS SELECT id FROM mail_outbox`,
+        expected: /unexpected view:unexpected_outbox_view/,
+      },
+      {
+        mutate: `DROP TRIGGER mail_outbox_history_immutable;
+          CREATE TRIGGER mail_outbox_history_immutable BEFORE UPDATE OF pre_dispatch_history_id ON mail_outbox
+          WHEN OLD.pre_dispatch_history_id IS NOT NULL OR NEW.status!='dispatched'
+          BEGIN SELECT RAISE(ABORT,'mail_outbox  dispatch history is immutable'); END`,
         expected: /definition mismatch: trigger:mail_outbox_history_immutable/,
       },
     ]

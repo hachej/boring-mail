@@ -5,7 +5,7 @@ import {
   type ClaimedOutbox,
   type DispatchedOutbox,
   type SentOutbox,
-} from '../../src/mail/store/productDb.js'
+} from '../../src/mail/store/internalProductStore.js'
 import { draft, scenario, UI_SESSION, type Scenario } from './scenario.js'
 describe('durable delivery state machine', () => {
   const HISTORY = '900719925474099312345'
@@ -81,6 +81,36 @@ describe('durable delivery state machine', () => {
       other.close()
     }
   })
+  it('discovers approved and expired claimed work after restart without an in-memory id', () => {
+    const x = open(), approved = x.enqueueApproved()
+    x.store.close()
+    s = undefined
+    let reopened = openProductStore(x.path, {
+      now: () => x.clock.now,
+      resolveReplyTarget: (id) => x.targets.get(id) ?? null,
+    })
+    expect(reopened.outbox.claimNext('restart', 10)?.id).toBe(approved.id)
+    reopened.close()
+    x.clock.now += 10
+    reopened = openProductStore(x.path, {
+      now: () => x.clock.now,
+      resolveReplyTarget: (id) => x.targets.get(id) ?? null,
+    })
+    const other = openProductStore(x.path, {
+      now: () => x.clock.now,
+      resolveReplyTarget: (id) => x.targets.get(id) ?? null,
+    })
+    try {
+      expect(reopened.outbox.claimNext('reclaimer')?.id).toBe(approved.id)
+      expect(other.outbox.claimNext('racer')).toBeNull()
+    } finally {
+      reopened.close()
+      other.close()
+    }
+  })
+  it('returns null when no durable send is claimable', () => {
+    expect(open().store.outbox.claimNext('idle')).toBeNull()
+  })
   it('supports deterministic failure and pre-dispatch cancellation', () => {
     const x = open(),
       a = dispatch(x)
@@ -138,10 +168,14 @@ describe('durable delivery state machine', () => {
     })
     const original = human(),
       oldMessage = original.snapshot.messageId,
-      retry = x.store.outbox.retry(original.id)
+      retry = x.store.outbox.retry(original.id, 'human-retry')
     expect(x.store.outbox.get(original.id)).toMatchObject({ status: 'cancelled', reason: 'retry' })
-    expect(retry).toMatchObject({ status: 'pending_approval', retryOf: original.id })
+    expect(retry).toMatchObject({ status: 'pending_approval', retryOf: original.id, operationKey: 'human-retry' })
     expect(retry.snapshot.messageId).not.toBe(oldMessage)
+    expect(x.store.outbox.retry(original.id, 'human-retry')).toEqual(retry)
+    expect(() => x.store.outbox.retry(original.id, 'different-retry-key')).toThrowError(
+      expect.objectContaining({ code: 'idempotency_conflict' }),
+    )
     expect(x.store.outbox.listAttention()).toHaveLength(1)
     expect(() => x.store.outbox.claim(retry.id, 'w')).toThrow(/not approved/)
   })
@@ -157,7 +191,7 @@ describe('durable delivery state machine', () => {
   })
   it('rejects predecessor and terminal-state transitions across the matrix', () => {
     const x = open(),
-      pending = x.store.outbox.enqueue(x.save().id)
+      pending = x.store.outbox.enqueue(x.save().id, 'cancel-pending')
     expect(() => x.store.outbox.claim(pending.id, 'w')).toThrow(/not approved/)
     expect(() => x.store.outbox.markDispatched(pending.id, 'w', HISTORY)).toThrow(/must be claimed/)
 
@@ -166,11 +200,11 @@ describe('durable delivery state machine', () => {
     terminalIds.push(x.store.outbox.markSent(sent.id, 'w', 'gmail').id)
     const failed = dispatch(x)
     terminalIds.push(x.store.outbox.markFailed(failed.id, 'w', '550', 'rejected').id)
-    const rejected = x.store.outbox.enqueue(x.save({ path: 'drafts/rejected.mail.md' }).id)
+    const rejected = x.store.outbox.enqueue(x.save({ path: 'drafts/rejected.mail.md' }).id, 'reject-row')
     terminalIds.push(x.store.outbox.reject(rejected.id).id)
     const cancelled = x.enqueueApproved({ path: 'drafts/cancelled.mail.md' })
     terminalIds.push(x.store.outbox.cancel(cancelled.id).id)
-    const stale = x.store.outbox.enqueue(x.save({ path: 'drafts/stale.mail.md' }).id)
+    const stale = x.store.outbox.enqueue(x.save({ path: 'drafts/stale.mail.md' }).id, 'stale-row')
     x.save({ path: 'drafts/stale.mail.md', bodyMarkdown: 'edited' })
     terminalIds.push(stale.id)
 
@@ -180,7 +214,7 @@ describe('durable delivery state machine', () => {
       expect(() => x.store.outbox.markSent(id, 'w', 'gmail')).toThrow()
       expect(() => x.store.outbox.markUnknown(id, 'w', 'timeout')).toThrow()
       expect(() => x.store.outbox.reconciliationFound(id, 'gmail')).toThrow()
-      expect(() => x.store.outbox.retry(id)).toThrow()
+      expect(() => x.store.outbox.retry(id, `illegal-${id}`)).toThrow()
     }
     expect(x.store.outbox.listAttention()).toEqual([])
   })

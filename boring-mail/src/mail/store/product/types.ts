@@ -71,6 +71,8 @@ interface OutboxBase {
   readonly draftRevision: number
   readonly snapshot: SendSnapshot
   readonly contentDigest: string
+  /** Stable host operation key used to deduplicate enqueue/retry requests. */
+  readonly operationKey: string
   readonly retryOf: string | null
 }
 export interface PendingOutbox extends OutboxBase {
@@ -177,6 +179,7 @@ export type ProductStoreErrorCode =
   | 'lease_invalid'
   | 'unsupported_schema'
   | 'corrupt_data'
+  | 'idempotency_conflict'
 export class ProductStoreError extends Error {
   constructor(
     readonly code: ProductStoreErrorCode,

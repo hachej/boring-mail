@@ -31,14 +31,14 @@ CREATE TABLE mail_outbox (
  bcc_json TEXT NOT NULL CHECK(json_valid(bcc_json) AND json_type(bcc_json)='array'),
  subject TEXT NOT NULL, body_markdown TEXT NOT NULL,
  attachments_json TEXT NOT NULL CHECK(json_valid(attachments_json) AND json_type(attachments_json)='array'),
- message_id TEXT NOT NULL, content_digest TEXT NOT NULL,
+ message_id TEXT NOT NULL, content_digest TEXT NOT NULL, operation_key TEXT NOT NULL,
  status TEXT NOT NULL CHECK(status IN('pending_approval','approved','claimed','dispatched','unknown','human_decision','sent','failed','rejected','cancelled','stale')),
  approval_cap_hash TEXT, approval_session_hash TEXT, approval_expires_ms INTEGER, approval_consumed_ms INTEGER,
  lease_owner TEXT, lease_expires_ms INTEGER, pre_dispatch_history_id TEXT,
  reconcile_deadline_ms INTEGER, reconcile_next_ms INTEGER, reconcile_attempts INTEGER, reconcile_detail TEXT,
  provider_message_id TEXT, delivery_basis TEXT, failure_code TEXT, failure_detail TEXT,
  terminal_reason TEXT, retry_of TEXT REFERENCES mail_outbox(id), created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
- UNIQUE(account_id,message_id),
+ UNIQUE(account_id,message_id), UNIQUE(account_id,operation_key),
  CHECK((reply_message_id IS NULL)=(reply_rfc822_message_id IS NULL) AND (reply_message_id IS NULL)=(reply_source_id IS NULL)),
  CHECK((approval_cap_hash IS NULL)=(approval_session_hash IS NULL) AND (approval_cap_hash IS NULL)=(approval_expires_ms IS NULL)),
  CHECK(status='pending_approval' OR (approval_cap_hash IS NULL AND approval_session_hash IS NULL AND approval_expires_ms IS NULL)),
@@ -72,7 +72,7 @@ CREATE INDEX idx_mail_outbox_status ON mail_outbox(status,account_id);
 CREATE INDEX idx_mail_outbox_reconcile ON mail_outbox(status,reconcile_next_ms);
 CREATE TRIGGER mail_outbox_snapshot_immutable BEFORE UPDATE OF
  draft_id,draft_revision,account_id,send_as_address,reply_message_id,reply_rfc822_message_id,reply_source_id,
- to_json,cc_json,bcc_json,subject,body_markdown,attachments_json,message_id,content_digest,retry_of
+ to_json,cc_json,bcc_json,subject,body_markdown,attachments_json,message_id,content_digest,operation_key,retry_of
 ON mail_outbox BEGIN SELECT RAISE(ABORT,'mail_outbox send snapshot is immutable'); END;
 CREATE TRIGGER mail_outbox_history_immutable BEFORE UPDATE OF pre_dispatch_history_id ON mail_outbox
 WHEN OLD.pre_dispatch_history_id IS NOT NULL OR NEW.status!='dispatched'
@@ -88,15 +88,41 @@ CREATE UNIQUE INDEX idx_mail_attention_unique_open ON mail_attention(outbox_id,k
 `
 
 interface SchemaObject { type: string; name: string; sql: string }
+/** Collapse formatting whitespace without changing quoted SQL tokens. */
 function canonicalSql(sql: string): string {
-  // Preserve string-literal and identifier case: SQL keywords are insensitive,
-  // but CHECK/status literals are not. Only formatting whitespace is ignored.
-  return sql.trim().replace(/\s+/g, ' ')
+  let result = ''
+  let quote: "'" | '"' | '`' | '[' | null = null
+  let space = false
+  for (let i = 0; i < sql.length; i++) {
+    const char = sql[i]
+    if (quote) {
+      result += char
+      const close = quote === '[' ? ']' : quote
+      if (char === close) {
+        if (quote !== '[' && sql[i + 1] === close) result += sql[++i]
+        else quote = null
+      }
+      continue
+    }
+    if (char === "'" || char === '"' || char === '`' || char === '[') {
+      if (space && result) result += ' '
+      space = false
+      quote = char
+      result += char
+    } else if (/\s/.test(char)) {
+      space = true
+    } else {
+      if (space && result) result += ' '
+      space = false
+      result += char
+    }
+  }
+  return result.trim()
 }
 function manifest(db: DatabaseSync): Map<string, string> {
   const rows = db.prepare(`
     SELECT type,name,sql FROM sqlite_master
-    WHERE type IN('table','index','trigger') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+    WHERE type IN('table','index','trigger','view') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
   `).all() as unknown as SchemaObject[]
   return new Map(rows.map((row) => [`${row.type}:${row.name}`, canonicalSql(row.sql)]))
 }

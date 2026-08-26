@@ -12,7 +12,7 @@
   "scripts": {
     "check-env": "node scripts/check-env.mjs",
     "dev": "pnpm --filter @hachej/boring-mail-playground dev",
-    "build": "pnpm --filter @hachej/boring-mail-playground build",
+    "build": "pnpm --filter @hachej/boring-mail build && pnpm --filter @hachej/boring-mail-playground build",
     "typecheck": "pnpm --filter @hachej/boring-mail typecheck && pnpm --filter @hachej/boring-mail-playground typecheck",
     "test": "pnpm --filter @hachej/boring-mail test",
     "lint": "pnpm run typecheck"
