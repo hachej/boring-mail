@@ -1,15 +1,6 @@
 packages:
   - "app"
   - "boring-mail"
-  - "../boring-ui-v2-775-pr811-final/packages/agent"
-  - "../boring-ui-v2-775-pr811-final/packages/workspace"
-  - "../boring-ui-v2-775-pr811-final/packages/workspace/test-fixtures/*"
-  - "../boring-ui-v2-775-pr811-final/packages/ui"
-  - "../boring-ui-v2-775-pr811-final/packages/plugin-cli"
-  - "../boring-ui-v2-775-pr811-final/packages/boring-bash"
-  - "../boring-ui-v2-775-pr811-final/packages/boring-sandbox"
-  - "../boring-ui-v2-775-pr811-final/packages/pi"
-  - "../boring-ui-v2-775-pr811-final/plugins/ask-user"
 overrides:
   '@earendil-works/pi-agent-core': 0.80.7
   '@earendil-works/pi-ai': 0.80.7

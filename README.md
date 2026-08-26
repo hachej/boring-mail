@@ -5,7 +5,7 @@ Boring Mail is an agent-native mail workbench for Boring UI. It is split into tw
 - `boring-mail/` — the reusable Boring UI plugin package (`@hachej/boring-mail`).
 - `app/` — a standalone playground app that installs the plugin and runs a local Boring workspace agent server.
 
-The playground uses the local Boring UI checkout from `../boring-ui-v2-775-pr811-final` through `pnpm-workspace.yaml`.
+The playground installs the Boring UI host packages (`@hachej/boring-workspace`, `@hachej/boring-agent`, `@hachej/boring-ask-user`) from npm, pinned to exact `0.1.103`.
 
 ## What is included
 
@@ -38,7 +38,7 @@ Prerequisites:
 
 - Node.js 22+
 - pnpm
-- Local Boring UI checkout at `../boring-ui-v2-775-pr811-final`
+- No sibling checkouts required — host packages come from npm at pinned versions
 - Pi/Boring host model provider config already available in your normal environment
 
 ### LLM provider setup
@@ -50,7 +50,7 @@ If chat works in your normal Pi/Boring setup, it should work here too. Configure
 Useful sanity check after starting the playground:
 
 ```sh
-curl http://localhost:5190/api/v1/agent/models
+curl http://localhost:5190/api/v1/agents/default/models
 ```
 
 If that endpoint returns models, the playground can see the host provider config. If it is empty or errors, fix the host Pi provider setup first, then restart `pnpm dev`.
@@ -58,7 +58,7 @@ If that endpoint returns models, the playground can see the host provider config
 Install dependencies:
 
 ```sh
-pnpm install --no-frozen-lockfile
+pnpm install --frozen-lockfile
 ```
 
 Run the playground:
