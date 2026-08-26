@@ -5,6 +5,12 @@
  * facade exported by productDb.ts so DatabaseSync never runs on the host loop.
  */
 export { ProductStore, openProductStore } from './product/ProductStore.js'
+export { openMailStoreForTest } from './product/MailStore.js'
+export type {
+  MailStoreTestOpenOptions,
+  MailStoreWorkerFactory,
+  WorkerTransport,
+} from './product/MailStore.js'
 export { PRODUCT_SCHEMA_VERSION } from './product/migrations.js'
 export { draftContentDigest, projectSendContent, sendSnapshotDigest } from './product/sendSnapshot.js'
 export { ProductStoreError } from './product/types.js'

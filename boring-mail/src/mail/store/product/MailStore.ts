@@ -52,10 +52,13 @@ export interface WorkerTransport {
 }
 export type MailStoreWorkerFactory = (config: MailStoreWorkerConfig) => WorkerTransport
 export interface MailStoreOpenOptions {
-  workerFactory?: MailStoreWorkerFactory
   startupTimeoutMs?: number
   requestTimeoutMs?: number
   maxPendingRequests?: number
+}
+/** Internal-only transport seam re-exported by internalProductStore.ts for tests. */
+export interface MailStoreTestOpenOptions extends MailStoreOpenOptions {
+  workerFactory: MailStoreWorkerFactory
 }
 
 export interface AsyncOutboxStore {
@@ -538,14 +541,13 @@ class MailStoreFacade implements MailStore {
   }
 }
 
-/** Open/share one dedicated SQLite worker for the canonical product DB directory. */
-export async function openMailStore(
+async function openWithFactory(
   input: MailStoreWorkerConfig,
-  options: MailStoreOpenOptions = {},
+  options: MailStoreOpenOptions,
+  factory: MailStoreWorkerFactory,
 ): Promise<MailStore> {
   const config = canonicalConfig(input)
   const selectedLimits = limits(options)
-  const factory = options.workerFactory ?? defaultWorker
   const key = dirname(config.productDbPath)
   for (;;) {
     let entry = registry.get(key)
@@ -580,4 +582,20 @@ export async function openMailStore(
       throw error
     }
   }
+}
+
+/** Public D8 boundary: the lock-owning storage-process transport is mandatory. */
+export function openMailStore(
+  input: MailStoreWorkerConfig,
+  options: MailStoreOpenOptions = {},
+): Promise<MailStore> {
+  return openWithFactory(input, options, defaultWorker)
+}
+
+/** Test-only transport injection; intentionally absent from the package export. */
+export function openMailStoreForTest(
+  input: MailStoreWorkerConfig,
+  options: MailStoreTestOpenOptions,
+): Promise<MailStore> {
+  return openWithFactory(input, options, options.workerFactory)
 }

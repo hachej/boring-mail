@@ -7,6 +7,7 @@
   "engines": {
     "node": ">=22.22 <23"
   },
+  "os": ["linux"],
   "description": "Agent-native Boring UI mail workbench plugin with .mail.md draft surfaces and an agent mail tool.",
   "exports": {
     "./front": "./src/boring-ui/front.tsx",

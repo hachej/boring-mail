@@ -9,7 +9,6 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
-import { parentPort, workerData } from 'node:worker_threads'
 import { openMsgvaultStore, resolveReplyTarget } from '../msgvaultAdapter.js'
 import { ProductStore } from './ProductStore.js'
 import type {
@@ -21,21 +20,17 @@ import type {
 } from './mailStoreProtocol.js'
 import { ProductStoreError } from './types.js'
 
-const processMode = parentPort === null
+if (!process.send) throw new Error('mailStoreWorker requires child-process IPC')
 const send = (message: RpcResponse): void => {
-  if (parentPort) parentPort.postMessage(message)
-  else if (process.send) process.send(message)
-  // A dead parent closes IPC before the synchronous handler can observe its
+  // A dead parent closes IPC before a synchronous handler can observe its
   // disconnect event. Dropping that final response lets disconnect fail-stop.
-  else if (!processMode) throw new Error('mailStoreWorker requires worker-thread or process IPC')
+  process.send?.(message)
 }
 const onRequest = (listener: (request: RpcRequest) => void): void => {
-  if (parentPort) parentPort.on('message', listener)
-  else process.on('message', (message) => listener(message as RpcRequest))
+  process.on('message', (message) => listener(message as RpcRequest))
 }
 const closeChannel = (): void => {
-  if (parentPort) parentPort.close()
-  else if (process.connected) process.disconnect()
+  if (process.connected) process.disconnect()
 }
 
 function serialized(error: unknown): SerializedError {
@@ -51,7 +46,6 @@ function serialized(error: unknown): SerializedError {
 }
 
 function configFromRuntime(): MailStoreWorkerConfig {
-  if (!processMode) return workerData as MailStoreWorkerConfig
   const raw = process.env.BORING_MAIL_WORKER_CONFIG
   if (!raw) throw new Error('BORING_MAIL_WORKER_CONFIG is required')
   return JSON.parse(raw) as MailStoreWorkerConfig
@@ -90,7 +84,7 @@ async function start(): Promise<void> {
     const config = configFromRuntime()
     if (!config?.productDbPath) throw new Error('productDbPath is required')
     assertCanonicalDatabasePath(config.productDbPath)
-    if (processMode) {
+    {
       const dataDirectory = process.env.BORING_MAIL_DATA_DIRECTORY
       const ownerPath = process.env.BORING_MAIL_OWNER_METADATA_PATH
       const directoryFd = Number(process.env.BORING_MAIL_DIRECTORY_LOCK_FD)
@@ -192,17 +186,15 @@ async function start(): Promise<void> {
         }
       })()
     })
-    if (processMode) {
-      process.once('disconnect', () => {
-        close()
-        process.exit(0)
-      })
-      process.once('SIGTERM', () => {
-        close()
-        closeChannel()
-        process.exit(0)
-      })
-    }
+    process.once('disconnect', () => {
+      close()
+      process.exit(0)
+    })
+    process.once('SIGTERM', () => {
+      close()
+      closeChannel()
+      process.exit(0)
+    })
   } catch (error) {
     close()
     send({ type: 'ready', error: serialized(error) })

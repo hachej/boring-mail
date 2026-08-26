@@ -13,12 +13,12 @@ import { dirname, join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { describe, expect, it } from 'vitest'
 import * as publicStoreApi from '../../src/mail/store/productDb.js'
+import type { DraftRecord } from '../../src/mail/store/productDb.js'
 import {
-  openMailStore,
-  type DraftRecord,
+  openMailStoreForTest,
   type MailStoreWorkerFactory,
   type WorkerTransport,
-} from '../../src/mail/store/productDb.js'
+} from '../../src/mail/store/internalProductStore.js'
 
 const fixture = new URL('../fixtures/mailStoreRpcWorker.mjs', import.meta.url)
 const path = () => join(mkdtempSync(join(tmpdir(), 'mail-rpc-')), 'boring-mail.db')
@@ -37,8 +37,8 @@ describe('async MailStore worker RPC facade', () => {
   it('shares one concurrent start by canonical DB path and closes on last reference', async () => {
     const created: Worker[] = [], db = path(), make = factory(created, { startupDelayMs: 20 })
     const [first, second] = await Promise.all([
-      openMailStore({ productDbPath: db }, { workerFactory: make }),
-      openMailStore({ productDbPath: join(db, '..', 'boring-mail.db') }, { workerFactory: make }),
+      openMailStoreForTest({ productDbPath: db }, { workerFactory: make }),
+      openMailStoreForTest({ productDbPath: join(db, '..', 'boring-mail.db') }, { workerFactory: make }),
     ])
     expect(created).toHaveLength(1)
     const result: DraftRecord | null = await first.getDraft('missing')
@@ -47,23 +47,23 @@ describe('async MailStore worker RPC facade', () => {
     await expect(first.getDraft('closed-reference')).rejects.toThrow(/reference is closed/)
     expect(await second.getDraft('still-alive')).toBeNull()
     await second.close()
-    const reopened = await openMailStore({ productDbPath: db }, { workerFactory: make })
+    const reopened = await openMailStoreForTest({ productDbPath: db }, { workerFactory: make })
     expect(created).toHaveLength(2)
     await reopened.close()
   })
 
   it('evicts an unexpectedly exited worker so the data directory can reopen', async () => {
     const created: Worker[] = [], db = path(), make = factory(created)
-    const crashed = await openMailStore({ productDbPath: db }, { workerFactory: make })
+    const crashed = await openMailStoreForTest({ productDbPath: db }, { workerFactory: make })
     await expect(crashed.getDraft('crash')).rejects.toThrow(/exited unexpectedly/)
-    const reopened = await openMailStore({ productDbPath: db }, { workerFactory: make })
+    const reopened = await openMailStoreForTest({ productDbPath: db }, { workerFactory: make })
     expect(created).toHaveLength(2)
     await crashed.close()
     await reopened.close()
   })
 
   it('preserves typed ProductStore errors over structured clone', async () => {
-    const store = await openMailStore({ productDbPath: path() }, { workerFactory: factory([]) })
+    const store = await openMailStoreForTest({ productDbPath: path() }, { workerFactory: factory([]) })
     try {
       await expect(store.outbox.get('missing')).rejects.toMatchObject({
         name: 'ProductStoreError', code: 'not_found', message: 'fixture outbox missing',
@@ -78,20 +78,20 @@ describe('async MailStore worker RPC facade', () => {
     const failing: MailStoreWorkerFactory = () => new Worker(fixture, {
       workerData: { failStartup: true },
     }) as WorkerTransport
-    await expect(openMailStore({ productDbPath: db }, { workerFactory: failing })).rejects.toMatchObject({
+    await expect(openMailStoreForTest({ productDbPath: db }, { workerFactory: failing })).rejects.toMatchObject({
       code: 'invalid_input', message: 'fixture startup failed',
     })
-    const store = await openMailStore({ productDbPath: db }, { workerFactory: factory([]) })
+    const store = await openMailStoreForTest({ productDbPath: db }, { workerFactory: factory([]) })
     await store.close()
   })
 
   it('keeps a disposal tombstone so reopen waits for delayed last-close termination', async () => {
     const created: Worker[] = [], db = path(), make = factory(created, { closeDelayMs: 50 })
-    const store = await openMailStore({ productDbPath: db }, {
+    const store = await openMailStoreForTest({ productDbPath: db }, {
       workerFactory: make, requestTimeoutMs: 500,
     })
     const closing = store.close()
-    const reopening = openMailStore({ productDbPath: db }, {
+    const reopening = openMailStoreForTest({ productDbPath: db }, {
       workerFactory: make, requestTimeoutMs: 500,
     })
     await wait(10)
@@ -104,22 +104,22 @@ describe('async MailStore worker RPC facade', () => {
 
   it('times out silent startup, disposes it, and permits a clean reopen', async () => {
     const db = path(), silent = factory([], { silentStartup: true })
-    await expect(openMailStore({ productDbPath: db }, {
+    await expect(openMailStoreForTest({ productDbPath: db }, {
       workerFactory: silent, startupTimeoutMs: 20,
     })).rejects.toMatchObject({ code: 'rpc_timeout' })
-    const healthy = await openMailStore({ productDbPath: db }, { workerFactory: factory([]) })
+    const healthy = await openMailStoreForTest({ productDbPath: db }, { workerFactory: factory([]) })
     await healthy.close()
   })
 
   it('request timeout fail-stops all pending calls and permits reopen after disposal', async () => {
     const db = path(), make = factory([])
-    const store = await openMailStore({ productDbPath: db }, {
+    const store = await openMailStoreForTest({ productDbPath: db }, {
       workerFactory: make, requestTimeoutMs: 20,
     })
     const first = store.getDraft('hang'), second = store.getDraft('hang')
     await expect(first).rejects.toMatchObject({ code: 'rpc_timeout' })
     await expect(second).rejects.toMatchObject({ code: 'rpc_timeout' })
-    const reopened = await openMailStore({ productDbPath: db }, {
+    const reopened = await openMailStoreForTest({ productDbPath: db }, {
       workerFactory: factory([]), requestTimeoutMs: 100,
     })
     await store.close()
@@ -128,7 +128,7 @@ describe('async MailStore worker RPC facade', () => {
 
   it('bounds pending requests without killing the healthy worker', async () => {
     const db = path(), make = factory([], { responseDelayMs: 30 })
-    const store = await openMailStore({ productDbPath: db }, {
+    const store = await openMailStoreForTest({ productDbPath: db }, {
       workerFactory: make, requestTimeoutMs: 500, maxPendingRequests: 1,
     })
     const first = store.getDraft('slow')
@@ -140,14 +140,14 @@ describe('async MailStore worker RPC facade', () => {
 
   it('validates RPC settings and rejects incompatible settings for a shared directory', async () => {
     const db = path(), make = factory([])
-    await expect(openMailStore({ productDbPath: db }, {
+    await expect(openMailStoreForTest({ productDbPath: db }, {
       workerFactory: make, startupTimeoutMs: 0,
     })).rejects.toMatchObject({ code: 'invalid_input' })
-    const store = await openMailStore({ productDbPath: db }, {
+    const store = await openMailStoreForTest({ productDbPath: db }, {
       workerFactory: make, requestTimeoutMs: 100,
     })
     try {
-      await expect(openMailStore({ productDbPath: db }, {
+      await expect(openMailStoreForTest({ productDbPath: db }, {
         workerFactory: make, requestTimeoutMs: 101,
       })).rejects.toMatchObject({ code: 'invalid_input' })
     } finally {
@@ -159,17 +159,17 @@ describe('async MailStore worker RPC facade', () => {
     const root = mkdtempSync(join(tmpdir(), 'mail-dangling-')),
       alias = join(root, 'dangling.db')
     symlinkSync(join(root, 'missing-target.db'), alias)
-    await expect(openMailStore({ productDbPath: alias }, { workerFactory: factory([]) }))
+    await expect(openMailStoreForTest({ productDbPath: alias }, { workerFactory: factory([]) }))
       .rejects.toMatchObject({ code: 'invalid_input' })
   })
 
   it('refuses to reuse a path whose open directory inode was replaced', async () => {
     const db = path(), directory = dirname(db), moved = `${directory}.moved`, make = factory([])
-    const store = await openMailStore({ productDbPath: db }, { workerFactory: make })
+    const store = await openMailStoreForTest({ productDbPath: db }, { workerFactory: make })
     renameSync(directory, moved)
     mkdirSync(directory)
     try {
-      await expect(openMailStore({ productDbPath: db }, { workerFactory: make }))
+      await expect(openMailStoreForTest({ productDbPath: db }, { workerFactory: make }))
         .rejects.toThrow(/path identity changed/)
     } finally {
       await store.close()
@@ -188,14 +188,14 @@ describe('async MailStore worker RPC facade', () => {
     symlinkSync(target, join(aliasB, 'db'))
     const created: Worker[] = [], make = factory(created)
     const [a, b] = await Promise.all([
-      openMailStore({ productDbPath: join(aliasA, 'db') }, { workerFactory: make }),
-      openMailStore({ productDbPath: join(aliasB, 'db') }, { workerFactory: make }),
+      openMailStoreForTest({ productDbPath: join(aliasA, 'db') }, { workerFactory: make }),
+      openMailStoreForTest({ productDbPath: join(aliasB, 'db') }, { workerFactory: make }),
     ])
     expect(created).toHaveLength(1)
     await a.close(); await b.close()
     const hardlink = join(targetDir, 'hardlink.db')
     linkSync(target, hardlink)
-    await expect(openMailStore({ productDbPath: hardlink }, { workerFactory: make }))
+    await expect(openMailStoreForTest({ productDbPath: hardlink }, { workerFactory: make }))
       .rejects.toMatchObject({ code: 'invalid_input' })
   })
 
@@ -204,12 +204,12 @@ describe('async MailStore worker RPC facade', () => {
       db = join(root, 'boring-mail.db'), vaultA = join(root, 'vault-a.db'), vaultB = join(root, 'vault-b.db'),
       make = factory([])
     writeFileSync(vaultA, ''); writeFileSync(vaultB, '')
-    const store = await openMailStore({ productDbPath: db, msgvaultDbPath: vaultA }, { workerFactory: make })
+    const store = await openMailStoreForTest({ productDbPath: db, msgvaultDbPath: vaultA }, { workerFactory: make })
     try {
-      await expect(openMailStore(
+      await expect(openMailStoreForTest(
         { productDbPath: db, msgvaultDbPath: vaultB }, { workerFactory: make },
       )).rejects.toMatchObject({ code: 'invalid_input' })
-      await expect(openMailStore(
+      await expect(openMailStoreForTest(
         { productDbPath: join(root, 'other.db'), msgvaultDbPath: vaultA }, { workerFactory: make },
       )).rejects.toMatchObject({ code: 'invalid_input' })
     } finally {

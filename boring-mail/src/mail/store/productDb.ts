@@ -8,8 +8,6 @@ export type {
   AsyncOutboxStore,
   MailStore,
   MailStoreOpenOptions,
-  MailStoreWorkerFactory,
-  WorkerTransport,
 } from './product/MailStore.js'
 export type { MailStoreWorkerConfig } from './product/mailStoreProtocol.js'
 export { ProductStoreError } from './product/types.js'
