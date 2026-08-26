@@ -10,6 +10,7 @@ import { DatabaseSync } from 'node:sqlite'
 import {
   attachmentAbsolutePath,
   getThreadMessages,
+  hasMessageAtSource,
   listAttachments,
   listThreads,
   openMsgvaultStore,
@@ -196,6 +197,13 @@ describe('msgvaultAdapter', () => {
     expect(listThreads(store.db, { unreadOnly: true })).toHaveLength(1)
     expect(listThreads(store.db, { label: 'SENT' })).toHaveLength(0)
     expect(listThreads(store.db, { label: 'INBOX' })).toHaveLength(1)
+  })
+
+  it('verifies trusted reply ownership by exact rfc822+source pair', () => {
+    expect(hasMessageAtSource(store.db, '<q2@example.com>', 1)).toBe(true)
+    expect(hasMessageAtSource(store.db, '<q2@example.com>', 999)).toBe(false)
+    expect(hasMessageAtSource(store.db, '<missing@example.com>', 1)).toBe(false)
+    expect(hasMessageAtSource(store.db, '<d@example.com>', 1)).toBe(false) // soft-deleted
   })
 
   it('returns thread messages with sender, labels and unread flag', async () => {
