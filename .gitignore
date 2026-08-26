@@ -8,3 +8,13 @@ app/.playground/
 .env.*
 .DS_Store
 *.log
+
+# bv (beads viewer) local config and caches
+.bv/
+.claude/settings.local.json
+
+# agent-mail local coordination DB and generated mcp configs
+/storage.sqlite3*
+/cursor.mcp.json
+/gemini.mcp.json
+.boring/
