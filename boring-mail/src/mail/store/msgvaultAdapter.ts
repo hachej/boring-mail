@@ -59,6 +59,10 @@ const REQUIRED_TABLES = [
 /**
  * Open the archive read-only. Throws with a named remediation when the file is
  * missing or the schema has drifted from what this adapter speaks.
+ *
+ * NOTE: returns the raw handle deliberately — the product layer performs its own
+ * rfc822/source-id joins (spike report §3). All product SQL lives in modules that
+ * re-run the drift guard via this opener; do not persist handles elsewhere.
  */
 export function openMsgvaultStore(
   dbPath: string,
@@ -173,19 +177,23 @@ export function getThreadMessages(db: DatabaseSync, conversationId: number): Mes
 
 export function getMessage(db: DatabaseSync, messageId: number): MessageSummary | null {
   const rows = db
-    .prepare(`${MESSAGE_SUMMARY_SELECT} WHERE m.id = ?`)
+    .prepare(`${MESSAGE_SUMMARY_SELECT} WHERE m.id = ? AND m.deleted_at IS NULL`)
     .all(messageId) as Array<Record<string, unknown>>
   return rows.length > 0 ? rowToMessageSummary(rows[0]) : null
 }
 
-/** FTS5 search with Gmail-ish user queries; returns matching messages, newest first. */
+/**
+ * FTS5 search with Gmail-ish user queries; returns matching messages, newest first.
+ * User input is wrapped as a quoted PHRASE: FTS5 syntax characters in raw input
+ * (`subject:x`, `-foo`, `a OR b`, unbalanced quotes/parens) must never be parsed
+ * as query syntax, and malformed MATCH must degrade to empty results, not throw.
+ */
 export function searchMessages(
   db: DatabaseSync,
   query: string,
   opts: { limit?: number } = {},
 ): MessageSummary[] {
-  // User input goes into FTS MATCH only after escaping double quotes.
-  const safe = query.replace(/"/g, '""')
+  const safe = `"${query.replace(/"/g, '""')}"`
   const rows = db
     .prepare(
       `${MESSAGE_SUMMARY_SELECT}
@@ -195,8 +203,13 @@ export function searchMessages(
        ORDER BY m.sent_at DESC
        LIMIT ?`,
     )
-    .all(safe, Math.min(opts.limit ?? 25, 200)) as Array<Record<string, unknown>>
-  return rows.map(rowToMessageSummary)
+  let matched: Array<Record<string, unknown>>
+  try {
+    matched = rows.all(safe, Math.min(opts.limit ?? 25, 200)) as Array<Record<string, unknown>>
+  } catch {
+    return [] // malformed MATCH (e.g. only syntax chars) degrades to no results
+  }
+  return matched.map(rowToMessageSummary)
 }
 
 /** Raw MIME for a message (zlib-compressed in message_raw). */

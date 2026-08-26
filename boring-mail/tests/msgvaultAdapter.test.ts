@@ -228,3 +228,43 @@ describe('msgvaultAdapter', () => {
     expect(attachmentAbsolutePath('/archive/root', atts[0])).toBe('/archive/root/ab/abcd1234.blob')
   })
 })
+
+describe('msgvaultAdapter — review-finding edges', () => {
+  let dbPath: string
+  let store: { db: DatabaseSync }
+  let raw: DatabaseSync
+
+  beforeAll(() => {
+    dbPath = join(mkdtempSync(join(tmpdir(), 'msgvault-edge-')), 'fixture.db')
+    raw = new DatabaseSync(dbPath)
+    raw.exec(SCHEMA)
+    raw.exec(`INSERT INTO sources (id, kind, email) VALUES (1, 'gmail', 'edge@example.com')`)
+    raw.exec(`INSERT INTO participants (id, email_address, display_name) VALUES (1, 'x@example.com', 'X')`)
+    raw.exec(
+      `INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type, title)
+       VALUES (1, 1, 't1', 'email_thread', 'Edge')`,
+    )
+    raw.exec(
+      `INSERT INTO messages (id, conversation_id, source_id, rfc822_message_id, subject, snippet, deleted_at)
+       VALUES (10, 1, 1, '<e1@example.com>', 'Deleted edge', 'gone', CURRENT_TIMESTAMP)`,
+    )
+    raw.prepare(
+      `INSERT INTO messages_fts (message_id, subject, body, from_addr) VALUES (10, 'Deleted edge', 'body', 'x@example.com')`,
+    ).run()
+    store = openMsgvaultStore(dbPath)
+  })
+
+  afterAll(() => raw.close())
+
+  it('FTS syntax characters degrade to empty results instead of throwing', async () => {
+    const { searchMessages } = await import('../src/mail/store/msgvaultAdapter.js')
+    expect(searchMessages(store.db, 'subject:x')).toEqual([])
+    expect(searchMessages(store.db, '-foo OR NEAR(a b)')).toEqual([])
+    expect(searchMessages(store.db, 'unbalanced "quote')).toEqual([])
+  })
+
+  it('getMessage hides soft-deleted rows', async () => {
+    const { getMessage } = await import('../src/mail/store/msgvaultAdapter.js')
+    expect(getMessage(store.db, 10)).toBeNull()
+  })
+})
