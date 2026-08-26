@@ -16,6 +16,7 @@ import {
   markOutboxSent,
   markOutboxUnknown,
   openProductDb,
+  recoverExpiredDispatched,
   saveDraft,
   upsertAccount,
   type DraftInput,
@@ -42,7 +43,9 @@ describe('productDb', () => {
 
   beforeEach(() => {
     const path = join(mkdtempSync(join(tmpdir(), 'boring-product-')), 'boring-mail.db')
-    product = openProductDb(path)
+    product = openProductDb(path, {
+      verifyReplyOwnership: (rfc822, sourceId) => rfc822 === '<inbound@example.net>' && sourceId === 7,
+    })
     upsertAccount(product.db, {
       accountId: 'acct_work',
       providerSourceId: 7,
@@ -64,6 +67,8 @@ describe('productDb', () => {
 
     // Stable object-key ordering; attachment/recipient array order remains covered.
     expect(computeContentDigest(baseDraft())).toBe(computeContentDigest({ ...baseDraft() }))
+    expect(computeContentDigest(baseDraft({ path: 'drafts/renamed.mail.md' })))
+      .toBe(computeContentDigest(baseDraft())) // registry path is not wire content
     expect(computeContentDigest(baseDraft({ to: ['a@x', 'b@x'] })))
       .not.toBe(computeContentDigest(baseDraft({ to: ['b@x', 'a@x'] })))
   })
@@ -75,7 +80,11 @@ describe('productDb', () => {
       accountId: 'acct_other', providerSourceId: 8, primaryAddress: 'other@example.com', sendAs: ['other@example.com'],
     })
     expect(() => saveDraft(product.db, baseDraft({ accountId: 'acct_other', sendAsAddress: 'other@example.com' })))
-      .toThrow(/thread source/)
+      .toThrow(/trusted msgvault/)
+    // Paired account+source spoof also fails because msgvault lookup owns truth.
+    expect(() => saveDraft(product.db, baseDraft({
+      accountId: 'acct_other', sendAsAddress: 'other@example.com', replySourceId: 8,
+    }))).toThrow(/trusted msgvault/)
 
     upsertAccount(product.db, {
       accountId: 'acct_work', providerSourceId: 7, primaryAddress: 'work@example.com',
@@ -96,6 +105,15 @@ describe('productDb', () => {
     expect(listOpenAttention(product.db)).toHaveLength(5)
   })
 
+  it('expired approval capability fails closed and can be reissued', () => {
+    const draft = saveDraft(product.db, baseDraft(), 'draft-expired')
+    const outbox = enqueueForApproval(product.db, draft.id)
+    const expired = issueApprovalCapability(product.db, outbox.id, -1)
+    expect(() => approveOutbox(product.db, outbox.id, expired)).toThrow(/expired/)
+    const fresh = issueApprovalCapability(product.db, outbox.id, 60_000)
+    expect(approveOutbox(product.db, outbox.id, fresh).status).toBe('approved')
+  })
+
   it('single-use capability is digest-bound and consumed atomically', () => {
     const draft = saveDraft(product.db, baseDraft(), 'draft-cap')
     const outbox = enqueueForApproval(product.db, draft.id)
@@ -108,6 +126,31 @@ describe('productDb', () => {
     expect(() => approveOutbox(product.db, outbox.id, token)).toThrow(/not pending/)
   })
 
+  it('revocation between queue/approval and claim/dispatch fails closed', () => {
+    const draft = saveDraft(product.db, baseDraft(), 'draft-revoke')
+    const outbox = enqueueForApproval(product.db, draft.id)
+    const token = issueApprovalCapability(product.db, outbox.id)
+    upsertAccount(product.db, {
+      accountId: 'acct_work', providerSourceId: 7, primaryAddress: 'work@example.com',
+      sendAs: ['work@example.com'], connected: false,
+    })
+    expect(() => approveOutbox(product.db, outbox.id, token)).toThrow(/disconnected/)
+
+    // Reconnect, approve, then revoke alias before irreversible dispatch.
+    upsertAccount(product.db, {
+      accountId: 'acct_work', providerSourceId: 7, primaryAddress: 'work@example.com',
+      sendAs: ['work@example.com', 'alias@example.com'], connected: true,
+    })
+    const aliasDraft = saveDraft(product.db, baseDraft({ path: 'drafts/alias.mail.md', sendAsAddress: 'alias@example.com' }), 'alias')
+    const aliasOutbox = enqueueForApproval(product.db, aliasDraft.id)
+    approveOutbox(product.db, aliasOutbox.id, issueApprovalCapability(product.db, aliasOutbox.id))
+    claimApprovedOutbox(product.db, aliasOutbox.id, 'worker')
+    upsertAccount(product.db, {
+      accountId: 'acct_work', providerSourceId: 7, primaryAddress: 'work@example.com', sendAs: ['work@example.com'],
+    })
+    expect(() => markOutboxDispatched(product.db, aliasOutbox.id, 'worker')).toThrow(/not provider-authorised/)
+  })
+
   it('content changes create a new revision and stale prior approval', () => {
     const first = saveDraft(product.db, baseDraft(), 'draft-edit')
     const queued = enqueueForApproval(product.db, first.id)
@@ -118,6 +161,17 @@ describe('productDb', () => {
     expect(edited.revision).toBe(2)
     expect(edited.contentDigest).not.toBe(first.contentDigest)
     expect(getOutbox(product.db, queued.id)?.status).toBe('stale')
+    expect(listOpenAttention(product.db)).toHaveLength(0)
+  })
+
+  it('editing after a pre-dispatch claim stales the row and clears its lease', () => {
+    const draft = saveDraft(product.db, baseDraft(), 'draft-claimed-edit')
+    const outbox = enqueueForApproval(product.db, draft.id)
+    approveOutbox(product.db, outbox.id, issueApprovalCapability(product.db, outbox.id))
+    claimApprovedOutbox(product.db, outbox.id, 'worker')
+    saveDraft(product.db, baseDraft({ bodyMarkdown: 'changed while claimed' }))
+    expect(getOutbox(product.db, outbox.id)?.status).toBe('stale')
+    expect(() => markOutboxDispatched(product.db, outbox.id, 'worker')).toThrow(/not held/)
   })
 
   it('fails closed when the outbox snapshot is tampered before approval', () => {
@@ -160,6 +214,24 @@ describe('productDb', () => {
     expect(attention[0].kind).toBe('send_unknown')
   })
 
+  it('recovers an expired post-dispatch lease as unknown with attention', () => {
+    const draft = saveDraft(product.db, baseDraft(), 'draft-crash')
+    const outbox = enqueueForApproval(product.db, draft.id)
+    approveOutbox(product.db, outbox.id, issueApprovalCapability(product.db, outbox.id))
+    claimApprovedOutbox(product.db, outbox.id, 'worker', -1)
+    // Need an unexpired claim to mark dispatch; claim it again, then force expiry.
+    claimApprovedOutbox(product.db, outbox.id, 'worker', 60_000)
+    markOutboxDispatched(product.db, outbox.id, 'worker')
+    product.db.prepare(`UPDATE mail_outbox SET send_lease_until=? WHERE id=?`)
+      .run(new Date(Date.now() - 1000).toISOString(), outbox.id)
+    const recovered = recoverExpiredDispatched(product.db)
+    expect(recovered).toHaveLength(1)
+    expect(recovered[0].status).toBe('unknown')
+    expect(recovered[0].sendAttemptCount).toBe(1)
+    expect(listOpenAttention(product.db).filter((x) => x.kind === 'send_unknown')).toHaveLength(1)
+    expect(recoverExpiredDispatched(product.db)).toEqual([]) // idempotent
+  })
+
   it('reclaims an expired pre-dispatch lease without creating a second attempt', () => {
     const draft = saveDraft(product.db, baseDraft(), 'draft-reclaim')
     const outbox = enqueueForApproval(product.db, draft.id)
@@ -174,6 +246,7 @@ describe('productDb', () => {
   it('requires both reply correlation keys and .mail.md paths', () => {
     expect(() => saveDraft(product.db, baseDraft({ replySourceId: undefined }))).toThrow(/supplied together/)
     expect(() => saveDraft(product.db, baseDraft({ path: 'drafts/x.txt' }))).toThrow(/\.mail\.md/)
+    expect(() => saveDraft(product.db, baseDraft({ path: '../escape.mail.md' }))).toThrow(/may not escape/)
     expect(() => saveDraft(product.db, baseDraft({ to: [] }))).toThrow(/To recipient/)
   })
 })

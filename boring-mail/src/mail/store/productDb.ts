@@ -3,6 +3,7 @@
 // copies provider message bodies: provider joins are rfc822_message_id+source_id.
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
+import { posix } from 'node:path'
 
 export type OutboxStatus =
   | 'pending_approval'
@@ -54,10 +55,17 @@ export interface OutboxRecord {
   providerMessageId: string | null
 }
 
+export interface ProductDbOptions {
+  /** Trusted msgvault lookup. Required for reply drafts. */
+  verifyReplyOwnership?: (rfc822MessageId: string, sourceId: number) => boolean
+}
+
 export interface ProductDb {
   db: DatabaseSync
   close(): void
 }
+
+const optionsByDb = new WeakMap<DatabaseSync, ProductDbOptions>()
 
 const SCHEMA = `
 PRAGMA foreign_keys = ON;
@@ -136,9 +144,10 @@ CREATE TABLE IF NOT EXISTS mail_attention (
 CREATE INDEX IF NOT EXISTS idx_mail_attention_open ON mail_attention(resolved_at, created_at);
 `
 
-export function openProductDb(path: string): ProductDb {
+export function openProductDb(path: string, options: ProductDbOptions = {}): ProductDb {
   const db = new DatabaseSync(path)
   db.exec(SCHEMA)
+  optionsByDb.set(db, options)
   return { db, close: () => db.close() }
 }
 
@@ -163,15 +172,22 @@ function normalizeAddress(value: string): string {
   return value.trim().toLowerCase()
 }
 
+function normalizeDraftPath(path: string): string {
+  const slash = path.replace(/\\/g, '/')
+  if (slash.startsWith('/') || slash.split('/').includes('..')) throw new Error('draft path must be workspace-relative and may not escape')
+  const normalized = posix.normalize(slash).replace(/^\.\//, '')
+  if (!normalized.endsWith('.mail.md')) throw new Error('draft path must end with .mail.md')
+  return normalized
+}
+
 function normalizeInput(input: DraftInput): DraftInput {
   const replyId = input.replyRfc822MessageId?.trim() || undefined
   if ((replyId == null) !== (input.replySourceId == null)) {
     throw new Error('replyRfc822MessageId and replySourceId must be supplied together')
   }
-  if (!input.path.endsWith('.mail.md')) throw new Error('draft path must end with .mail.md')
   if (input.to.length === 0) throw new Error('at least one To recipient is required')
   return {
-    path: input.path,
+    path: normalizeDraftPath(input.path),
     accountId: input.accountId,
     sendAsAddress: normalizeAddress(input.sendAsAddress),
     ...(replyId ? { replyRfc822MessageId: replyId, replySourceId: input.replySourceId } : {}),
@@ -195,8 +211,15 @@ function canonical(value: unknown): string {
     .join(',')}}`
 }
 
+function sendContent(input: DraftInput): Omit<DraftInput, 'path'> {
+  const { path: _registryPath, ...covered } = normalizeInput(input)
+  return covered
+}
+
 export function computeContentDigest(input: DraftInput): string {
-  return createHash('sha256').update(canonical(normalizeInput(input))).digest('hex')
+  // Registry path is not wire content and intentionally excluded. Everything
+  // capable of changing recipient, identity or bytes-on-wire remains covered.
+  return createHash('sha256').update(canonical(sendContent(input))).digest('hex')
 }
 
 export function upsertAccount(
@@ -253,11 +276,13 @@ function rowToDraft(row: Record<string, unknown>): DraftRecord {
 export function saveDraft(db: DatabaseSync, input: DraftInput, id = randomUUID()): DraftRecord {
   const value = normalizeInput(input)
   assertAuthorizedIdentity(db, value.accountId, value.sendAsAddress)
-  if (value.replySourceId != null) {
+  if (value.replySourceId != null && value.replyRfc822MessageId) {
     const owner = db.prepare(`SELECT provider_source_id FROM mail_accounts WHERE account_id=?`)
       .get(value.accountId) as { provider_source_id: number } | undefined
-    if (!owner || owner.provider_source_id !== value.replySourceId) {
-      throw new Error('reply account must be derived from the msgvault thread source; client-selected account refused')
+    const verify = optionsByDb.get(db)?.verifyReplyOwnership
+    if (!owner || owner.provider_source_id !== value.replySourceId || !verify ||
+        !verify(value.replyRfc822MessageId, value.replySourceId)) {
+      throw new Error('reply account must be derived from trusted msgvault state; client-selected ownership refused')
     }
   }
   const digest = computeContentDigest(value)
@@ -270,8 +295,10 @@ export function saveDraft(db: DatabaseSync, input: DraftInput, id = randomUUID()
     if (existing) {
       db.prepare(`
         UPDATE mail_outbox SET status='stale', approval_cap_hash=NULL, approval_expires_at=NULL,
-          updated_at=CURRENT_TIMESTAMP
-        WHERE draft_id=? AND status IN ('pending_approval','approved')
+          send_lease_owner=NULL, send_lease_until=NULL, updated_at=CURRENT_TIMESTAMP
+        WHERE draft_id=? AND (
+          status IN ('pending_approval','approved') OR (status='sending' AND send_attempt_count=0)
+        )
       `).run(draftId)
       db.prepare(`
         UPDATE mail_attention SET resolved_at=CURRENT_TIMESTAMP
@@ -319,7 +346,7 @@ function computeOutboxDigest(input: DraftInput, idempotencyKey: string): string 
   // Message-ID is generated before approval and is covered like every other
   // generated header. Date/RFC822 composition is added by the send-lane bead.
   return createHash('sha256')
-    .update(canonical({ draft: normalizeInput(input), messageId: idempotencyKey }))
+    .update(canonical({ content: sendContent(input), messageId: idempotencyKey }))
     .digest('hex')
 }
 
@@ -389,6 +416,22 @@ export function issueApprovalCapability(
   return token
 }
 
+function assertOutboxIdentity(db: DatabaseSync, row: Record<string, unknown>): void {
+  const accountId = String(row.account_id)
+  const sendAs = String(row.send_as_address)
+  assertAuthorizedIdentity(db, accountId, sendAs)
+  if (row.reply_source_id != null && row.reply_rfc822_message_id) {
+    const account = db.prepare(`SELECT provider_source_id FROM mail_accounts WHERE account_id=?`)
+      .get(accountId) as { provider_source_id: number } | undefined
+    const sourceId = Number(row.reply_source_id)
+    const verify = optionsByDb.get(db)?.verifyReplyOwnership
+    if (!account || account.provider_source_id !== sourceId || !verify ||
+        !verify(String(row.reply_rfc822_message_id), sourceId)) {
+      throw new Error('reply ownership or sending identity was revoked')
+    }
+  }
+}
+
 function outboxDigest(row: Record<string, unknown>): string {
   const input: DraftInput = {
     path: String(row.path ?? `${row.draft_id}.mail.md`),
@@ -414,6 +457,7 @@ export function approveOutbox(db: DatabaseSync, outboxId: string, token: string)
       SELECT o.*, d.path FROM mail_outbox o JOIN mail_drafts d ON d.id=o.draft_id WHERE o.id=?
     `).get(outboxId) as Record<string, unknown> | undefined
     if (!row || row.status !== 'pending_approval') throw new Error('outbox is not pending approval')
+    assertOutboxIdentity(db, row)
     if (!row.approval_cap_hash || !row.approval_expires_at) throw new Error('approval capability was not issued')
     if (Date.parse(String(row.approval_expires_at)) <= Date.now()) throw new Error('approval capability expired')
     const actual = createHash('sha256').update(token).digest()
@@ -444,6 +488,7 @@ export function claimApprovedOutbox(
     const reclaimable = row?.status === 'sending' && Number(row.send_attempt_count) === 0 &&
       Date.parse(String(row.send_lease_until)) <= Date.now()
     if (!row || (row.status !== 'approved' && !reclaimable)) throw new Error('outbox is not approved or reclaimable')
+    assertOutboxIdentity(db, row)
     if (outboxDigest(row) !== row.content_digest) throw new Error('content digest mismatch before claim')
     const leaseUntil = new Date(Date.now() + leaseMs).toISOString()
     db.prepare(`UPDATE mail_outbox SET status='sending',send_lease_owner=?,send_lease_until=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
@@ -454,13 +499,19 @@ export function claimApprovedOutbox(
 
 /** Called immediately before the irreversible provider request. */
 export function markOutboxDispatched(db: DatabaseSync, outboxId: string, workerId: string): OutboxRecord {
-  const result = db.prepare(`
-    UPDATE mail_outbox SET send_attempt_count=1,updated_at=CURRENT_TIMESTAMP
-    WHERE id=? AND status='sending' AND send_lease_owner=? AND send_attempt_count=0
-      AND send_lease_until > ?
-  `).run(outboxId, workerId, new Date().toISOString())
-  if (result.changes !== 1) throw new Error('outbox is not held by this worker or was already dispatched')
-  return getOutbox(db, outboxId)!
+  return tx(db, () => {
+    const row = db.prepare(`
+      SELECT o.*, d.path FROM mail_outbox o JOIN mail_drafts d ON d.id=o.draft_id WHERE o.id=?
+    `).get(outboxId) as Record<string, unknown> | undefined
+    if (!row || row.status !== 'sending' || row.send_lease_owner !== workerId ||
+        Number(row.send_attempt_count) !== 0 || Date.parse(String(row.send_lease_until)) <= Date.now()) {
+      throw new Error('outbox is not held by this worker or was already dispatched')
+    }
+    assertOutboxIdentity(db, row) // revalidate immediately before irreversible request
+    if (outboxDigest(row) !== row.content_digest) throw new Error('content digest mismatch before dispatch')
+    db.prepare(`UPDATE mail_outbox SET send_attempt_count=1,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(outboxId)
+    return getOutbox(db, outboxId)!
+  })
 }
 
 export function markOutboxSent(db: DatabaseSync, outboxId: string, providerMessageId: string): OutboxRecord {
@@ -484,6 +535,34 @@ export function markOutboxUnknown(db: DatabaseSync, outboxId: string, detail: st
     db.prepare(`INSERT INTO mail_attention (id,kind,account_id,outbox_id,title,detail) VALUES (?,?,?,?,?,?)`)
       .run(randomUUID(), 'send_unknown', row.accountId, outboxId, 'Send outcome unknown', detail)
     return row
+  })
+}
+
+/** Startup/reaper path: a dispatched row with an expired lease is ambiguous. */
+export function recoverExpiredDispatched(db: DatabaseSync, now = new Date()): OutboxRecord[] {
+  return tx(db, () => {
+    const rows = db.prepare(`
+      SELECT id FROM mail_outbox
+      WHERE status='sending' AND send_attempt_count=1 AND send_lease_until <= ?
+    `).all(now.toISOString()) as Array<{ id: string }>
+    const recovered: OutboxRecord[] = []
+    for (const { id } of rows) {
+      db.prepare(`
+        UPDATE mail_outbox SET status='unknown',send_lease_owner=NULL,send_lease_until=NULL,
+          updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='sending' AND send_attempt_count=1
+      `).run(id)
+      const row = getOutbox(db, id)!
+      const existing = db.prepare(`
+        SELECT 1 FROM mail_attention WHERE outbox_id=? AND kind='send_unknown' AND resolved_at IS NULL
+      `).get(id)
+      if (!existing) {
+        db.prepare(`INSERT INTO mail_attention (id,kind,account_id,outbox_id,title,detail) VALUES (?,?,?,?,?,?)`)
+          .run(randomUUID(), 'send_unknown', row.accountId, id, 'Send outcome unknown',
+            'worker lease expired after dispatch; reconciliation required')
+      }
+      recovered.push(row)
+    }
+    return recovered
   })
 }
 

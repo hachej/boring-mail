@@ -175,6 +175,18 @@ export function getThreadMessages(db: DatabaseSync, conversationId: number): Mes
   return rows.map(rowToMessageSummary)
 }
 
+/** Trusted ownership check used by productDb for reply-account binding. */
+export function hasMessageAtSource(
+  db: DatabaseSync,
+  rfc822MessageId: string,
+  sourceId: number,
+): boolean {
+  return db.prepare(`
+    SELECT 1 FROM messages
+    WHERE rfc822_message_id=? AND source_id=? AND deleted_at IS NULL LIMIT 1
+  `).get(rfc822MessageId, sourceId) != null
+}
+
 export function getMessage(db: DatabaseSync, messageId: number): MessageSummary | null {
   const rows = db
     .prepare(`${MESSAGE_SUMMARY_SELECT} WHERE m.id = ? AND m.deleted_at IS NULL`)
