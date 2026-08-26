@@ -45,22 +45,36 @@ export interface MessageBody {
   format: string
 }
 
-const REQUIRED_TABLES = [
-  'messages',
-  'conversations',
-  'participants',
-  'message_labels',
-  'labels',
-  'message_raw',
-  'attachments',
-  'messages_fts',
-] as const
-
-const REQUIRED_MESSAGE_COLUMNS = [
-  'rfc822_message_id',
-  'source_id',
-  'deleted_at',
-] as const
+const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
+  messages: [
+    'id',
+    'conversation_id',
+    'source_id',
+    'rfc822_message_id',
+    'subject',
+    'snippet',
+    'sent_at',
+    'is_read',
+    'attachment_count',
+    'sender_id',
+    'deleted_at',
+  ],
+  conversations: [
+    'id',
+    'conversation_type',
+    'title',
+    'message_count',
+    'unread_count',
+    'last_message_at',
+    'last_message_preview',
+  ],
+  participants: ['id', 'email_address', 'display_name'],
+  message_labels: ['message_id', 'label_id'],
+  labels: ['id', 'name'],
+  message_raw: ['message_id', 'raw_data', 'raw_format', 'compression'],
+  attachments: ['id', 'message_id', 'filename', 'mime_type', 'size', 'content_hash', 'storage_path'],
+  messages_fts: ['message_id'],
+}
 
 /**
  * Open the archive read-only. Throws with a named remediation when the file is
@@ -70,10 +84,7 @@ const REQUIRED_MESSAGE_COLUMNS = [
  * rfc822/source-id joins (spike report §3). All product SQL lives in modules that
  * re-run the drift guard via this opener; do not persist handles elsewhere.
  */
-export function openMsgvaultStore(
-  dbPath: string,
-  opts: MsgvaultStoreOptions = {},
-): { db: DatabaseSync } {
+export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {}): { db: DatabaseSync } {
   let db: DatabaseSync
   try {
     db = new DatabaseSync(dbPath, { readOnly: true })
@@ -83,20 +94,32 @@ export function openMsgvaultStore(
         `Run: msgvault init-db && msgvault add-account <email>, or point config at an existing archive.`,
     )
   }
-  const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>
+  const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{
+    name: string
+  }>
   const have = new Set(tables.map((t) => t.name))
-  const missingTables = REQUIRED_TABLES.filter((table) => !have.has(table))
-  let missingMessageColumns: readonly string[] = []
-  if (have.has('messages')) {
-    const columns = db.prepare(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>
-    const columnNames = new Set(columns.map((column) => column.name))
-    missingMessageColumns = REQUIRED_MESSAGE_COLUMNS.filter((column) => !columnNames.has(column))
+  const missingTables = Object.keys(REQUIRED_SCHEMA).filter((table) => !have.has(table))
+  const columnErrors: string[] = []
+  for (const [table, required] of Object.entries(REQUIRED_SCHEMA)) {
+    if (!have.has(table)) continue
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+    const names = new Set(columns.map((column) => column.name))
+    const missing = required.filter((column) => !names.has(column))
+    if (missing.length) columnErrors.push(`${table} missing column(s): ${missing.join(', ')}`)
   }
-  if (missingTables.length > 0 || missingMessageColumns.length > 0) {
+  const ftsRow = db.prepare(`SELECT sql FROM sqlite_master WHERE name='messages_fts'`).get() as
+    | { sql: string | null }
+    | undefined
+  const invalidFts =
+    have.has('messages_fts') && !/CREATE\s+VIRTUAL\s+TABLE[\s\S]*USING\s+fts5/i.test(ftsRow?.sql ?? '')
+  if (missingTables.length > 0 || columnErrors.length > 0 || invalidFts) {
     const details = [
       missingTables.length > 0 ? `missing table(s): ${missingTables.join(', ')}` : '',
-      missingMessageColumns.length > 0 ? `messages missing column(s): ${missingMessageColumns.join(', ')}` : '',
-    ].filter(Boolean).join('; ')
+      ...columnErrors,
+      invalidFts ? 'messages_fts is not an FTS5 virtual table' : '',
+    ]
+      .filter(Boolean)
+      .join('; ')
     const msg =
       `REMEDIATION: msgvault schema drift — ${details}. ` +
       `This adapter targets ${MSGVAULT_TESTED_MAJOR_MINOR}.x; upgrade boring-mail or pin msgvault.`
@@ -193,16 +216,30 @@ export function getThreadMessages(db: DatabaseSync, conversationId: number): Mes
   return rows.map(rowToMessageSummary)
 }
 
-/** Trusted ownership check used by productDb for reply-account binding. */
-export function hasMessageAtSource(
-  db: DatabaseSync,
-  rfc822MessageId: string,
-  sourceId: number,
-): boolean {
-  return db.prepare(`
+export interface ResolvedMsgvaultReply {
+  rfc822MessageId: string
+  sourceId: number
+}
+/** Resolve the immutable msgvault row key to server-owned reply identity. */
+export function resolveReplyTarget(db: DatabaseSync, messageId: number): ResolvedMsgvaultReply | null {
+  const row = db
+    .prepare(`SELECT rfc822_message_id,source_id FROM messages WHERE id=? AND deleted_at IS NULL`)
+    .get(messageId) as { rfc822_message_id: string | null; source_id: number } | undefined
+  return row?.rfc822_message_id ? { rfc822MessageId: row.rfc822_message_id, sourceId: row.source_id } : null
+}
+
+/** Trusted ownership check retained for read-side callers. */
+export function hasMessageAtSource(db: DatabaseSync, rfc822MessageId: string, sourceId: number): boolean {
+  return (
+    db
+      .prepare(
+        `
     SELECT 1 FROM messages
     WHERE rfc822_message_id=? AND source_id=? AND deleted_at IS NULL LIMIT 1
-  `).get(rfc822MessageId, sourceId) != null
+  `,
+      )
+      .get(rfc822MessageId, sourceId) != null
+  )
 }
 
 export function getMessage(db: DatabaseSync, messageId: number): MessageSummary | null {
@@ -224,15 +261,14 @@ export function searchMessages(
   opts: { limit?: number } = {},
 ): MessageSummary[] {
   const safe = `"${query.replace(/"/g, '""')}"`
-  const rows = db
-    .prepare(
-      `${MESSAGE_SUMMARY_SELECT}
+  const rows = db.prepare(
+    `${MESSAGE_SUMMARY_SELECT}
         JOIN messages_fts f ON f.message_id = m.id
        WHERE messages_fts MATCH ?
          AND m.deleted_at IS NULL
        ORDER BY m.sent_at DESC
        LIMIT ?`,
-    )
+  )
   let matched: Array<Record<string, unknown>>
   try {
     matched = rows.all(safe, Math.min(opts.limit ?? 25, 200)) as Array<Record<string, unknown>>

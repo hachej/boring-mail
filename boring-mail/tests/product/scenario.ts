@@ -3,19 +3,18 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   openProductStore,
-  type DraftInput,
   type ProductStore,
   type ProductStoreDependencies,
+  type ReplyDraftInput,
 } from '../../src/mail/store/productDb.js'
-
-export const reply = { rfc822MessageId: '<inbound@example.net>', sourceId: 7 }
-
-export function draft(overrides: Partial<DraftInput> = {}): DraftInput {
+export const UI_SESSION = 'host-session-a'
+export const reply = { messageId: 101, rfc822MessageId: '<inbound@example.net>', sourceId: 7 }
+export function draft(overrides: Partial<ReplyDraftInput> = {}): ReplyDraftInput {
   return {
+    kind: 'reply',
     path: 'drafts/reply.mail.md',
-    accountId: 'acct_work',
+    replyToMessageId: reply.messageId,
     sendAsAddress: 'work@example.com',
-    reply,
     to: ['Client@Example.net'],
     cc: [],
     bcc: [],
@@ -25,25 +24,25 @@ export function draft(overrides: Partial<DraftInput> = {}): DraftInput {
     ...overrides,
   }
 }
-
 export interface Scenario {
   path: string
   store: ProductStore
   clock: { now: number }
-  owned: Set<string>
+  targets: Map<number, { rfc822MessageId: string; sourceId: number }>
   close(): void
-  save(overrides?: Partial<DraftInput>, id?: string): ReturnType<ProductStore['saveDraft']>
-  enqueueApproved(overrides?: Partial<DraftInput>): ReturnType<ProductStore['enqueue']>
+  save(overrides?: Partial<ReplyDraftInput>, id?: string): ReturnType<ProductStore['saveDraft']>
+  enqueueApproved(overrides?: Partial<ReplyDraftInput>): ReturnType<ProductStore['outbox']['approve']>
 }
-
-export function scenario(depsOverride: Partial<ProductStoreDependencies> = {}): Scenario {
-  const path = join(mkdtempSync(join(tmpdir(), 'boring-product-')), 'boring-mail.db')
-  const clock = { now: 1_800_000_000_000 }
-  const owned = new Set([`${reply.sourceId}:${reply.rfc822MessageId}`])
+export function scenario(deps: Partial<ProductStoreDependencies> = {}): Scenario {
+  const path = join(mkdtempSync(join(tmpdir(), 'boring-product-')), 'boring-mail.db'),
+    clock = { now: 1_800_000_000_000 },
+    targets = new Map([
+      [reply.messageId, { rfc822MessageId: reply.rfc822MessageId, sourceId: reply.sourceId }],
+    ])
   const store = openProductStore(path, {
     now: () => clock.now,
-    verifyReplyOwnership: (messageId, sourceId) => owned.has(`${sourceId}:${messageId}`),
-    ...depsOverride,
+    resolveReplyTarget: (id) => targets.get(id) ?? null,
+    ...deps,
   })
   store.upsertAccount({
     accountId: 'acct_work',
@@ -51,19 +50,17 @@ export function scenario(depsOverride: Partial<ProductStoreDependencies> = {}): 
     primaryAddress: 'work@example.com',
     sendAs: ['work@example.com', 'alias@example.com'],
   })
-  const result: Scenario = {
+  return {
     path,
     store,
     clock,
-    owned,
+    targets,
     close: () => store.close(),
-    save: (overrides = {}, id) => store.saveDraft(draft(overrides), id),
-    enqueueApproved: (overrides = {}) => {
-      const saved = store.saveDraft(draft(overrides))
-      const queued = store.enqueue(saved.id)
-      const token = store.issueApprovalCapability(queued.id)
-      return store.approve(queued.id, token)
+    save: (o = {}, id) => store.saveDraft(draft(o), id),
+    enqueueApproved: (o = {}) => {
+      const queued = store.outbox.enqueue(store.saveDraft(draft(o)).id),
+        token = store.outbox.issueApprovalCapability(queued.id, UI_SESSION)
+      return store.outbox.approve(queued.id, token, UI_SESSION)
     },
   }
-  return result
 }

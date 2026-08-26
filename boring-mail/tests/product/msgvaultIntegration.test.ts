@@ -4,55 +4,46 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
-import { hasMessageAtSource, openMsgvaultStore } from '../../src/mail/store/msgvaultAdapter.js'
+import { openMsgvaultStore, resolveReplyTarget } from '../../src/mail/store/msgvaultAdapter.js'
 import { openProductStore } from '../../src/mail/store/productDb.js'
-
-function createMsgvaultFixture(path: string): void {
-  const db = new DatabaseSync(path)
-  db.exec(`
-    CREATE TABLE messages (
-      id INTEGER PRIMARY KEY, rfc822_message_id TEXT, source_id INTEGER, deleted_at TEXT
-    );
-    CREATE TABLE conversations (id INTEGER); CREATE TABLE participants (id INTEGER);
-    CREATE TABLE message_labels (id INTEGER); CREATE TABLE labels (id INTEGER);
-    CREATE TABLE message_raw (id INTEGER); CREATE TABLE attachments (id INTEGER);
-    CREATE TABLE messages_fts (id INTEGER);
-    INSERT INTO messages VALUES (1, '<trusted@example.net>', 42, NULL);
-    INSERT INTO messages VALUES (2, '<deleted@example.net>', 42, '2027-01-01');
-  `)
-  db.close()
-}
-
-describe('ProductStore + msgvault ownership boundary', () => {
-  it('uses the real guarded msgvault lookup for exact live rfc822+source ownership', () => {
-    const root = mkdtempSync(join(tmpdir(), 'product-msgvault-'))
-    const archivePath = join(root, 'msgvault.db')
-    createMsgvaultFixture(archivePath)
-    const archive = openMsgvaultStore(archivePath)
-    const product = openProductStore(join(root, 'product.db'), {
-      now: () => 1_800_000_000_000,
-      verifyReplyOwnership: (messageId, sourceId) => hasMessageAtSource(archive.db, messageId, sourceId),
-    })
-    product.upsertAccount({
-      accountId: 'trusted', providerSourceId: 42,
-      primaryAddress: 'sender@example.com', sendAs: ['sender@example.com'],
-    })
-    const base = {
-      path: 'drafts/reply.mail.md', accountId: 'trusted', sendAsAddress: 'sender@example.com',
-      to: ['recipient@example.net'], subject: 'reply', bodyMarkdown: 'body',
+const schema = `CREATE TABLE conversations(id INTEGER,conversation_type TEXT,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER,source_id INTEGER,rfc822_message_id TEXT,subject TEXT,snippet TEXT,sent_at TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT);CREATE TABLE message_labels(message_id INTEGER,label_id INTEGER);CREATE TABLE labels(id INTEGER,name TEXT);CREATE TABLE message_raw(message_id INTEGER,raw_data BLOB,raw_format TEXT,compression TEXT);CREATE TABLE attachments(id INTEGER,message_id INTEGER,filename TEXT,mime_type TEXT,size INTEGER,content_hash TEXT,storage_path TEXT);CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED,subject);`
+describe('trusted msgvault integration', () => {
+  it('derives account from selected immutable row even when RFC822 ID is duplicated', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-')),
+      path = join(root, 'mv.db'),
+      raw = new DatabaseSync(path)
+    raw.exec(schema)
+    raw.exec(
+      `INSERT INTO messages(id,source_id,rfc822_message_id)VALUES(1,42,'<same@x>'),(2,43,'<same@x>'),(3,42,'<gone@x>');UPDATE messages SET deleted_at='x' WHERE id=3`,
+    )
+    raw.close()
+    const mv = openMsgvaultStore(path),
+      product = openProductStore(join(root, 'product.db'), {
+        now: () => 1,
+        resolveReplyTarget: (id) => resolveReplyTarget(mv.db, id),
+      })
+    try {
+      product.upsertAccount({ accountId: 'a', providerSourceId: 42, primaryAddress: 'a@x', sendAs: ['a@x'] })
+      product.upsertAccount({ accountId: 'b', providerSourceId: 43, primaryAddress: 'b@x', sendAs: ['b@x'] })
+      const base = {
+        kind: 'reply' as const,
+        path: 'a.mail.md',
+        replyToMessageId: 1,
+        sendAsAddress: 'a@x',
+        to: ['z@x'],
+        subject: 's',
+        bodyMarkdown: 'b',
+      }
+      expect(product.saveDraft(base)).toMatchObject({ accountId: 'a', reply: { messageId: 1, sourceId: 42 } })
+      expect(
+        product.saveDraft({ ...base, path: 'b.mail.md', replyToMessageId: 2, sendAsAddress: 'b@x' }),
+      ).toMatchObject({ accountId: 'b' })
+      expect(() => product.saveDraft({ ...base, path: 'gone.mail.md', replyToMessageId: 3 })).toThrow(
+        /absent/,
+      )
+    } finally {
+      product.close()
+      mv.db.close()
     }
-    expect(product.saveDraft({
-      ...base, reply: { rfc822MessageId: '<trusted@example.net>', sourceId: 42 },
-    })).toMatchObject({ reply: { sourceId: 42 } })
-    expect(() => product.saveDraft({
-      ...base, path: 'drafts/spoof.mail.md',
-      reply: { rfc822MessageId: '<trusted@example.net>', sourceId: 41 },
-    })).toThrow(/trusted msgvault/)
-    expect(() => product.saveDraft({
-      ...base, path: 'drafts/deleted.mail.md',
-      reply: { rfc822MessageId: '<deleted@example.net>', sourceId: 42 },
-    })).toThrow(/trusted msgvault/)
-    product.close()
-    archive.db.close()
   })
 })
