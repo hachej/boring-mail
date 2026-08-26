@@ -38,13 +38,13 @@ try {
   )
 }
 
-// 3. The storage process is executed directly under util-linux flock.
+// 3. The storage process inherits an fd locked by util-linux flock.
 try {
   const help = execFileSync('flock', ['--help'], { encoding: 'utf8' })
-  if (!help.includes('--no-fork') || !help.includes('--conflict-exit-code')) {
-    fail('flock lacks --no-fork/-E support. Remediation: install a current util-linux package.')
+  if (!help.includes('--conflict-exit-code')) {
+    fail('flock lacks -E support. Remediation: install a current util-linux package.')
   } else {
-    ok('util-linux flock supports --no-fork and conflict exit codes')
+    ok('util-linux flock supports descriptor locks and conflict exit codes')
   }
 } catch {
   fail('flock is unavailable. Remediation: install util-linux (required for the single-owner mail store).')

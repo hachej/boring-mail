@@ -94,8 +94,8 @@ async function start(): Promise<void> {
       if (!lockPath || !Number.isSafeInteger(lockFd) || lockFd < 0) {
         throw new Error('BORING_MAIL_LOCK_PATH and BORING_MAIL_LOCK_FD are required')
       }
-      // This process is already executing under flock --no-fork. Verify that
-      // the inherited O_NOFOLLOW descriptor still names the reserved path,
+      // The shell locked fd 4 and exec'd this process without closing it.
+      // Verify that the inherited O_NOFOLLOW descriptor still names the reserved path,
       // then write metadata through that descriptor—never reopen the pathname.
       const held = fstatSync(lockFd)
       const named = lstatSync(lockPath, { throwIfNoEntry: false })

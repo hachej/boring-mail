@@ -103,8 +103,9 @@ const LOCK_CONFLICT_EXIT = 73
 const TERMINATE_GRACE_MS = 5_000
 
 /**
- * Default storage transport. `flock --no-fork` execs Node in the lock-owning
- * process, so SQLite ownership and the kernel lock have exactly one lifetime.
+ * Default storage transport. A shell locks inherited fd 4, then `exec`s Node;
+ * the storage process keeps that same open-file description for its lifetime,
+ * so SQLite ownership and the kernel lock end atomically.
  */
 class StorageProcessTransport extends EventEmitter {
   readonly #child: ChildProcess
@@ -135,8 +136,10 @@ class StorageProcessTransport extends EventEmitter {
       throw new ProductStoreError('invalid_input', `cannot safely open mail store lock: ${(error as Error).message}`)
     }
     try {
-      this.#child = spawn('flock', [
-        '-n', '-E', String(LOCK_CONFLICT_EXIT), '--no-fork', '4',
+      this.#child = spawn('/bin/sh', [
+        '-c',
+        `flock -n -E ${LOCK_CONFLICT_EXIT} 4 || exit $?; exec "$@"`,
+        'boring-mail-storage',
         process.execPath, '--disable-warning=ExperimentalWarning', workerPath,
       ], {
         env: {
