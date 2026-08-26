@@ -183,6 +183,18 @@ describe('msgvaultAdapter', () => {
     empty.exec('CREATE TABLE other(x)')
     empty.close()
     expect(() => openMsgvaultStore(notAnArchive)).toThrow(/schema drift/)
+
+    const missingJoinColumn = join(mkdtempSync(join(tmpdir(), 'msgvault-column-drift-')), 'drift.db')
+    const drift = new DatabaseSync(missingJoinColumn)
+    drift.exec(`
+      CREATE TABLE messages (id INTEGER, rfc822_message_id TEXT, deleted_at TEXT);
+      CREATE TABLE conversations (id INTEGER); CREATE TABLE participants (id INTEGER);
+      CREATE TABLE message_labels (id INTEGER); CREATE TABLE labels (id INTEGER);
+      CREATE TABLE message_raw (id INTEGER); CREATE TABLE attachments (id INTEGER);
+      CREATE TABLE messages_fts (id INTEGER);
+    `)
+    drift.close()
+    expect(() => openMsgvaultStore(missingJoinColumn)).toThrow(/messages missing column\(s\): source_id/)
     expect(() => openMsgvaultStore(join(tmpdir(), 'does-not-exist.db'))).toThrow(/REMEDIATION/)
   })
 

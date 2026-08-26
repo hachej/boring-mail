@@ -56,6 +56,12 @@ const REQUIRED_TABLES = [
   'messages_fts',
 ] as const
 
+const REQUIRED_MESSAGE_COLUMNS = [
+  'rfc822_message_id',
+  'source_id',
+  'deleted_at',
+] as const
+
 /**
  * Open the archive read-only. Throws with a named remediation when the file is
  * missing or the schema has drifted from what this adapter speaks.
@@ -79,13 +85,25 @@ export function openMsgvaultStore(
   }
   const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>
   const have = new Set(tables.map((t) => t.name))
-  const missing = REQUIRED_TABLES.filter((t) => !have.has(t))
-  if (missing.length > 0) {
-    db.close()
+  const missingTables = REQUIRED_TABLES.filter((table) => !have.has(table))
+  let missingMessageColumns: readonly string[] = []
+  if (have.has('messages')) {
+    const columns = db.prepare(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>
+    const columnNames = new Set(columns.map((column) => column.name))
+    missingMessageColumns = REQUIRED_MESSAGE_COLUMNS.filter((column) => !columnNames.has(column))
+  }
+  if (missingTables.length > 0 || missingMessageColumns.length > 0) {
+    const details = [
+      missingTables.length > 0 ? `missing table(s): ${missingTables.join(', ')}` : '',
+      missingMessageColumns.length > 0 ? `messages missing column(s): ${missingMessageColumns.join(', ')}` : '',
+    ].filter(Boolean).join('; ')
     const msg =
-      `REMEDIATION: msgvault schema drift — missing table(s): ${missing.join(', ')}. ` +
+      `REMEDIATION: msgvault schema drift — ${details}. ` +
       `This adapter targets ${MSGVAULT_TESTED_MAJOR_MINOR}.x; upgrade boring-mail or pin msgvault.`
-    if (opts.strictSchema !== false) throw new Error(msg)
+    if (opts.strictSchema !== false) {
+      db.close()
+      throw new Error(msg)
+    }
     console.warn(`[boring-mail] ${msg}`)
   }
   return { db }
