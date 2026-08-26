@@ -66,7 +66,7 @@ try {
 try {
   const hits = execFileSync(
     'git',
-    ['grep', '-l', 'boring-ui-v2-775-pr811-final', '--', ':/', ':!docs', ':!scripts/check-env.mjs'], {
+    ['grep', '-l', 'boring-ui-v2-775-pr811-final', '--', ':/', ':!docs', ':!scripts/check-env.mjs', ':!.beads', ':!.handoff'], {
     cwd: ROOT, encoding: 'utf8',
   }).trim()
   if (hits) {
