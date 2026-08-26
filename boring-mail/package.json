@@ -8,8 +8,10 @@
   "exports": {
     "./front": "./src/boring-ui/front.tsx",
     "./server": "./src/boring-ui/server.ts",
-    "./mail-agent-tool": "./src/mail/server/mailAgentTool.ts"
+    "./mail-agent-tool": "./src/mail/server/mailAgentTool.ts",
+    "./mail-store": "./dist/mail/store/productDb.js"
   },
+  "files": ["src", "dist"],
   "boring": {
     "id": "boring-mail",
     "label": "Mail",
@@ -20,7 +22,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run -c vitest.config.ts",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "build": "tsc -p tsconfig.worker.json"
+    "build": "tsc -p tsconfig.worker.json && node scripts/smoke-mail-store-worker.mjs"
   },
   "dependencies": {
     "@hachej/boring-workspace": "0.1.103",

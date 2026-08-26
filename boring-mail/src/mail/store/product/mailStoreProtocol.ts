@@ -64,5 +64,7 @@ export type RpcResponse =
   | { type: 'response'; id: number; error: SerializedError }
 
 export type RpcHandlers = {
-  [M in MailStoreMethod]: (...args: Parameters<MailStoreMethods[M]>) => ReturnType<MailStoreMethods[M]>
+  [M in MailStoreMethod]: (
+    ...args: Parameters<MailStoreMethods[M]>
+  ) => ReturnType<MailStoreMethods[M]> | Promise<ReturnType<MailStoreMethods[M]>>
 }

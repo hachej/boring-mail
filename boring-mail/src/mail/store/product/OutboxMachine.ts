@@ -230,12 +230,22 @@ export class OutboxMachine {
       const now = this.c.now()
       // Validate before returning "no work" so invalid caller input never hides.
       this.c.deadline(now, leaseMs, 'send lease')
-      const row = this.c.db.prepare(`
+      const rows = this.c.db.prepare(`
         SELECT * FROM mail_outbox
         WHERE status='approved' OR (status='claimed' AND lease_expires_ms<=?)
-        ORDER BY created_ms,id LIMIT 1
-      `).get(now) as unknown as OutboxRow | undefined
-      return row ? this.claimRow(row, worker, now, leaseMs) : null
+        ORDER BY created_ms,id
+      `).all(now) as unknown as OutboxRow[]
+      for (const row of rows) {
+        try {
+          return this.claimRow(row, worker, now, leaseMs)
+        } catch (error) {
+          // Identity can be restored later; leave only that row eligible and
+          // continue so one disconnected account cannot starve all others.
+          if (error instanceof ProductStoreError && error.code === 'identity_revoked') continue
+          throw error
+        }
+      }
+      return null
     })
   }
   private worker(worker: string): void {
@@ -246,8 +256,10 @@ export class OutboxMachine {
     const reclaim = record.status === 'claimed' && record.lease.expiresAt <= now
     if (record.status !== 'approved' && !reclaim)
       fail('invalid_transition', 'outbox is not approved or an expired claim')
-    this.c.assertIdentity(record.snapshot)
+    // Verify durable bytes before classifying a row-local identity problem;
+    // otherwise account-id tampering could be mistaken for a skippable revoke.
     this.digest(row)
+    this.c.assertIdentity(record.snapshot)
     const expires = this.c.deadline(now, leaseMs, 'send lease')
     this.c.db.prepare(
       `UPDATE mail_outbox SET status='claimed',lease_owner=?,lease_expires_ms=?,updated_ms=? WHERE id=?`,

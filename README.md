@@ -104,6 +104,14 @@ import createBoringMailServerPlugin from '@hachej/boring-mail/server'
 
 The server plugin contributes a single agent tool named `mail`. It deliberately does not register any LLM/model provider. The playground uses the default Pi host configuration supplied by the environment.
 
+Product storage consumers import the compiled worker-backed entry:
+
+```ts
+import { openMailStore } from '@hachej/boring-mail/mail-store'
+```
+
+Do not import `src/mail/store/productDb.ts` from application code. It is compile input; the package export keeps the emitted `mailStoreWorker.js` adjacent to the RPC facade. The worker holds the only synchronous SQLite connection and an OS-backed lock for its data directory.
+
 ## Security / repo hygiene
 
 - No credentials are required or stored by this repo.

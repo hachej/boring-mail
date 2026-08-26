@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   openProductStore,
@@ -111,6 +112,45 @@ describe('durable delivery state machine', () => {
   it('returns null when no durable send is claimable', () => {
     expect(open().store.outbox.claimNext('idle')).toBeNull()
   })
+  it('claimNext skips only revoked rows so one account cannot starve another', () => {
+    const x = open()
+    const older = x.enqueueApproved({ path: 'drafts/older.mail.md' })
+    x.clock.now++
+    x.store.upsertAccount({
+      accountId: 'acct_other', providerSourceId: 8,
+      primaryAddress: 'other@example.com', sendAs: ['other@example.com'],
+    })
+    x.targets.set(202, { rfc822MessageId: '<other@example.net>', sourceId: 8 })
+    const newer = x.enqueueApproved({
+      path: 'drafts/newer.mail.md', replyToMessageId: 202,
+      sendAsAddress: 'other@example.com',
+    })
+    x.store.upsertAccount({
+      accountId: 'acct_work', providerSourceId: 7,
+      primaryAddress: 'work@example.com', sendAs: ['work@example.com'], connected: false,
+    })
+    expect(x.store.outbox.claimNext('worker')?.id).toBe(newer.id)
+    x.store.upsertAccount({
+      accountId: 'acct_work', providerSourceId: 7,
+      primaryAddress: 'work@example.com', sendAs: ['work@example.com'], connected: true,
+    })
+    expect(x.store.outbox.claimNext('worker')?.id).toBe(older.id)
+  })
+
+  it('claimNext fails closed on corrupt eligible work instead of skipping it', () => {
+    const x = open(), older = x.enqueueApproved({ path: 'drafts/corrupt-old.mail.md' })
+    x.clock.now++
+    x.enqueueApproved({ path: 'drafts/valid-new.mail.md' })
+    const raw = new DatabaseSync(x.path)
+    raw.exec(`DROP TRIGGER mail_outbox_snapshot_immutable;
+      CREATE TRIGGER mail_outbox_snapshot_immutable BEFORE UPDATE OF subject ON mail_outbox BEGIN SELECT 1; END`)
+    raw.prepare(`UPDATE mail_outbox SET subject='changed without digest' WHERE id=?`).run(older.id)
+    raw.close()
+    expect(() => x.store.outbox.claimNext('worker')).toThrowError(
+      expect.objectContaining({ code: 'content_changed' }),
+    )
+  })
+
   it('supports deterministic failure and pre-dispatch cancellation', () => {
     const x = open(),
       a = dispatch(x)

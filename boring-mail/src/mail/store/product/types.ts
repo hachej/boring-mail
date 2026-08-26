@@ -180,6 +180,9 @@ export type ProductStoreErrorCode =
   | 'unsupported_schema'
   | 'corrupt_data'
   | 'idempotency_conflict'
+  | 'mail_store_already_active'
+  | 'rpc_timeout'
+  | 'rpc_overloaded'
 export class ProductStoreError extends Error {
   constructor(
     readonly code: ProductStoreErrorCode,

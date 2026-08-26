@@ -27,6 +27,11 @@ import type {
   SerializedError,
 } from './mailStoreProtocol.js'
 
+const DEFAULT_STARTUP_TIMEOUT_MS = 10_000
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const DEFAULT_MAX_PENDING_REQUESTS = 100
+const MAX_TIMER_MS = 2_147_483_647
+
 export interface WorkerTransport {
   postMessage(value: unknown): void
   on(event: 'message', listener: (value: RpcResponse) => void): this
@@ -35,7 +40,12 @@ export interface WorkerTransport {
   terminate(): Promise<number>
 }
 export type MailStoreWorkerFactory = (config: MailStoreWorkerConfig) => WorkerTransport
-export interface MailStoreOpenOptions { workerFactory?: MailStoreWorkerFactory }
+export interface MailStoreOpenOptions {
+  workerFactory?: MailStoreWorkerFactory
+  startupTimeoutMs?: number
+  requestTimeoutMs?: number
+  maxPendingRequests?: number
+}
 
 export interface AsyncOutboxStore {
   get(id: string): Promise<OutboxRecord | null>
@@ -67,12 +77,25 @@ export interface MailStore {
   close(): Promise<void>
 }
 
-/**
- * The package/server build emits mailStoreWorker.ts beside this module as
- * mailStoreWorker.js. Keeping a normal emitted-JS URL avoids runtime TS loaders.
- */
+interface RpcLimits {
+  startupTimeoutMs: number
+  requestTimeoutMs: number
+  maxPendingRequests: number
+}
+interface PendingCall {
+  resolve: (value: unknown) => void
+  reject: (error: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
+/** mailStoreWorker.js is emitted adjacent to this compiled public module. */
 function defaultWorker(config: MailStoreWorkerConfig): WorkerTransport {
-  return new Worker(new URL('./mailStoreWorker.js', import.meta.url), { workerData: config })
+  return new Worker(new URL('./mailStoreWorker.js', import.meta.url), {
+    workerData: config,
+    // node:sqlite is intentionally isolated here; suppress its Node 22
+    // ExperimentalWarning only in this emitted storage worker.
+    execArgv: ['--disable-warning=ExperimentalWarning'],
+  })
 }
 function remoteError(error: SerializedError): Error {
   if (error.code) {
@@ -90,73 +113,141 @@ class RpcClient {
   readonly ready: Promise<void>
   #readyResolve!: () => void
   #readyReject!: (error: Error) => void
+  #startupTimer: ReturnType<typeof setTimeout>
   #nextId = 1
-  #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
+  #pending = new Map<number, PendingCall>()
   #stopped = false
-  constructor(readonly worker: WorkerTransport, private readonly onStop: () => void) {
+  #termination: Promise<void> | null = null
+
+  constructor(
+    readonly worker: WorkerTransport,
+    private readonly limits: RpcLimits,
+    private readonly onFailure: (error: Error) => void,
+  ) {
     this.ready = new Promise((resolveReady, rejectReady) => {
       this.#readyResolve = resolveReady
       this.#readyReject = rejectReady
     })
+    this.#startupTimer = setTimeout(() => {
+      this.#fail(new ProductStoreError('rpc_timeout', 'mail store worker startup timed out'))
+    }, limits.startupTimeoutMs)
+    this.#startupTimer.unref()
     worker.on('message', (message) => this.#message(message))
-    worker.on('error', (error) => this.#stop(error))
+    worker.on('error', (error) => this.#fail(error))
     worker.on('exit', (code) => {
-      if (!this.#stopped) this.#stop(new Error(`mail store worker exited unexpectedly with code ${code}`))
+      if (!this.#stopped) this.#fail(new Error(`mail store worker exited unexpectedly with code ${code}`))
     })
   }
+
   #message(message: RpcResponse): void {
     if (message.type === 'ready') {
-      if ('error' in message) this.#readyReject(remoteError(message.error))
+      clearTimeout(this.#startupTimer)
+      if ('error' in message) this.#fail(remoteError(message.error))
       else this.#readyResolve()
       return
     }
     const pending = this.#pending.get(message.id)
     if (!pending) return
     this.#pending.delete(message.id)
+    clearTimeout(pending.timer)
     if ('error' in message) pending.reject(remoteError(message.error))
     else pending.resolve(message.value)
   }
-  #stop(error: Error): void {
+
+  #fail(error: Error): void {
     if (this.#stopped) return
     this.#stopped = true
-    this.onStop()
+    clearTimeout(this.#startupTimer)
     this.#readyReject(error)
-    for (const pending of this.#pending.values()) pending.reject(error)
+    for (const pending of this.#pending.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
     this.#pending.clear()
+    this.onFailure(error)
   }
+
   async call<M extends MailStoreMethod>(
     method: M,
     ...args: Parameters<MailStoreMethods[M]>
   ): Promise<ReturnType<MailStoreMethods[M]>> {
     await this.ready
     if (this.#stopped) throw new Error('mail store worker is closed')
+    if (this.#pending.size >= this.limits.maxPendingRequests) {
+      throw new ProductStoreError(
+        'rpc_overloaded',
+        `mail store has ${this.#pending.size} pending requests (limit ${this.limits.maxPendingRequests})`,
+      )
+    }
     const id = this.#nextId++
     const result = new Promise<unknown>((resolveCall, rejectCall) => {
-      this.#pending.set(id, { resolve: resolveCall, reject: rejectCall })
+      const timer = setTimeout(() => {
+        this.#fail(new ProductStoreError('rpc_timeout', `mail store request timed out: ${String(method)}`))
+      }, this.limits.requestTimeoutMs)
+      timer.unref()
+      this.#pending.set(id, { resolve: resolveCall, reject: rejectCall, timer })
       try {
         this.worker.postMessage({ id, method, args } as RpcRequest)
       } catch (error) {
+        clearTimeout(timer)
         this.#pending.delete(id)
         rejectCall(error instanceof Error ? error : new Error(String(error)))
       }
     })
     return await result as ReturnType<MailStoreMethods[M]>
   }
+
+  async terminate(): Promise<void> {
+    if (!this.#termination) {
+      this.#termination = this.worker.terminate().then(() => undefined, () => undefined)
+    }
+    await this.#termination
+  }
+
   async shutdown(): Promise<void> {
-    if (this.#stopped) return
-    try { await this.call('close') } finally {
-      this.#stopped = true
-      await this.worker.terminate()
+    try {
+      if (!this.#stopped) await this.call('close')
+    } finally {
+      if (!this.#stopped) {
+        this.#stopped = true
+        clearTimeout(this.#startupTimer)
+        for (const pending of this.#pending.values()) {
+          clearTimeout(pending.timer)
+          pending.reject(new Error('mail store worker is closing'))
+        }
+        this.#pending.clear()
+      }
+      await this.terminate()
     }
   }
 }
 
+type RegistryState = 'starting' | 'ready' | 'closing' | 'dead'
 interface RegistryEntry {
   config: MailStoreWorkerConfig
+  limits: RpcLimits
+  factory: MailStoreWorkerFactory
   rpc: RpcClient
   references: number
+  state: RegistryState
+  disposal: Promise<void> | null
 }
 const registry = new Map<string, RegistryEntry>()
+
+function positiveOption(value: number | undefined, fallback: number, name: string, maximum = MAX_TIMER_MS): number {
+  const selected = value ?? fallback
+  if (!Number.isSafeInteger(selected) || selected <= 0 || selected > maximum) {
+    throw new ProductStoreError('invalid_input', `${name} must be a positive safe integer no greater than ${maximum}`)
+  }
+  return selected
+}
+function limits(options: MailStoreOpenOptions): RpcLimits {
+  return {
+    startupTimeoutMs: positiveOption(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 'startupTimeoutMs'),
+    requestTimeoutMs: positiveOption(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 'requestTimeoutMs'),
+    maxPendingRequests: positiveOption(options.maxPendingRequests, DEFAULT_MAX_PENDING_REQUESTS, 'maxPendingRequests'),
+  }
+}
 function canonicalConfig(config: MailStoreWorkerConfig): MailStoreWorkerConfig {
   if (!config.productDbPath) throw new ProductStoreError('invalid_input', 'productDbPath is required')
   const absolute = resolve(config.productDbPath)
@@ -171,8 +262,50 @@ function canonicalConfig(config: MailStoreWorkerConfig): MailStoreWorkerConfig {
     ...(config.msgvaultDbPath ? { msgvaultDbPath: resolve(config.msgvaultDbPath) } : {}),
   }
 }
-function compatible(left: MailStoreWorkerConfig, right: MailStoreWorkerConfig): boolean {
+function sameConfig(left: MailStoreWorkerConfig, right: MailStoreWorkerConfig): boolean {
   return left.productDbPath === right.productDbPath && left.msgvaultDbPath === right.msgvaultDbPath
+}
+function sameLimits(left: RpcLimits, right: RpcLimits): boolean {
+  return left.startupTimeoutMs === right.startupTimeoutMs &&
+    left.requestTimeoutMs === right.requestTimeoutMs &&
+    left.maxPendingRequests === right.maxPendingRequests
+}
+
+function beginDisposal(key: string, entry: RegistryEntry, graceful: boolean): Promise<void> {
+  if (entry.disposal) return entry.disposal
+  entry.state = 'closing'
+  const dispose = graceful ? entry.rpc.shutdown() : entry.rpc.terminate()
+  // Disposal is a barrier, not an error channel; operation/startup promises
+  // already carry the original failure. Reopens must proceed after teardown.
+  entry.disposal = dispose.catch(() => undefined).finally(() => {
+    entry.state = 'dead'
+    if (registry.get(key) === entry) registry.delete(key)
+  })
+  return entry.disposal
+}
+
+function createEntry(
+  key: string,
+  config: MailStoreWorkerConfig,
+  selectedLimits: RpcLimits,
+  factory: MailStoreWorkerFactory,
+): RegistryEntry {
+  let entry!: RegistryEntry
+  const rpc = new RpcClient(factory(config), selectedLimits, () => {
+    // Keep a closing tombstone until termination has completed.
+    queueMicrotask(() => { void beginDisposal(key, entry, false) })
+  })
+  entry = {
+    config,
+    limits: selectedLimits,
+    factory,
+    rpc,
+    references: 0,
+    state: 'starting',
+    disposal: null,
+  }
+  registry.set(key, entry)
+  return entry
 }
 
 class MailStoreFacade implements MailStore {
@@ -220,41 +353,47 @@ class MailStoreFacade implements MailStore {
     if (this.#closed) return
     this.#closed = true
     this.entry.references--
-    if (this.entry.references === 0) {
-      if (registry.get(this.key) === this.entry) registry.delete(this.key)
-      await this.entry.rpc.shutdown()
-    }
+    if (this.entry.references === 0) await beginDisposal(this.key, this.entry, true)
   }
 }
 
-/** Open/share one dedicated SQLite worker for the canonical product DB path. */
+/** Open/share one dedicated SQLite worker for the canonical product DB directory. */
 export async function openMailStore(
   input: MailStoreWorkerConfig,
   options: MailStoreOpenOptions = {},
 ): Promise<MailStore> {
   const config = canonicalConfig(input)
+  const selectedLimits = limits(options)
+  const factory = options.workerFactory ?? defaultWorker
   const key = dirname(config.productDbPath)
-  let entry = registry.get(key)
-  if (entry && !compatible(entry.config, config)) {
-    throw new ProductStoreError('invalid_input', 'mail store path is already open with different msgvault config')
+  for (;;) {
+    let entry = registry.get(key)
+    if (entry?.state === 'closing' || entry?.state === 'dead') {
+      await entry.disposal
+      continue
+    }
+    if (entry) {
+      if (!sameConfig(entry.config, config)) {
+        throw new ProductStoreError('invalid_input', 'mail store directory is already open with different database config')
+      }
+      if (!sameLimits(entry.limits, selectedLimits) || entry.factory !== factory) {
+        throw new ProductStoreError('invalid_input', 'mail store directory is already open with different RPC settings')
+      }
+    } else {
+      entry = createEntry(key, config, selectedLimits, factory)
+    }
+
+    // Reserve synchronously before readiness can race a last-close disposal.
+    entry.references++
+    try {
+      await entry.rpc.ready
+      if (entry.state === 'starting') entry.state = 'ready'
+      if (entry.state !== 'ready') throw new Error('mail store worker became unavailable during startup')
+      return new MailStoreFacade(key, entry)
+    } catch (error) {
+      entry.references--
+      if (!entry.disposal) void beginDisposal(key, entry, false)
+      throw error
+    }
   }
-  if (!entry) {
-    const factory = options.workerFactory ?? defaultWorker
-    let rpc!: RpcClient
-    rpc = new RpcClient(factory(config), () => {
-      const current = registry.get(key)
-      if (current?.rpc === rpc) registry.delete(key)
-    })
-    entry = { config, rpc, references: 0 }
-    registry.set(key, entry)
-  }
-  try {
-    await entry.rpc.ready
-  } catch (error) {
-    if (registry.get(key) === entry) registry.delete(key)
-    await entry.rpc.worker.terminate().catch(() => 0)
-    throw error
-  }
-  entry.references++
-  return new MailStoreFacade(key, entry)
 }
