@@ -62,8 +62,11 @@ try {
 
 // 4. No resurrected sibling-checkout references anywhere in tracked source.
 //    docs/** is exempt: plans legitimately cite the retired path as history.
+//    this file is exempt: it must contain the literal to grep for it.
 try {
-  const hits = execFileSync('git', ['grep', '-l', 'boring-ui-v2-775-pr811-final', '--', ':/', ':!docs'], {
+  const hits = execFileSync(
+    'git',
+    ['grep', '-l', 'boring-ui-v2-775-pr811-final', '--', ':/', ':!docs', ':!scripts/check-env.mjs'], {
     cwd: ROOT, encoding: 'utf8',
   }).trim()
   if (hits) {
