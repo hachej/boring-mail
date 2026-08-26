@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -63,6 +71,38 @@ const openEventually = async () => {
 }
 
 try {
+  const lockPath = join(directory, '.boring-mail.lock')
+  const victim = join(directory, 'lock-victim.txt')
+  writeFileSync(victim, 'do-not-truncate')
+  symlinkSync(victim, lockPath)
+  await openMailStore({ productDbPath }).then(
+    (store) => store.close().then(() => { throw new Error('symlink lock unexpectedly opened') }),
+    () => undefined,
+  )
+  if (readFileSync(victim, 'utf8') !== 'do-not-truncate') throw new Error('lock symlink target was modified')
+  rmSync(lockPath)
+  linkSync(victim, lockPath)
+  await openMailStore({ productDbPath }).then(
+    (store) => store.close().then(() => { throw new Error('hardlink lock unexpectedly opened') }),
+    () => undefined,
+  )
+  if (readFileSync(victim, 'utf8') !== 'do-not-truncate') throw new Error('lock hardlink target was modified')
+  rmSync(lockPath)
+  await openMailStore({ productDbPath: lockPath }).then(
+    (store) => store.close().then(() => { throw new Error('reserved lock path opened as database') }),
+    () => undefined,
+  )
+
+  // Spawn failure must fully dispose its registry tombstone so the same data
+  // directory can open after the environment is repaired.
+  const originalPath = process.env.PATH
+  process.env.PATH = join(directory, 'missing-bin')
+  await openMailStore({ productDbPath }, { startupTimeoutMs: 1_000 }).then(
+    (store) => store.close().then(() => { throw new Error('missing flock unexpectedly started') }),
+    () => undefined,
+  )
+  process.env.PATH = originalPath
+
   const store = await openMailStore({ productDbPath }, {
     startupTimeoutMs: 3_000,
     requestTimeoutMs: 3_000,

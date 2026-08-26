@@ -1,4 +1,13 @@
-import { existsSync, lstatSync, realpathSync, statSync } from 'node:fs'
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  realpathSync,
+  statSync,
+} from 'node:fs'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -99,24 +108,56 @@ const TERMINATE_GRACE_MS = 5_000
  */
 class StorageProcessTransport extends EventEmitter {
   readonly #child: ChildProcess
+  readonly #closed: Promise<number>
   #readySeen = false
   #stderr = ''
   #termination: Promise<number> | null = null
+  #closeCode: number | null = null
 
   constructor(config: MailStoreWorkerConfig) {
     super()
     const workerPath = fileURLToPath(new URL('./mailStoreWorker.js', import.meta.url))
     const lockPath = join(dirname(config.productDbPath), '.boring-mail.lock')
-    this.#child = spawn('flock', [
-      '-n', '-E', String(LOCK_CONFLICT_EXIT), '--no-fork', lockPath,
-      process.execPath, '--disable-warning=ExperimentalWarning', workerPath,
-    ], {
-      env: {
-        ...process.env,
-        BORING_MAIL_WORKER_CONFIG: JSON.stringify(config),
-        BORING_MAIL_LOCK_PATH: lockPath,
-      },
-      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    let lockFd: number
+    try {
+      lockFd = openSync(
+        lockPath,
+        fsConstants.O_CREAT | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+        0o600,
+      )
+      const lockStat = fstatSync(lockFd)
+      if (!lockStat.isFile() || lockStat.nlink !== 1) {
+        closeSync(lockFd)
+        throw new ProductStoreError('invalid_input', 'mail store lock must be a single-link regular file')
+      }
+    } catch (error) {
+      if (error instanceof ProductStoreError) throw error
+      throw new ProductStoreError('invalid_input', `cannot safely open mail store lock: ${(error as Error).message}`)
+    }
+    try {
+      this.#child = spawn('flock', [
+        '-n', '-E', String(LOCK_CONFLICT_EXIT), '--no-fork', '4',
+        process.execPath, '--disable-warning=ExperimentalWarning', workerPath,
+      ], {
+        env: {
+          ...process.env,
+          BORING_MAIL_WORKER_CONFIG: JSON.stringify(config),
+          BORING_MAIL_LOCK_PATH: lockPath,
+          BORING_MAIL_LOCK_FD: '4',
+        },
+        // fd 4 is the already-opened O_NOFOLLOW lock. The child inherits the
+        // same open-file description; closing our copy makes its lifetime the
+        // storage process lifetime.
+        stdio: ['ignore', 'ignore', 'pipe', 'ipc', lockFd],
+      })
+    } finally {
+      closeSync(lockFd)
+    }
+    this.#closed = new Promise((resolveClosed) => {
+      this.#child.once('close', (code, signal) => {
+        this.#closeCode = code ?? (signal ? 1 : 0)
+        resolveClosed(this.#closeCode)
+      })
     })
     this.#child.stderr?.setEncoding('utf8')
     this.#child.stderr?.on('data', (chunk: string) => { this.#stderr += chunk })
@@ -154,19 +195,15 @@ class StorageProcessTransport extends EventEmitter {
 
   terminate(): Promise<number> {
     if (this.#termination) return this.#termination
-    this.#termination = new Promise((resolveTermination) => {
-      if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
-        resolveTermination(this.#child.exitCode ?? 1)
-        return
-      }
+    if (this.#closeCode !== null) return Promise.resolve(this.#closeCode)
+    this.#termination = (async () => {
       const force = setTimeout(() => this.#child.kill('SIGKILL'), TERMINATE_GRACE_MS)
       force.unref()
-      this.#child.once('exit', (code) => {
-        clearTimeout(force)
-        resolveTermination(code ?? 1)
-      })
       this.#child.kill('SIGTERM')
-    })
+      const code = await this.#closed // `close` is guaranteed even when spawn fails.
+      clearTimeout(force)
+      return code
+    })()
     return this.#termination
   }
 }
@@ -348,10 +385,17 @@ function canonicalConfig(config: MailStoreWorkerConfig): MailStoreWorkerConfig {
     if (error instanceof ProductStoreError) throw error
     throw new ProductStoreError('invalid_input', 'product database path must have an existing canonical directory')
   }
+  const reservedLockPath = join(dirname(productDbPath), '.boring-mail.lock')
+  if (productDbPath === reservedLockPath) {
+    throw new ProductStoreError('invalid_input', 'product database may not use the reserved .boring-mail.lock path')
+  }
   let msgvaultDbPath: string | undefined
   if (config.msgvaultDbPath) {
     try { msgvaultDbPath = realpathSync.native(resolve(config.msgvaultDbPath)) }
     catch { throw new ProductStoreError('invalid_input', 'msgvault database path must exist') }
+    if (msgvaultDbPath === reservedLockPath) {
+      throw new ProductStoreError('invalid_input', 'msgvault database may not use the reserved .boring-mail.lock path')
+    }
   }
   return { productDbPath, ...(msgvaultDbPath ? { msgvaultDbPath } : {}) }
 }
