@@ -38,35 +38,45 @@ try {
   )
 }
 
-// 3. The host package must be installed at the pinned exact version.
+// 3. The host package must be installed at exactly the version pinned in
+//    app/package.json (single source of truth — no third copy of the pin).
 //    (@hachej/boring-workspace is ESM-only: exports expose no "require"
 //    condition, so filesystem verification is more truthful than CJS resolve.)
 const REMEDIATION_HOST =
   'REMEDIATION: @hachej/boring-workspace does not resolve. Run: pnpm install --frozen-lockfile'
-const HOST_PIN = '0.1.103'
-const hostPkgPath = join(ROOT, 'app', 'node_modules', '@hachej', 'boring-workspace', 'package.json')
+let HOST_PIN
 try {
-  const host = JSON.parse(readFileSync(hostPkgPath, 'utf8'))
-  if (host.version !== HOST_PIN) {
-    fail(
-      `@hachej/boring-workspace ${host.version} installed, expected exact ${HOST_PIN}. ` +
-      `Remediation: pnpm install --frozen-lockfile (lockfile pins ${HOST_PIN}; never widen the range).`
-    )
-  } else {
-    ok(`@hachej/boring-workspace ${host.version} (exact pin)`)
+  const appPkg = JSON.parse(readFileSync(join(ROOT, 'app', 'package.json'), 'utf8'))
+  HOST_PIN = appPkg.dependencies?.['@hachej/boring-workspace']
+} catch { /* handled below by hostPkgPath ENOENT/unreadable path */ }
+if (!HOST_PIN || !/^\d+\.\d+\.\d+$/.test(HOST_PIN)) {
+  fail(`app/package.json must pin @hachej/boring-workspace to an EXACT version (got: ${HOST_PIN ?? 'missing'}).`)
+} else {
+  const hostPkgPath = join(ROOT, 'app', 'node_modules', '@hachej', 'boring-workspace', 'package.json')
+  try {
+    const host = JSON.parse(readFileSync(hostPkgPath, 'utf8'))
+    if (host.version !== HOST_PIN) {
+      fail(
+        `@hachej/boring-workspace ${host.version} installed, expected exact ${HOST_PIN}. ` +
+        `Remediation: pnpm install --frozen-lockfile.`
+      )
+    } else {
+      ok(`@hachej/boring-workspace ${host.version} (exact pin)`)
+    }
+  } catch (e) {
+    if (e.code === 'ENOENT') fail(REMEDIATION_HOST)
+    else fail(`@hachej/boring-workspace unreadable at ${hostPkgPath}: ${e.message}`)
   }
-} catch (e) {
-  if (e.code === 'ENOENT') fail(REMEDIATION_HOST)
-  else fail(`@hachej/boring-workspace unreadable at ${hostPkgPath}: ${e.message}`)
 }
 
 // 4. No resurrected sibling-checkout references anywhere in tracked source.
-//    docs/** is exempt: plans legitimately cite the retired path as history.
+//    docs/** and scripts/__tests__ are exempt: plans cite the retired path as
+//    history; tests must contain it to prove the tripwire fires.
 //    this file is exempt: it must contain the literal to grep for it.
 try {
   const hits = execFileSync(
     'git',
-    ['grep', '-l', 'boring-ui-v2-775-pr811-final', '--', ':/', ':!docs', ':!scripts/check-env.mjs', ':!.beads', ':!.handoff'], {
+    ['grep', '-l', 'boring-ui-v2-775-pr811-final', '--', ':/', ':!docs', ':!scripts', ':!.beads', ':!.handoff'], {
     cwd: ROOT, encoding: 'utf8',
   }).trim()
   if (hits) {

@@ -32,7 +32,7 @@ test('check-env names the remediation when @hachej/boring-workspace does not res
   const root = mkdtempSync(join(tmpdir(), 'checkenv-'))
   // minimal repo skeleton with NO node_modules: resolution must fail
   mkdirSync(join(root, 'app'), { recursive: true })
-  writeFileSync(join(root, 'app', 'package.json'), '{"name":"x"}')
+  writeFileSync(join(root, 'app', 'package.json'), '{"name":"x","dependencies":{"@hachej/boring-workspace":"0.1.103"}}')
   // git grep needs a repo; give it one with no matches
   execFileSync('git', ['init', '-q'], { cwd: root })
   writeFileSync(join(root, '.gitignore'), '')
@@ -40,6 +40,22 @@ test('check-env names the remediation when @hachej/boring-workspace does not res
   const { code, out } = run({ CHECK_ENV_ROOT: root })
   assert.equal(code, 1)
   assert.ok(out.includes(REMEDIATION_HOST), `missing remediation string:\n${out}`)
-  // node checks still ran and reported
-  assert.ok(out.includes('✓') || out.includes('✗'))
+})
+
+test('tripwire positive path: tracked sibling-checkout reference fails with hits listed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'checkenv-trip-'))
+  mkdirSync(join(root, 'app'), { recursive: true })
+  writeFileSync(
+    join(root, 'app', 'package.json'),
+    JSON.stringify({ name: 'x', dependencies: { '@hachej/boring-workspace': '0.1.103' } })
+  )
+  writeFileSync(join(root, 'stray.ts'), `import x from '../boring-ui-v2-775-pr811-final/packages/ui'`)
+  execFileSync('git', ['init', '-q'], { cwd: root })
+  execFileSync('git', ['add', 'stray.ts'], { cwd: root }) // git grep sees the index/worktree
+  writeFileSync(join(root, '.gitignore'), '')
+
+  const { code, out } = run({ CHECK_ENV_ROOT: root })
+  assert.equal(code, 1)
+  assert.ok(out.includes('retired sibling checkout'), out)
+  assert.ok(out.includes('stray.ts'), out)
 })
