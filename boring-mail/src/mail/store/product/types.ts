@@ -181,7 +181,6 @@ export type ProductStoreErrorCode =
   | 'corrupt_data'
   | 'idempotency_conflict'
   | 'mail_store_already_active'
-  | 'mail_store_lock_lost'
   | 'rpc_timeout'
   | 'rpc_overloaded'
 export class ProductStoreError extends Error {

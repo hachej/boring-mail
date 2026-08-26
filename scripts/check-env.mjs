@@ -38,7 +38,19 @@ try {
   )
 }
 
-// 3. The host package must be installed at exactly the version pinned in
+// 3. The storage process is executed directly under util-linux flock.
+try {
+  const help = execFileSync('flock', ['--help'], { encoding: 'utf8' })
+  if (!help.includes('--no-fork') || !help.includes('--conflict-exit-code')) {
+    fail('flock lacks --no-fork/-E support. Remediation: install a current util-linux package.')
+  } else {
+    ok('util-linux flock supports --no-fork and conflict exit codes')
+  }
+} catch {
+  fail('flock is unavailable. Remediation: install util-linux (required for the single-owner mail store).')
+}
+
+// 4. The host package must be installed at exactly the version pinned in
 //    app/package.json (single source of truth — no third copy of the pin).
 //    (@hachej/boring-workspace is ESM-only: exports expose no "require"
 //    condition, so filesystem verification is more truthful than CJS resolve.)
@@ -69,7 +81,7 @@ if (!HOST_PIN || !/^\d+\.\d+\.\d+$/.test(HOST_PIN)) {
   }
 }
 
-// 4. No resurrected sibling-checkout references anywhere in tracked source.
+// 5. No resurrected sibling-checkout references anywhere in tracked source.
 //    docs/** and scripts/__tests__ are exempt: plans cite the retired path as
 //    history; tests must contain it to prove the tripwire fires.
 //    this file is exempt: it must contain the literal to grep for it.

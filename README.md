@@ -110,7 +110,7 @@ Product storage consumers import the compiled worker-backed entry:
 import { openMailStore } from '@hachej/boring-mail/mail-store'
 ```
 
-Do not import `src/mail/store/productDb.ts` from application code. It is compile input; the package export keeps the emitted `mailStoreWorker.js` adjacent to the RPC facade. The worker holds the only synchronous SQLite connection and an OS-backed lock for its data directory.
+Do not import `src/mail/store/productDb.ts` from application code. It is compile input; the package export keeps the emitted `mailStoreWorker.js` adjacent to the RPC facade. The storage process is executed directly under `flock --no-fork`, so the only synchronous SQLite owner and the OS lock have exactly the same lifetime.
 
 ## Security / repo hygiene
 

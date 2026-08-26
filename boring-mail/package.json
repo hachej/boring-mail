@@ -9,7 +9,11 @@
     "./front": "./src/boring-ui/front.tsx",
     "./server": "./src/boring-ui/server.ts",
     "./mail-agent-tool": "./src/mail/server/mailAgentTool.ts",
-    "./mail-store": "./dist/mail/store/productDb.js"
+    "./mail-store": {
+      "types": "./dist/mail/store/productDb.d.ts",
+      "import": "./dist/mail/store/productDb.js",
+      "default": "./dist/mail/store/productDb.js"
+    }
   },
   "files": ["src", "dist"],
   "boring": {
@@ -22,7 +26,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run -c vitest.config.ts",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "build": "tsc -p tsconfig.worker.json && node scripts/smoke-mail-store-worker.mjs"
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json && node scripts/smoke-mail-store-worker.mjs"
   },
   "dependencies": {
     "@hachej/boring-workspace": "0.1.103",

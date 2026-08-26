@@ -1,6 +1,7 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { spawn, spawnSync } from 'node:child_process'
 import { openMailStore } from '@hachej/boring-mail/mail-store'
 
@@ -42,6 +43,24 @@ const waitForOutput = (child, expected) => new Promise((resolve, reject) => {
     }
   })
 })
+const openEventually = async () => {
+  let last
+  for (let attempt = 0; attempt < 40; attempt++) {
+    let candidate
+    try {
+      candidate = await openMailStore({ productDbPath }, {
+        startupTimeoutMs: 3_000, requestTimeoutMs: 3_000,
+      })
+      await candidate.getDraft('__replacement_probe__')
+      return candidate
+    } catch (error) {
+      last = error
+      await candidate?.close().catch(() => undefined)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+  throw last
+}
 
 try {
   const store = await openMailStore({ productDbPath }, {
@@ -61,8 +80,9 @@ try {
   if (queued.status !== 'pending_approval') throw new Error(`unexpected outbox state ${queued.status}`)
 
   const metadata = JSON.parse(readFileSync(join(directory, '.boring-mail.lock'), 'utf8'))
-  if (metadata.pid !== process.pid || typeof metadata.processStartedAt !== 'string') {
-    throw new Error('lock metadata lacks host pid/start time')
+  if (!Number.isSafeInteger(metadata.pid) || metadata.pid <= 0 || metadata.pid === process.pid ||
+      typeof metadata.processStartedAt !== 'string') {
+    throw new Error('lock metadata lacks storage-owner pid/start time')
   }
   const blocked = childOpen()
   if (!blocked.stdout.includes('ERROR:mail_store_already_active')) {
@@ -75,39 +95,30 @@ try {
     throw new Error(`lock was not released for second process: ${reopened.stdout}${reopened.stderr}`)
   }
 
-  // Lock-health proof: killing the post-acquisition helper must fail-stop the
-  // database worker before a replacement owner is admitted.
+  // Atomic owner proof: kill the process that owns both flock and SQLite while
+  // a large synchronous write is in flight. The old RPC must reject, while a
+  // replacement may open only after the kernel has released that same process's lock.
   const lossStore = await openMailStore({ productDbPath }, {
     startupTimeoutMs: 3_000, requestTimeoutMs: 3_000,
   })
-  const processes = spawnSync('ps', ['-eo', 'pid=,ppid=,comm='], { encoding: 'utf8' }).stdout
-    .trim().split('\n').map((line) => {
-      const [pid, ppid, ...command] = line.trim().split(/\s+/)
-      return { pid: Number(pid), ppid: Number(ppid), command: command.join(' ') }
-    })
-  const descendants = new Set([process.pid])
-  for (let pass = 0; pass < 4; pass++) {
-    for (const item of processes) if (descendants.has(item.ppid)) descendants.add(item.pid)
-  }
-  const holders = processes.filter((item) =>
-    descendants.has(item.pid) && ['cat', 'sh', 'flock'].includes(item.command))
-  if (!holders.some((item) => item.command === 'flock')) throw new Error('could not locate flock holder process')
-  for (const item of holders.reverse()) {
-    try { process.kill(item.pid, 'SIGKILL') } catch { /* descendant already exited */ }
-  }
-  await new Promise((resolve) => setTimeout(resolve, 300))
-  let lockLossObserved = false
-  try { await lossStore.getDraft('after-lock-loss') }
-  catch { lockLossObserved = true }
-  if (!lockLossObserved) throw new Error('store continued serving after kernel lock loss')
+  const owner = JSON.parse(readFileSync(join(directory, '.boring-mail.lock'), 'utf8')).pid
+  let oldResolved = false
+  const inFlight = lossStore.saveDraft({
+    kind: 'compose', path: 'large.mail.md', accountId: 'smoke',
+    sendAsAddress: 'smoke@example.test', to: ['recipient@example.test'],
+    subject: 'large interrupted write', bodyMarkdown: 'x'.repeat(64 * 1024 * 1024),
+  }, 'large-draft').then(() => { oldResolved = true }, () => undefined)
+  await new Promise((resolve) => setTimeout(resolve, 1))
+  process.kill(owner, 'SIGKILL')
+  const replacementPromise = openEventually()
+  await inFlight
+  if (oldResolved) throw new Error('killed SQLite owner resolved an in-flight RPC')
+  const replacement = await replacementPromise
   await lossStore.close()
-  const afterLockLoss = await openMailStore({ productDbPath }, {
-    startupTimeoutMs: 3_000, requestTimeoutMs: 3_000,
-  })
-  await afterLockLoss.close()
+  await replacement.close()
 
-  // Crash proof: SIGKILL the host without closing; the flock helper must lose
-  // its stdin and the kernel lock must become available without stale cleanup.
+  // Crash proof: SIGKILL the host without closing; IPC disconnect must end the
+  // lock-owning storage process and make the kernel lock available.
   const holder = spawn(process.execPath, ['-e', childSource, moduleUrl, productDbPath, 'hold'], {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -115,11 +126,31 @@ try {
   const holderExited = new Promise((resolve) => holder.once('exit', resolve))
   holder.kill('SIGKILL')
   await holderExited
-  const afterCrash = await openMailStore({ productDbPath }, {
-    startupTimeoutMs: 3_000, requestTimeoutMs: 3_000,
-  })
+  const afterCrash = await openEventually()
   await afterCrash.close()
-  console.log('✓ emitted mail-store worker, RPC, and cross-process flock smoke')
+
+  // Public declaration proof: a strict external NodeNext consumer resolves the
+  // package export and domain/facade types without reaching into src/.
+  const consumer = mkdtempSync(join(tmpdir(), 'boring-mail-type-consumer-'))
+  const scope = join(consumer, 'node_modules', '@hachej')
+  mkdirSync(scope, { recursive: true })
+  const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+  symlinkSync(packageRoot, join(scope, 'boring-mail'), 'dir')
+  writeFileSync(join(consumer, 'index.ts'), `
+    import { openMailStore, ProductStoreError, type DraftInput, type MailStore } from '@hachej/boring-mail/mail-store'
+    const draft: DraftInput = { kind: 'compose', path: 'x.mail.md', accountId: 'a', sendAsAddress: 'a@x', to: ['b@x'], subject: '', bodyMarkdown: '' }
+    const opened: Promise<MailStore> = openMailStore({ productDbPath: '/tmp/example.db' })
+    void draft; void opened; void ProductStoreError
+  `)
+  writeFileSync(join(consumer, 'tsconfig.json'), JSON.stringify({ compilerOptions: {
+    strict: true, noEmit: true, target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', skipLibCheck: false,
+  }, include: ['index.ts'] }))
+  const tsc = spawnSync(process.execPath, [fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url)), '-p', join(consumer, 'tsconfig.json')], {
+    encoding: 'utf8', cwd: consumer,
+  })
+  rmSync(consumer, { recursive: true, force: true })
+  if (tsc.status !== 0) throw new Error(`strict mail-store type consumer failed:\n${tsc.stdout}${tsc.stderr}`)
+  console.log('✓ emitted mail-store process, atomic flock, RPC, and strict declaration smoke')
 } finally {
   rmSync(directory, { recursive: true, force: true })
 }

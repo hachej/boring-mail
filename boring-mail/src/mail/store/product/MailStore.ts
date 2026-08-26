@@ -1,6 +1,8 @@
-import { existsSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, realpathSync, statSync } from 'node:fs'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { basename, dirname, join, resolve } from 'node:path'
-import { Worker } from 'node:worker_threads'
+import { fileURLToPath } from 'node:url'
 import type {
   AccountInput,
   ApprovedOutbox,
@@ -88,14 +90,89 @@ interface PendingCall {
   timer: ReturnType<typeof setTimeout>
 }
 
-/** mailStoreWorker.js is emitted adjacent to this compiled public module. */
+const LOCK_CONFLICT_EXIT = 73
+const TERMINATE_GRACE_MS = 5_000
+
+/**
+ * Default storage transport. `flock --no-fork` execs Node in the lock-owning
+ * process, so SQLite ownership and the kernel lock have exactly one lifetime.
+ */
+class StorageProcessTransport extends EventEmitter {
+  readonly #child: ChildProcess
+  #readySeen = false
+  #stderr = ''
+  #termination: Promise<number> | null = null
+
+  constructor(config: MailStoreWorkerConfig) {
+    super()
+    const workerPath = fileURLToPath(new URL('./mailStoreWorker.js', import.meta.url))
+    const lockPath = join(dirname(config.productDbPath), '.boring-mail.lock')
+    this.#child = spawn('flock', [
+      '-n', '-E', String(LOCK_CONFLICT_EXIT), '--no-fork', lockPath,
+      process.execPath, '--disable-warning=ExperimentalWarning', workerPath,
+    ], {
+      env: {
+        ...process.env,
+        BORING_MAIL_WORKER_CONFIG: JSON.stringify(config),
+        BORING_MAIL_LOCK_PATH: lockPath,
+      },
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    })
+    this.#child.stderr?.setEncoding('utf8')
+    this.#child.stderr?.on('data', (chunk: string) => { this.#stderr += chunk })
+    this.#child.on('message', (message: RpcResponse) => {
+      if (message.type === 'ready') this.#readySeen = true
+      this.emit('message', message)
+    })
+    this.#child.on('error', (error) => this.emit('error', error))
+    this.#child.on('exit', (code, signal) => {
+      if (!this.#readySeen && code === LOCK_CONFLICT_EXIT) {
+        this.emit('message', {
+          type: 'ready',
+          error: {
+            name: 'ProductStoreError',
+            code: 'mail_store_already_active',
+            message: `MAIL_STORE_ALREADY_ACTIVE: another process owns ${lockPath}`,
+          },
+        } satisfies RpcResponse)
+      } else if (!this.#readySeen && this.#stderr.trim()) {
+        this.emit('error', new Error(`mail store process failed before ready: ${this.#stderr.trim()}`))
+      }
+      this.emit('exit', code ?? (signal ? 1 : 0))
+    })
+  }
+
+  postMessage(value: unknown): void {
+    if (value === null || typeof value !== 'object') {
+      throw new Error('mail store IPC messages must be structured objects')
+    }
+    if (!this.#child.connected) throw new Error('mail store process IPC channel is closed')
+    // `false` means IPC backpressure, not send failure; the message is still
+    // queued. The RPC-level pending cap bounds this queue.
+    this.#child.send(value, (error) => { if (error) this.emit('error', error) })
+  }
+
+  terminate(): Promise<number> {
+    if (this.#termination) return this.#termination
+    this.#termination = new Promise((resolveTermination) => {
+      if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+        resolveTermination(this.#child.exitCode ?? 1)
+        return
+      }
+      const force = setTimeout(() => this.#child.kill('SIGKILL'), TERMINATE_GRACE_MS)
+      force.unref()
+      this.#child.once('exit', (code) => {
+        clearTimeout(force)
+        resolveTermination(code ?? 1)
+      })
+      this.#child.kill('SIGTERM')
+    })
+    return this.#termination
+  }
+}
+
 function defaultWorker(config: MailStoreWorkerConfig): WorkerTransport {
-  return new Worker(new URL('./mailStoreWorker.js', import.meta.url), {
-    workerData: config,
-    // node:sqlite is intentionally isolated here; suppress its Node 22
-    // ExperimentalWarning only in this emitted storage worker.
-    execArgv: ['--disable-warning=ExperimentalWarning'],
-  })
+  return new StorageProcessTransport(config) as WorkerTransport
 }
 function remoteError(error: SerializedError): Error {
   if (error.code) {
@@ -144,10 +221,6 @@ class RpcClient {
       clearTimeout(this.#startupTimer)
       if ('error' in message) this.#fail(remoteError(message.error))
       else this.#readyResolve()
-      return
-    }
-    if (message.type === 'fatal') {
-      this.#fail(remoteError(message.error))
       return
     }
     const pending = this.#pending.get(message.id)
@@ -257,7 +330,11 @@ function canonicalConfig(config: MailStoreWorkerConfig): MailStoreWorkerConfig {
   const absolute = resolve(config.productDbPath)
   let productDbPath: string
   try {
-    if (existsSync(absolute)) {
+    const finalEntry = lstatSync(absolute, { throwIfNoEntry: false })
+    if (finalEntry?.isSymbolicLink() && !existsSync(absolute)) {
+      throw new ProductStoreError('invalid_input', 'product database path may not be a dangling symlink')
+    }
+    if (finalEntry) {
       const stat = statSync(absolute)
       if (!stat.isFile() || stat.nlink !== 1) {
         throw new ProductStoreError('invalid_input', 'product database must be a regular file with one hard link')

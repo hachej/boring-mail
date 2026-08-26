@@ -1,8 +1,8 @@
-/** Dedicated DatabaseSync owner. Loaded as emitted mailStoreWorker.js. */
+/** Dedicated DatabaseSync owner, run as an emitted child process in production. */
+import { lstatSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 import { openMsgvaultStore, resolveReplyTarget } from '../msgvaultAdapter.js'
-import { acquireDataDirectoryLock, type DataDirectoryLock } from './dataDirectoryLock.js'
 import { ProductStore } from './ProductStore.js'
 import type {
   MailStoreWorkerConfig,
@@ -13,8 +13,22 @@ import type {
 } from './mailStoreProtocol.js'
 import { ProductStoreError } from './types.js'
 
-if (!parentPort) throw new Error('mailStoreWorker must run in a worker thread')
-const port = parentPort
+const processMode = parentPort === null
+const send = (message: RpcResponse): void => {
+  if (parentPort) parentPort.postMessage(message)
+  else if (process.send) process.send(message)
+  // A dead parent closes IPC before the synchronous handler can observe its
+  // disconnect event. Dropping that final response lets disconnect fail-stop.
+  else if (!processMode) throw new Error('mailStoreWorker requires worker-thread or process IPC')
+}
+const onRequest = (listener: (request: RpcRequest) => void): void => {
+  if (parentPort) parentPort.on('message', listener)
+  else process.on('message', (message) => listener(message as RpcRequest))
+}
+const closeChannel = (): void => {
+  if (parentPort) parentPort.close()
+  else if (process.connected) process.disconnect()
+}
 
 function serialized(error: unknown): SerializedError {
   if (error instanceof Error) {
@@ -28,41 +42,59 @@ function serialized(error: unknown): SerializedError {
   return { name: 'Error', message: String(error) }
 }
 
+function configFromRuntime(): MailStoreWorkerConfig {
+  if (!processMode) return workerData as MailStoreWorkerConfig
+  const raw = process.env.BORING_MAIL_WORKER_CONFIG
+  if (!raw) throw new Error('BORING_MAIL_WORKER_CONFIG is required')
+  return JSON.parse(raw) as MailStoreWorkerConfig
+}
+
+/** Re-check final-component identity after the canonical-directory flock is held. */
+function assertCanonicalDatabasePath(path: string): void {
+  if (realpathSync.native(dirname(path)) !== dirname(path)) {
+    throw new ProductStoreError('invalid_input', 'product database parent is not canonical')
+  }
+  const entry = lstatSync(path, { throwIfNoEntry: false })
+  if (!entry) return
+  if (entry.isSymbolicLink() || !entry.isFile() || statSync(path).nlink !== 1) {
+    throw new ProductStoreError(
+      'invalid_input',
+      'product database must be absent or an existing non-symlink regular file with one hard link',
+    )
+  }
+}
+
 async function start(): Promise<void> {
-  let lock: DataDirectoryLock | null = null
   let vault: ReturnType<typeof openMsgvaultStore> | null = null
   let store: ProductStore | null = null
   let closed = false
-  const close = async (): Promise<void> => {
+  const close = (): void => {
     if (closed) return
     closed = true
     store?.close()
     store = null
     vault?.db.close()
     vault = null
-    await lock?.release()
-    lock = null
   }
   try {
-    const config = workerData as MailStoreWorkerConfig
+    const config = configFromRuntime()
     if (!config?.productDbPath) throw new Error('productDbPath is required')
-    // D8: lock precedes every archive/database open and every migration.
-    lock = await acquireDataDirectoryLock(dirname(config.productDbPath))
+    assertCanonicalDatabasePath(config.productDbPath)
+    if (processMode) {
+      const lockPath = process.env.BORING_MAIL_LOCK_PATH
+      if (!lockPath) throw new Error('BORING_MAIL_LOCK_PATH is required')
+      // This process is already executing under flock --no-fork here.
+      writeFileSync(lockPath, JSON.stringify({
+        pid: process.pid,
+        processStartedAt: new Date(Date.now() - Math.floor(process.uptime() * 1_000)).toISOString(),
+      }) + '\n', { mode: 0o600 })
+    }
     vault = config.msgvaultDbPath ? openMsgvaultStore(config.msgvaultDbPath) : null
     store = ProductStore.open(config.productDbPath, {
       now: Date.now,
       resolveReplyTarget: (messageId) => vault ? resolveReplyTarget(vault.db, messageId) : null,
     })
     const productStore = store
-    const heldLock = lock
-    // Kernel lock loss is a fatal ownership violation. Close both databases
-    // before notifying the facade; the facade then terminates this worker.
-    void heldLock.lost.then(async (error) => {
-      if (closed) return
-      await close().catch(() => undefined)
-      port.postMessage({ type: 'fatal', error: serialized(error) } satisfies RpcResponse)
-      port.close()
-    })
     const handlers: RpcHandlers = {
       upsertAccount: (input) => productStore.upsertAccount(input),
       saveDraft: (input, id) => productStore.saveDraft(input, id),
@@ -89,23 +121,32 @@ async function start(): Promise<void> {
       retry: (id, key) => productStore.outbox.retry(id, key),
       close,
     }
-    port.postMessage({ type: 'ready' } satisfies RpcResponse)
-    port.on('message', (request: RpcRequest) => {
+    send({ type: 'ready' })
+    onRequest((request) => {
       void (async () => {
         try {
-          // Handler map is checked against the protocol above; this cast is the
-          // structured-clone boundary where the discriminated request is erased.
           const invoke = handlers[request.method] as (...args: unknown[]) => unknown
           const value = await invoke(...request.args)
-          port.postMessage({ type: 'response', id: request.id, value } satisfies RpcResponse)
+          send({ type: 'response', id: request.id, value })
         } catch (error) {
-          port.postMessage({ type: 'response', id: request.id, error: serialized(error) } satisfies RpcResponse)
+          send({ type: 'response', id: request.id, error: serialized(error) })
         }
       })()
     })
+    if (processMode) {
+      process.once('disconnect', () => {
+        close()
+        process.exit(0)
+      })
+      process.once('SIGTERM', () => {
+        close()
+        closeChannel()
+        process.exit(0)
+      })
+    }
   } catch (error) {
-    await close().catch(() => undefined)
-    port.postMessage({ type: 'ready', error: serialized(error) } satisfies RpcResponse)
+    close()
+    send({ type: 'ready', error: serialized(error) })
   }
 }
 

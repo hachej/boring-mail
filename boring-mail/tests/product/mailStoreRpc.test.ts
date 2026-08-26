@@ -147,6 +147,14 @@ describe('async MailStore worker RPC facade', () => {
     }
   })
 
+  it('rejects a dangling final symlink instead of treating it as an absent database', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mail-dangling-')),
+      alias = join(root, 'dangling.db')
+    symlinkSync(join(root, 'missing-target.db'), alias)
+    await expect(openMailStore({ productDbPath: alias }, { workerFactory: factory([]) }))
+      .rejects.toMatchObject({ code: 'invalid_input' })
+  })
+
   it('canonicalizes symlink aliases to one database/worker and rejects hardlinks', async () => {
     const root = mkdtempSync(join(tmpdir(), 'mail-alias-')),
       targetDir = join(root, 'target'), aliasA = join(root, 'alias-a'), aliasB = join(root, 'alias-b')
