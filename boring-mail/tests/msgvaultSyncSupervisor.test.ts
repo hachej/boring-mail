@@ -141,6 +141,63 @@ describe('MsgvaultSyncSupervisor', () => {
     await supervisor.stop()
   })
 
+  it('coalesces case-only identifier churn behind one canonical mutex', async () => {
+    const accounts = ['Case@Test']
+    const first = deferred<{ changed: boolean }>()
+    const calls: string[] = []
+    let canonicalRunning = 0, maxCanonicalRunning = 0
+    const { clock, supervisor } = harness(accounts, async (account) => {
+      calls.push(account)
+      canonicalRunning++
+      maxCanonicalRunning = Math.max(maxCanonicalRunning, canonicalRunning)
+      try {
+        if (calls.length === 1) return await first.promise
+        return { changed: true }
+      } finally { canonicalRunning-- }
+    }, () => 0.5, { activeIntervalMs: 1_000_000, heartbeatMs: 10, suspendLateAfterMs: 1_000 })
+    await supervisor.start(); await clock.advance(0)
+    accounts[0] = 'case@test'
+    await clock.advance(10); await flush()
+    expect(calls).toEqual(['Case@Test'])
+    expect(maxCanonicalRunning).toBe(1)
+    first.resolve({ changed: true })
+    await flush()
+    expect(calls).toEqual(['Case@Test', 'case@test'])
+    expect(maxCanonicalRunning).toBe(1)
+    expect(supervisor.health()[0]?.account).toBe('case@test')
+    await supervisor.syncNow('CASE@TEST')
+    expect(calls.at(-1)).toBe('case@test')
+    await supervisor.stop()
+  })
+
+  it('continues a coalesced maintenance mode after discovery failure', async () => {
+    const failedDiscovery = deferred<string[]>()
+    let discoveries = 0, calls = 0
+    const clock = new FakeClock()
+    const retrying = new MsgvaultSyncSupervisor({
+      discoverAccounts: async () => {
+        discoveries++
+        if (discoveries === 2) return failedDiscovery.promise
+        return ['a@test']
+      },
+      syncAccount: async () => { calls++; return { changed: true } },
+      now: () => clock.now,
+      random: () => 0.5,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    }, { heartbeatMs: 1_000_000, suspendLateAfterMs: 1_000_000 })
+    await retrying.start(); await clock.advance(0)
+    calls = 0
+    const firstRequest = retrying.syncNow()
+    await flush()
+    const secondRequest = retrying.syncNow()
+    failedDiscovery.reject(new Error('transient discovery failure'))
+    await Promise.all([firstRequest, secondRequest])
+    expect(discoveries).toBe(3)
+    expect(calls).toBe(1)
+    await retrying.stop()
+  })
+
   it('coalesces a second suspend during a long resume wave into one follow-up', async () => {
     const pending = deferred<{ changed: boolean }>()
     let calls = 0
@@ -287,6 +344,7 @@ describe('MsgvaultSyncSupervisor', () => {
     await clock.advance(10); await flush()
     expect(calls).toContain('b@test')
     expect(errors).toContain('heartbeat rearm failed')
+    expect(supervisor.health()[0]?.maintenanceError).toBeNull()
 
     failNextAccountArm = true
     accounts.push('c@test')
@@ -303,6 +361,35 @@ describe('MsgvaultSyncSupervisor', () => {
     pending.resolve({ changed: true })
     await stop
     expect(errors).toContain('clear failed')
+  })
+
+  it('retains double heartbeat-arm degradation after successful account sync', async () => {
+    const clock = new FakeClock()
+    let heartbeatArms = 0, calls = 0
+    const errors: string[] = []
+    const supervisor = new MsgvaultSyncSupervisor({
+      discoverAccounts: async () => ['a@test'],
+      syncAccount: async () => { calls++; return { changed: true } },
+      now: () => clock.now,
+      random: () => 0.5,
+      setTimeout(callback, delay) {
+        if (delay === 10 && [2, 3].includes(++heartbeatArms)) throw new Error('heartbeat unavailable')
+        return clock.setTimeout(callback, delay)
+      },
+      clearTimeout: clock.clearTimeout,
+      onError: (message) => errors.push(message),
+    }, { activeIntervalMs: 1_000, heartbeatMs: 10, suspendLateAfterMs: 1_000 })
+    await supervisor.start(); await clock.advance(0)
+    await clock.advance(10); await flush()
+    expect(supervisor.health()[0]?.maintenanceError).toMatch(/sync maintenance degraded/)
+    expect(errors.some((message) => message.includes('sync maintenance degraded'))).toBe(true)
+    await supervisor.syncNow('a@test')
+    expect(calls).toBeGreaterThanOrEqual(2)
+    expect(supervisor.health()[0]).toMatchObject({
+      maintenanceError: expect.stringMatching(/sync maintenance degraded/),
+      lastError: expect.stringMatching(/sync maintenance degraded/),
+    })
+    await supervisor.stop()
   })
 
   it('uses internal timer identity when external handles are null', async () => {

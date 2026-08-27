@@ -1,3 +1,5 @@
+import { armSafeTimer, cancelSafeTimer, type ArmedTimer } from './safeTimer.ts'
+
 export const ACTIVE_SYNC_INTERVAL_MS = 120_000
 export const ACTIVE_SYNC_JITTER_FRACTION = 0.2
 export const IDLE_SYNC_MIN_MS = 300_000
@@ -37,17 +39,14 @@ export interface AccountSyncHealth {
   readonly consecutiveEmpty: number
   readonly nextRunAt: number | null
   readonly lastError: string | null
-}
-
-interface ArmedTimer {
-  handle: unknown
-  hasHandle: boolean
-  active: boolean
-  arming: boolean
-  firedSynchronously: boolean
+  /** Supervisor maintenance failure that cannot be cleared by account success. */
+  readonly maintenanceError: string | null
 }
 
 interface AccountState {
+  /** Case-folded mutex identity, stable across msgvault spelling churn. */
+  key: string
+  /** Latest exact msgvault source identifier passed to the CLI. */
   account: string
   timer: ArmedTimer | null
   nextRunAt: number | null
@@ -77,6 +76,10 @@ function positiveSafeInteger(value: number, name: string): number {
 function boundedRandom(value: number): number {
   if (!Number.isFinite(value) || value < 0 || value >= 1) throw new Error('random() must return [0,1)')
   return value
+}
+
+function accountKey(account: string): string {
+  return account.toLowerCase()
 }
 
 function sanitizedError(error: unknown, account: string): string {
@@ -109,6 +112,7 @@ export class MsgvaultSyncSupervisor {
   #heartbeat: ArmedTimer | null = null
   #heartbeatDueAt: number | null = null
   #heartbeatRetryQueued = false
+  #heartbeatError: string | null = null
 
   constructor(deps: MsgvaultSyncSupervisorDependencies, options: MsgvaultSyncSupervisorOptions = {}) {
     this.#deps = deps
@@ -159,7 +163,8 @@ export class MsgvaultSyncSupervisor {
         inFlight: state.inFlight !== null,
         consecutiveEmpty: state.consecutiveEmpty,
         nextRunAt: state.nextRunAt,
-        lastError: state.lastError,
+        lastError: state.lastError ?? this.#heartbeatError,
+        maintenanceError: this.#heartbeatError,
       })))
   }
 
@@ -167,7 +172,7 @@ export class MsgvaultSyncSupervisor {
     await this.#startPromise
     if (!this.#started || this.#stopping) return
     if (account !== undefined) {
-      const state = this.#accounts.get(account)
+      const state = this.#accounts.get(accountKey(account))
       if (!state || state.removed) throw new Error('sync account is not active')
       await this.#request(state)
       return
@@ -197,46 +202,21 @@ export class MsgvaultSyncSupervisor {
   }
 
   #armTimer(callback: () => void, delayMs: number): ArmedTimer {
-    const timer: ArmedTimer = {
-      handle: undefined,
-      hasHandle: false,
-      active: true,
-      arming: true,
-      firedSynchronously: false,
-    }
-    try {
-      timer.handle = this.#deps.setTimeout(() => {
-        if (!timer.active) return
-        if (timer.arming) {
-          timer.firedSynchronously = true
-          return
-        }
-        callback()
-      }, delayMs)
-      timer.hasHandle = true
-      timer.arming = false
-      if (timer.firedSynchronously) {
-        this.#cancelTimer(timer)
-        throw new Error('setTimeout callbacks must run asynchronously')
-      }
-      return timer
-    } catch (error) {
-      timer.arming = false
-      if (timer.active && timer.hasHandle) this.#clearExternalTimer(timer.handle)
-      timer.active = false
-      throw error
-    }
-  }
-
-  #clearExternalTimer(handle: unknown, account = ''): void {
-    try { this.#deps.clearTimeout(handle) }
-    catch (error) { this.#reportError(sanitizedError(error, account)) }
+    return armSafeTimer(
+      this.#deps.setTimeout,
+      this.#deps.clearTimeout,
+      callback,
+      delayMs,
+      (error) => this.#reportError(sanitizedError(error, '')),
+    )
   }
 
   #cancelTimer(timer: ArmedTimer, account = ''): void {
-    if (!timer.active) return
-    timer.active = false
-    if (timer.hasHandle) this.#clearExternalTimer(timer.handle, account)
+    cancelSafeTimer(
+      timer,
+      this.#deps.clearTimeout,
+      (error) => this.#reportError(sanitizedError(error, account)),
+    )
   }
 
   #clearTimers(): void {
@@ -324,7 +304,7 @@ export class MsgvaultSyncSupervisor {
           state.lastError = sanitizedError(error, state.account)
           this.#reportError(state.lastError)
         }
-      } else if (state.removed) this.#accounts.delete(state.account)
+      } else if (state.removed) this.#accounts.delete(state.key)
     })
     return state.inFlight
   }
@@ -334,16 +314,23 @@ export class MsgvaultSyncSupervisor {
     const refresh = (async () => {
       const discovered = await this.#deps.discoverAccounts()
       if (this.#stopping) return []
-      const active = new Set(discovered)
+      const active = new Set(discovered.map(accountKey))
       const added: AccountState[] = []
       for (const account of discovered) {
-        const existing = this.#accounts.get(account)
+        const key = accountKey(account)
+        const existing = this.#accounts.get(key)
         if (existing) {
-          if (existing.removed) added.push(existing)
+          // Exact spelling is msgvault's lookup value, while the folded key is
+          // the mutex identity. A case-only change therefore coalesces behind
+          // an in-flight run instead of creating a concurrent account state.
+          const spellingChanged = existing.account !== account
+          existing.account = account
+          if (existing.removed || spellingChanged) added.push(existing)
           existing.removed = false
           continue
         }
         const state: AccountState = {
+          key,
           account,
           timer: null,
           nextRunAt: null,
@@ -355,18 +342,18 @@ export class MsgvaultSyncSupervisor {
           removed: false,
           scheduleFailed: false,
         }
-        this.#accounts.set(account, state)
+        this.#accounts.set(key, state)
         added.push(state)
       }
       for (const state of this.#accounts.values()) {
-        if (active.has(state.account)) continue
+        if (active.has(state.key)) continue
         state.removed = true
         const timer = state.timer
         state.timer = null
         state.nextRunAt = null
         if (timer) this.#cancelTimer(timer, state.account)
         state.followUp = false
-        if (!state.inFlight) this.#accounts.delete(state.account)
+        if (!state.inFlight) this.#accounts.delete(state.key)
       }
       return added
     })()
@@ -386,10 +373,10 @@ export class MsgvaultSyncSupervisor {
     this.#mergeMaintenanceMode(mode)
     if (this.#maintenancePromise) return this.#maintenancePromise
     const wave = (async () => {
-      try {
-        while (this.#maintenancePending !== 'none' && !this.#stopping) {
-          const current = this.#maintenancePending
-          this.#maintenancePending = 'none'
+      while (this.#maintenancePending !== 'none' && !this.#stopping) {
+        const current = this.#maintenancePending
+        this.#maintenancePending = 'none'
+        try {
           const added = await this.#refreshAccounts()
           if (this.#stopping) break
           const targets = current === 'all'
@@ -399,11 +386,13 @@ export class MsgvaultSyncSupervisor {
                 ...[...this.#accounts.values()].filter((state) => state.scheduleFailed && !state.removed),
               ])]
           await Promise.all(targets.map((state) => this.#request(state)))
+        } catch (error) {
+          const message = sanitizedError(error, '')
+          this.#reportError(message)
+          for (const state of this.#accounts.values()) state.lastError = message
+          // A mode coalesced while this failed iteration was pending remains in
+          // #maintenancePending and is processed by the next loop iteration.
         }
-      } catch (error) {
-        const message = sanitizedError(error, '')
-        this.#reportError(message)
-        for (const state of this.#accounts.values()) state.lastError = message
       }
     })()
     const tracked = wave.finally(() => {
@@ -429,12 +418,15 @@ export class MsgvaultSyncSupervisor {
     }, this.#heartbeatMs)
     this.#heartbeat = timer
     this.#heartbeatDueAt = dueAt
+    // A successfully armed heartbeat restores maintenance health. Account sync
+    // success cannot clear a degraded heartbeat on its own.
+    this.#heartbeatError = null
   }
 
   #queueHeartbeatRetry(maintenance: Promise<void>, error: unknown): void {
     const first = sanitizedError(error, '')
+    this.#heartbeatError = first
     this.#reportError(first)
-    for (const state of this.#accounts.values()) state.lastError = first
     if (this.#heartbeatRetryQueued || this.#stopping) return
     this.#heartbeatRetryQueued = true
     queueMicrotask(() => {
@@ -448,8 +440,8 @@ export class MsgvaultSyncSupervisor {
             new Error(`sync maintenance degraded: ${retryError instanceof Error ? retryError.message : 'heartbeat timer unavailable'}`),
             '',
           )
+          this.#heartbeatError = message
           this.#reportError(message)
-          for (const state of this.#accounts.values()) state.lastError = message
         }
       })()
     })

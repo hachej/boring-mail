@@ -25,23 +25,31 @@ describe('msgvault Gmail discovery and sync runner', () => {
 
     const executable = join(root, 'fake-msgvault')
     const argvPath = join(root, 'argv.json')
-    writeFileSync(executable, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.ARGV_PATH,JSON.stringify(process.argv.slice(2)));console.log('Changes: 0 processed, 0 added')\n`)
+    writeFileSync(executable, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.ARGV_PATH,JSON.stringify({argv:process.argv.slice(2),direct:process.env.MSGVAULT_DAEMON_CLI_PARENT_PID===String(process.ppid)}));console.log('Changes: 0 processed, 0 added')\n`)
     chmodSync(executable, 0o700)
     const before = process.env.ARGV_PATH
     process.env.ARGV_PATH = argvPath
     try {
       await expect(createMsgvaultSyncRunner({ executable, home: root })(accounts[0]!)).resolves.toEqual({ changed: false })
-      expect(JSON.parse(readFileSync(argvPath, 'utf8'))).toEqual([
-        '--home', root, '--no-log-file', 'sync', '--', 'CaseSensitive@Example.Test',
-      ])
+      expect(JSON.parse(readFileSync(argvPath, 'utf8'))).toEqual({
+        argv: ['--home', root, '--no-log-file', 'sync', '--', 'CaseSensitive@Example.Test'],
+        direct: true,
+      })
     } finally {
       if (before === undefined) delete process.env.ARGV_PATH
       else process.env.ARGV_PATH = before
     }
 
-    const duplicate = new DatabaseSync(dbPath)
-    duplicate.exec(`INSERT INTO sources VALUES(3,'gmail','casesensitive@example.test')`)
-    duplicate.close()
+    for (const invalid of [' CaseSensitive@Example.Test', 'CaseSensitive@Example.Test ', '\u00a0CaseSensitive@Example.Test']) {
+      const whitespace = new DatabaseSync(dbPath)
+      whitespace.prepare(`UPDATE sources SET identifier=? WHERE id=1`).run(invalid)
+      whitespace.close()
+      await expect(discoverMsgvaultGmailAccounts({ dbPath })).rejects.toThrow(/identifier is invalid/)
+    }
+    const restore = new DatabaseSync(dbPath)
+    restore.prepare(`UPDATE sources SET identifier=? WHERE id=1`).run('CaseSensitive@Example.Test')
+    restore.exec(`INSERT INTO sources VALUES(3,'gmail','casesensitive@example.test')`)
+    restore.close()
     await expect(discoverMsgvaultGmailAccounts({ dbPath })).rejects.toThrow(/duplicate/)
 
     const driftPath = join(root, 'drift.db')

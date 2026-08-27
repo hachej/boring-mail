@@ -3,6 +3,13 @@ import type { MsgvaultArchiveLock } from './msgvaultArchiveLock.ts'
 
 const MAX_CAPTURE_BYTES = 64 * 1024
 
+// Pinned msgvault v0.19.3 normally routes `sync` through an auto-started
+// daemon. Its own foreground daemon sets this marker to its immediate PID when
+// spawning the verified direct worker (daemon_cli_subprocess.go / sync.go).
+// Setting the same parent-bound marker keeps Boring Mail's child as the actual
+// writer whose lifetime and inherited ownership OFDs we supervise.
+const MSGVAULT_DIRECT_PARENT_ENV = 'MSGVAULT_DAEMON_CLI_PARENT_PID'
+
 export interface MsgvaultSyncRunnerOptions {
   executable?: string
   home?: string
@@ -58,8 +65,12 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
       let settled = false
       const child = spawnProcess(executable, args, {
         shell: false,
+        env: {
+          ...process.env,
+          [MSGVAULT_DIRECT_PARENT_ENV]: String(process.pid),
+        },
         stdio: locked
-          ? ['ignore', 'pipe', 'pipe', locked.inheritedFds[0], locked.inheritedFds[1]]
+          ? ['ignore', 'pipe', 'pipe', ...locked.inheritedFds]
           : ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })

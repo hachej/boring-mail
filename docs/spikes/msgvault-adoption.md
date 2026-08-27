@@ -42,6 +42,13 @@ Key structures relevant to boring-mail:
   adapter pins msgvault releases.
 - `msgvault serve` daemon/OpenAPI/MCP remains available later for remote
   deployments — not needed locally.
+- **Pinned v0.19 process contract:** ordinary archive CLI commands auto-start or
+  reuse a local daemon. The thin supervisor invokes the same parent-bound direct
+  worker branch that v0.19.3's daemon uses (`MSGVAULT_DAEMON_CLI_PARENT_PID`,
+  implemented in `daemon_cli_subprocess.go` / `sync.go`) so the supervised child
+  remains the actual writer. It holds msgvault's `daemon.lock` and
+  `db.write.lock` plus canonical home/database inode locks for the whole runtime;
+  upgrades must re-verify this upstream contract before changing the pin.
 
 ## 4. Risks & deviations recorded
 

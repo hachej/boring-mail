@@ -33,8 +33,10 @@ export async function discoverMsgvaultGmailAccounts(
     const seen = new Set<string>()
     return rows.map((row) => {
       if (typeof row.identifier !== 'string') throw remediation('msgvault Gmail account identifier is not text')
-      const account = row.identifier.trim()
-      if (!account || account.length > 320 || /[\s\x00-\x1f\x7f]/.test(account) ||
+      // msgvault 0.19 resolves source identifiers by exact spelling. Reject
+      // surrounding whitespace instead of silently changing the lookup key.
+      const account = row.identifier
+      if (!account || account !== account.trim() || account.length > 320 || /[\s\x00-\x1f\x7f]/u.test(account) ||
           account.indexOf('@') <= 0 || account.indexOf('@') !== account.lastIndexOf('@') || account.endsWith('@')) {
         throw remediation('msgvault Gmail account identifier is invalid')
       }
