@@ -1,4 +1,8 @@
-import { DatabaseSync } from 'node:sqlite'
+import {
+  openMsgvaultReadOnly,
+  readMsgvaultTableColumns,
+  validateMsgvaultSourcesSchema,
+} from '../store/msgvault/schema.ts'
 
 export interface MsgvaultAccountDiscoveryOptions {
   dbPath: string
@@ -8,27 +12,19 @@ function remediation(message: string): Error {
   return new Error(`REMEDIATION: ${message}`)
 }
 
-/** Discover active Gmail source identifiers from msgvault without reading mail. */
+/** Discover active Gmail source identifiers through the shared v0.19 schema seam. */
 export async function discoverMsgvaultGmailAccounts(
   options: MsgvaultAccountDiscoveryOptions,
 ): Promise<string[]> {
-  let db: DatabaseSync
+  let db
   try {
-    db = new DatabaseSync(options.dbPath, { readOnly: true })
+    db = openMsgvaultReadOnly(options.dbPath)
   } catch {
-    throw remediation('cannot open the msgvault database; run msgvault init-db or configure MSGVAULT_DB_PATH')
+    throw remediation('cannot open the msgvault database; run msgvault init-db or configure MSGVAULT_HOME')
   }
   try {
-    const table = db.prepare(`PRAGMA table_info(sources)`).all() as Array<{
-      name: unknown; type: unknown; notnull: unknown; pk: unknown
-    }>
-    const id = table.find((column) => column.name === 'id')
-    const type = table.find((column) => column.name === 'source_type')
-    const identifier = table.find((column) => column.name === 'identifier')
-    const primary = table.filter((column) => Number(column.pk) > 0)
-    if (!id || typeof id.type !== 'string' || !/int/i.test(id.type) || id.pk !== 1 || primary.length !== 1 ||
-        !type || typeof type.type !== 'string' || !/(char|clob|text)/i.test(type.type) || type.notnull !== 1 ||
-        !identifier || typeof identifier.type !== 'string' || !/(char|clob|text)/i.test(identifier.type) || identifier.notnull !== 1) {
+    const errors = validateMsgvaultSourcesSchema(readMsgvaultTableColumns(db, 'sources'))
+    if (errors.length > 0) {
       throw remediation('msgvault sources schema drifted; this supervisor targets msgvault 0.19.x')
     }
     const rows = db.prepare(

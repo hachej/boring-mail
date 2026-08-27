@@ -30,6 +30,8 @@ export interface MsgvaultSyncRuntimeLease {
   release(): Promise<void>
 }
 
+type ErrorSubscriber = (message: string) => void
+
 interface SingletonEntry {
   supervisor: MsgvaultSyncSupervisor
   fingerprint: string
@@ -37,14 +39,16 @@ interface SingletonEntry {
   ready: Promise<void>
   ownership: MsgvaultArchiveLock | null
   closing: Promise<void> | null
+  subscribers: Set<ErrorSubscriber>
 }
 
 interface SingletonOptions {
   fingerprint?: string
   acquireOwnership?: () => Promise<MsgvaultArchiveLock>
+  onError?: ErrorSubscriber
 }
 
-const REGISTRY_SYMBOL = Symbol.for('@hachej/boring-mail/msgvault-sync-supervisors.v2')
+const REGISTRY_SYMBOL = Symbol.for('@hachej/boring-mail/msgvault-sync-supervisors.v3')
 const root = globalThis as typeof globalThis & { [REGISTRY_SYMBOL]?: Map<string, SingletonEntry> }
 const registry = root[REGISTRY_SYMBOL] ??= new Map<string, SingletonEntry>()
 const functionIds = new WeakMap<object, number>()
@@ -110,18 +114,24 @@ function resolveExecutable(input: string | undefined, env: NodeJS.ProcessEnv = p
 }
 
 function archiveIdentity(home: string, dbPath: string): string {
-  const directory = statSync(home, { bigint: true })
-  const database = statSync(dbPath, { bigint: true })
-  return `${directory.dev}:${directory.ino}:${database.dev}:${database.ino}`
+  try {
+    const directory = statSync(home, { bigint: true })
+    const database = statSync(dbPath, { bigint: true })
+    return `${directory.dev}:${directory.ino}:${database.dev}:${database.ino}`
+  } catch {
+    throw new Error('REMEDIATION: msgvault archive identity changed during startup; retry after restoring the archive')
+  }
 }
 
 /** Generic process singleton seam, exported for deterministic lifecycle tests. */
 export async function acquireSyncSupervisorSingleton(
   key: string,
-  create: () => MsgvaultSyncSupervisor,
+  create: (reportError: ErrorSubscriber) => MsgvaultSyncSupervisor,
   options: SingletonOptions = {},
 ): Promise<MsgvaultSyncRuntimeLease> {
   const fingerprint = options.fingerprint ?? 'default'
+  // One wrapper per lease lets identical callbacks be independently removed.
+  const subscriber = options.onError ? ((message: string) => options.onError!(message)) : null
   for (;;) {
     let entry = registry.get(key)
     if (entry?.closing) {
@@ -132,13 +142,21 @@ export async function acquireSyncSupervisorSingleton(
       throw new Error('REMEDIATION: conflicting sync supervisor configuration for the same msgvault archive')
     }
     if (!entry) {
-      const supervisor = create()
+      const subscribers = new Set<ErrorSubscriber>()
+      if (subscriber) subscribers.add(subscriber)
+      const reportError = (message: string) => {
+        for (const notify of [...subscribers]) {
+          try { notify(message) } catch { /* diagnostics cannot break sync */ }
+        }
+      }
+      const supervisor = create(reportError)
       entry = {
         supervisor,
         fingerprint,
         refs: 0,
         ownership: null,
         closing: null,
+        subscribers,
         ready: Promise.resolve(),
       }
       const candidate = entry
@@ -147,24 +165,32 @@ export async function acquireSyncSupervisorSingleton(
           candidate.ownership = options.acquireOwnership ? await options.acquireOwnership() : null
           await candidate.supervisor.start()
         } catch (error) {
-          await candidate.supervisor.stop().catch(() => undefined)
-          await candidate.ownership?.release().catch(() => undefined)
+          // Release ownership only after stop proves startup/account work drained.
+          await candidate.supervisor.stop()
+          await candidate.ownership?.release()
           candidate.ownership = null
           throw error
         }
       })()
       registry.set(key, candidate)
+    } else if (subscriber) {
+      entry.subscribers.add(subscriber)
     }
     try { await entry.ready }
     catch (error) {
-      if (registry.get(key) === entry) registry.delete(key)
+      if (subscriber) entry.subscribers.delete(subscriber)
+      // A retained ownership object means cleanup failed: preserve the rejected
+      // entry and kernel locks so no replacement can overlap it.
+      if (registry.get(key) === entry && entry.ownership === null) registry.delete(key)
       throw error
     }
     if (entry.closing) {
+      if (subscriber) entry.subscribers.delete(subscriber)
       await entry.closing
       continue
     }
     if (entry.fingerprint !== fingerprint) {
+      if (subscriber) entry.subscribers.delete(subscriber)
       throw new Error('REMEDIATION: conflicting sync supervisor configuration for the same msgvault archive')
     }
     entry.refs++
@@ -174,16 +200,19 @@ export async function acquireSyncSupervisorSingleton(
       async release() {
         if (released) return
         released = true
+        if (subscriber) entry!.subscribers.delete(subscriber)
         entry!.refs--
         if (entry!.refs !== 0) return
         entry!.closing = (async () => {
-          try { await entry!.supervisor.stop() }
-          finally {
-            await entry!.ownership?.release()
-            entry!.ownership = null
-          }
-        })().finally(() => {
+          // Never release the ownership descriptors if stop fails before drain.
+          await entry!.supervisor.stop()
+          await entry!.ownership?.release()
+          entry!.ownership = null
+        })()
+        entry!.closing.then(() => {
           if (registry.get(key) === entry) registry.delete(key)
+        }, () => {
+          // Fail closed: retain the rejected closing entry and ownership.
         })
         await entry!.closing
       },
@@ -196,11 +225,11 @@ export async function acquireMsgvaultSyncRuntime(
   injected?: Partial<MsgvaultSyncSupervisorDependencies>,
 ): Promise<MsgvaultSyncRuntimeLease> {
   if (options === false || options?.enabled === false) return { supervisor: null, release: async () => undefined }
-  const homeHint = options?.home ?? defaultMsgvaultHome()
-  const dbHint = options?.dbPath ?? defaultMsgvaultDbPath(homeHint)
+  const homeHint = options?.home?.trim() || defaultMsgvaultHome()
+  const dbHint = options?.dbPath?.trim() || defaultMsgvaultDbPath(homeHint)
   if (options?.enabled !== true && !existsSync(dbHint)) return { supervisor: null, release: async () => undefined }
   const { home, dbPath } = resolveMsgvaultArchive(options ?? {})
-  const configPath = options?.configPath ? canonicalExisting(options.configPath, 'msgvault config') : undefined
+  const configPath = options?.configPath?.trim() ? canonicalExisting(options.configPath, 'msgvault config') : undefined
   const executable = resolveExecutable(options?.executable)
   const key = archiveIdentity(home, dbPath)
   const injectedFingerprint = injected && (
@@ -226,19 +255,35 @@ export async function acquireMsgvaultSyncRuntime(
     suspendLateAfterMs: options?.suspendLateAfterMs ?? SUSPEND_LATE_AFTER_MS,
     injected: injectedFingerprint,
   })
-  return acquireSyncSupervisorSingleton(key, () => {
-    const runner = createMsgvaultSyncRunner({ executable, home, ...(configPath ? { configPath } : {}) })
+  let ownership: MsgvaultArchiveLock | null = null
+  return acquireSyncSupervisorSingleton(key, (reportError) => {
+    const runner = createMsgvaultSyncRunner({
+      executable,
+      home,
+      ...(configPath ? { configPath } : {}),
+      archiveLock: { spawnContext: () => {
+        if (!ownership) throw new Error('REMEDIATION: msgvault archive ownership is unavailable')
+        return ownership.spawnContext()
+      } },
+    })
     return new MsgvaultSyncSupervisor({
-      discoverAccounts: injected?.discoverAccounts ?? (() => discoverMsgvaultGmailAccounts({ dbPath })),
+      discoverAccounts: injected?.discoverAccounts ?? (() => {
+        if (!ownership) throw new Error('REMEDIATION: msgvault archive ownership is unavailable')
+        return discoverMsgvaultGmailAccounts({ dbPath: ownership.databasePath() })
+      }),
       syncAccount: injected?.syncAccount ?? runner,
       now: injected?.now ?? Date.now,
       random: injected?.random ?? Math.random,
       setTimeout: injected?.setTimeout ?? ((callback, delay) => setTimeout(callback, delay)),
       clearTimeout: injected?.clearTimeout ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>)),
-      ...(injected?.onError ? { onError: injected.onError } : {}),
+      onError: reportError,
     }, options ?? {})
   }, {
     fingerprint,
-    acquireOwnership: () => acquireMsgvaultArchiveLock(dbPath),
+    onError: injected?.onError,
+    acquireOwnership: async () => {
+      ownership = await acquireMsgvaultArchiveLock(dbPath)
+      return ownership
+    },
   })
 }

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import type { MsgvaultArchiveLock } from './msgvaultArchiveLock.ts'
 
 const MAX_CAPTURE_BYTES = 64 * 1024
 
@@ -7,6 +8,7 @@ export interface MsgvaultSyncRunnerOptions {
   home?: string
   configPath?: string
   spawnProcess?: typeof spawn
+  archiveLock?: Pick<MsgvaultArchiveLock, 'spawnContext'>
 }
 
 export type MsgvaultOutputClassification = 'changed' | 'empty' | 'unknown' | 'error'
@@ -15,7 +17,8 @@ export type MsgvaultOutputClassification = 'changed' | 'empty' | 'unknown' | 'er
 export function classifyMsgvaultSyncOutput(output: string): MsgvaultOutputClassification {
   const errors = [...output.matchAll(/\bErrors:\s*(\d+)\b/gi)].map((match) => Number(match[1]))
   if (errors.some((count) => count > 0)) return 'error'
-  const summary = /\bChanges:\s*(\d+)\s+processed,\s*(\d+)\s+added\b/i.exec(output)
+  const summaries = [...output.matchAll(/\bChanges:\s*(\d+)\s+processed,\s*(\d+)\s+added\b/gi)]
+  const summary = summaries.at(-1)
   if (summary) return Number(summary[1]) > 0 || Number(summary[2]) > 0 ? 'changed' : 'empty'
   const counters = [...output.matchAll(
     /\b(?:new|added|created|imported|updated|changed|deleted|removed|synced)\s*(?:messages?)?\s*[:=]?\s*(\d+)\b/gi,
@@ -40,25 +43,28 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
   const executable = options.executable?.trim() || 'msgvault'
   const spawnProcess = options.spawnProcess ?? spawn
   return async (account: string): Promise<{ changed: boolean }> => {
+    const locked = options.archiveLock?.spawnContext()
+    const home = locked?.home ?? options.home
     const args = [
-      ...(options.home ? ['--home', options.home] : []),
+      ...(home ? ['--home', home] : []),
       ...(options.configPath ? ['--config', options.configPath] : []),
       '--no-log-file',
       'sync',
       '--',
       account,
     ]
-    let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0)
-    let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+    let output: Buffer<ArrayBufferLike> = Buffer.alloc(0)
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const child = spawnProcess(executable, args, {
         shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: locked
+          ? ['ignore', 'pipe', 'pipe', locked.inheritedFds[0], locked.inheritedFds[1]]
+          : ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
-      child.stdout?.on('data', (chunk) => { stdout = appendBoundedTail(stdout, chunk) })
-      child.stderr?.on('data', (chunk) => { stderr = appendBoundedTail(stderr, chunk) })
+      child.stdout?.on('data', (chunk) => { output = appendBoundedTail(output, chunk) })
+      child.stderr?.on('data', (chunk) => { output = appendBoundedTail(output, chunk) })
       child.once('error', (error: NodeJS.ErrnoException) => {
         if (settled) return
         settled = true
@@ -77,7 +83,7 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
         ))
       })
     })
-    const classification = classifyMsgvaultSyncOutput(`${stdout.toString('utf8')}\n${stderr.toString('utf8')}`)
+    const classification = classifyMsgvaultSyncOutput(output.toString('utf8'))
     if (classification === 'error') {
       throw new Error('REMEDIATION: msgvault sync completed with item errors; inspect msgvault logs')
     }

@@ -5,6 +5,7 @@ export const IDLE_SYNC_MAX_MS = 600_000
 export const IDLE_AFTER_EMPTY_RUNS = 3
 export const SUSPEND_HEARTBEAT_MS = 30_000
 export const SUSPEND_LATE_AFTER_MS = 60_000
+export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 export interface SyncRunResult {
   changed: boolean
@@ -50,10 +51,13 @@ interface AccountState {
   lastSuccessAt: number | null
   lastError: string | null
   removed: boolean
+  scheduleFailed: boolean
 }
 
-function finitePositive(value: number, name: string): number {
-  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be positive`)
+function finitePositiveTimer(value: number, name: string): number {
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_TIMER_DELAY_MS) {
+    throw new Error(`${name} must be positive and no greater than ${MAX_TIMER_DELAY_MS}`)
+  }
   return value
 }
 
@@ -100,22 +104,25 @@ export class MsgvaultSyncSupervisor {
 
   constructor(deps: MsgvaultSyncSupervisorDependencies, options: MsgvaultSyncSupervisorOptions = {}) {
     this.#deps = deps
-    this.#activeIntervalMs = finitePositive(options.activeIntervalMs ?? ACTIVE_SYNC_INTERVAL_MS, 'activeIntervalMs')
+    this.#activeIntervalMs = finitePositiveTimer(options.activeIntervalMs ?? ACTIVE_SYNC_INTERVAL_MS, 'activeIntervalMs')
     this.#activeJitterFraction = options.activeJitterFraction ?? ACTIVE_SYNC_JITTER_FRACTION
     if (!Number.isFinite(this.#activeJitterFraction) || this.#activeJitterFraction < 0 || this.#activeJitterFraction >= 1) {
       throw new Error('activeJitterFraction must be at least zero and less than one')
     }
-    this.#idleMinMs = finitePositive(options.idleMinMs ?? IDLE_SYNC_MIN_MS, 'idleMinMs')
-    this.#idleMaxMs = finitePositive(options.idleMaxMs ?? IDLE_SYNC_MAX_MS, 'idleMaxMs')
+    if (this.#activeIntervalMs * (1 + this.#activeJitterFraction) > MAX_TIMER_DELAY_MS) {
+      throw new Error(`active jitter upper bound must be no greater than ${MAX_TIMER_DELAY_MS}`)
+    }
+    this.#idleMinMs = finitePositiveTimer(options.idleMinMs ?? IDLE_SYNC_MIN_MS, 'idleMinMs')
+    this.#idleMaxMs = finitePositiveTimer(options.idleMaxMs ?? IDLE_SYNC_MAX_MS, 'idleMaxMs')
     if (this.#idleMaxMs < this.#idleMinMs) throw new Error('idleMaxMs must be >= idleMinMs')
     this.#idleAfterEmptyRuns = positiveSafeInteger(options.idleAfterEmptyRuns ?? IDLE_AFTER_EMPTY_RUNS, 'idleAfterEmptyRuns')
-    this.#heartbeatMs = finitePositive(options.heartbeatMs ?? SUSPEND_HEARTBEAT_MS, 'heartbeatMs')
-    this.#suspendLateAfterMs = finitePositive(options.suspendLateAfterMs ?? SUSPEND_LATE_AFTER_MS, 'suspendLateAfterMs')
+    this.#heartbeatMs = finitePositiveTimer(options.heartbeatMs ?? SUSPEND_HEARTBEAT_MS, 'heartbeatMs')
+    this.#suspendLateAfterMs = finitePositiveTimer(options.suspendLateAfterMs ?? SUSPEND_LATE_AFTER_MS, 'suspendLateAfterMs')
   }
 
   start(): Promise<void> {
-    if (this.#startPromise) return this.#startPromise
     if (this.#stopping) return Promise.reject(new Error('sync supervisor is stopping'))
+    if (this.#startPromise) return this.#startPromise
     this.#started = true
     this.#startPromise = (async () => {
       try {
@@ -183,15 +190,25 @@ export class MsgvaultSyncSupervisor {
     return this.#stopPromise
   }
 
+  #clearTimer(handle: unknown, account = ''): void {
+    try { this.#deps.clearTimeout(handle) }
+    catch (error) {
+      const message = sanitizedError(error, account)
+      this.#reportError(message)
+    }
+  }
+
   #clearTimers(): void {
-    if (this.#heartbeat !== null) this.#deps.clearTimeout(this.#heartbeat)
+    const heartbeat = this.#heartbeat
     this.#heartbeat = null
     this.#heartbeatDueAt = null
+    if (heartbeat !== null) this.#clearTimer(heartbeat)
     for (const state of this.#accounts.values()) {
-      if (state.timer !== null) this.#deps.clearTimeout(state.timer)
+      const timer = state.timer
       state.timer = null
       state.nextRunAt = null
       state.followUp = false
+      if (timer !== null) this.#clearTimer(timer, state.account)
     }
   }
 
@@ -210,20 +227,34 @@ export class MsgvaultSyncSupervisor {
 
   #schedule(state: AccountState, delayMs: number): void {
     if (this.#stopping || state.removed) return
-    if (state.timer !== null) this.#deps.clearTimeout(state.timer)
+    const previous = state.timer
+    state.timer = null
+    state.nextRunAt = null
+    if (previous !== null) this.#clearTimer(previous, state.account)
+    let handle: unknown
+    try {
+      handle = this.#deps.setTimeout(() => {
+        if (state.timer !== handle) return
+        state.timer = null
+        state.nextRunAt = null
+        void this.#request(state)
+      }, delayMs)
+    } catch (error) {
+      state.scheduleFailed = true
+      throw error
+    }
+    state.timer = handle
     state.nextRunAt = this.#deps.now() + delayMs
-    state.timer = this.#deps.setTimeout(() => {
-      state.timer = null
-      state.nextRunAt = null
-      void this.#request(state)
-    }, delayMs)
+    state.scheduleFailed = false
   }
 
   #request(state: AccountState): Promise<void> {
     if (this.#stopping || state.removed) return Promise.resolve()
-    if (state.timer !== null) this.#deps.clearTimeout(state.timer)
+    const timer = state.timer
     state.timer = null
     state.nextRunAt = null
+    if (timer !== null) this.#clearTimer(timer, state.account)
+    state.scheduleFailed = false
     if (state.inFlight) {
       state.followUp = true
       return state.inFlight
@@ -266,6 +297,7 @@ export class MsgvaultSyncSupervisor {
       for (const account of discovered) {
         const existing = this.#accounts.get(account)
         if (existing) {
+          if (existing.removed) added.push(existing)
           existing.removed = false
           continue
         }
@@ -279,6 +311,7 @@ export class MsgvaultSyncSupervisor {
           lastSuccessAt: null,
           lastError: null,
           removed: false,
+          scheduleFailed: false,
         }
         this.#accounts.set(account, state)
         added.push(state)
@@ -286,9 +319,10 @@ export class MsgvaultSyncSupervisor {
       for (const state of this.#accounts.values()) {
         if (active.has(state.account)) continue
         state.removed = true
-        if (state.timer !== null) this.#deps.clearTimeout(state.timer)
+        const timer = state.timer
         state.timer = null
         state.nextRunAt = null
+        if (timer !== null) this.#clearTimer(timer, state.account)
         state.followUp = false
         if (!state.inFlight) this.#accounts.delete(state.account)
       }
@@ -303,15 +337,25 @@ export class MsgvaultSyncSupervisor {
 
   #scheduleHeartbeat(): void {
     if (this.#stopping) return
-    this.#heartbeatDueAt = this.#deps.now() + this.#heartbeatMs
-    this.#heartbeat = this.#deps.setTimeout(() => {
+    let handle: unknown
+    const dueAt = this.#deps.now() + this.#heartbeatMs
+    handle = this.#deps.setTimeout(() => {
+      if (this.#heartbeat !== handle) return
       this.#heartbeat = null
       const lateBy = this.#deps.now() - (this.#heartbeatDueAt ?? this.#deps.now())
       this.#heartbeatDueAt = null
-      this.#scheduleHeartbeat()
+      // Execute this tick's work even when a transient timer rearm fails.
       if (lateBy >= this.#suspendLateAfterMs) this.#requestResumeWave()
       else void this.#refreshAndRunAdditions()
+      try { this.#scheduleHeartbeat() }
+      catch (error) {
+        const message = sanitizedError(error, '')
+        this.#reportError(message)
+        for (const state of this.#accounts.values()) state.lastError = message
+      }
     }, this.#heartbeatMs)
+    this.#heartbeat = handle
+    this.#heartbeatDueAt = dueAt
   }
 
   #refreshAndRunAdditions(): Promise<void> {
@@ -319,7 +363,8 @@ export class MsgvaultSyncSupervisor {
     const wave = (async () => {
       try {
         const added = await this.#refreshAccounts()
-        await Promise.all(added.map((state) => this.#request(state)))
+        const recover = [...this.#accounts.values()].filter((state) => state.scheduleFailed && !state.removed)
+        await Promise.all([...new Set([...added, ...recover])].map((state) => this.#request(state)))
       } catch (error) {
         const message = sanitizedError(error, '')
         this.#reportError(message)
