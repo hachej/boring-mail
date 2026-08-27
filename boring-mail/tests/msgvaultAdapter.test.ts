@@ -432,7 +432,8 @@ describe('msgvaultAdapter — unified inbox projection', () => {
         (3,'gmail','disconnected@example.com'), (4,'gmail','unregistered@example.com');
       INSERT INTO conversations(id,source_id,source_conversation_id,conversation_type) VALUES
         (11,1,'a-1','email_thread'), (12,2,'b-1','email_thread'),
-        (13,3,'c-1','email_thread'), (14,4,'d-1','email_thread');
+        (13,3,'c-1','email_thread'), (14,4,'d-1','email_thread'),
+        (15,2,'b-calendar','calendar');
     `)
     const insert = raw.prepare(`INSERT INTO messages(
       id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,
@@ -489,6 +490,12 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
       VALUES(502,'to','disconnected@example.com')`)
 
+    // An email-typed row in a non-email conversation cannot count or win.
+    message(550, 11, 1, '<mixed-conversation@example.com>', '2029-10-30 00:00:00+00:00', 'replyable copy')
+    message(551, 15, 2, '<mixed-conversation@example.com>', '2034-01-01 00:00:00+00:00', 'calendar copy')
+    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
+      VALUES(551,'to','owner-b@example.com')`)
+
     // Both deletion forms and non-email rows never surface.
     message(801, 11, 1, '<local-delete@example.com>', '2033-01-01 00:00:00+00:00', 'local deleted', 'gone')
     message(802, 12, 2, '<provider-delete@example.com>', '2033-01-01 00:00:00+00:00', 'provider deleted', null, 'gone')
@@ -521,7 +528,21 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     expect(items.find((item) => item.rfc822MessageId === '<connected@example.com>')).toMatchObject({
       messageId: 501, sourceId: 1, coalesced: false, copyCount: 1,
     })
-    expect(items.some((item) => [502, 503, 801, 802, 803].includes(item.messageId))).toBe(false)
+    expect(items.some((item) => [502, 503, 551, 801, 802, 803].includes(item.messageId))).toBe(false)
+    expect(items.find((item) => item.rfc822MessageId === '<mixed-conversation@example.com>')).toMatchObject({
+      messageId: 550, sourceId: 1, coalesced: false, copyCount: 1,
+    })
+  })
+
+  it('returns only replyable ownership for every correlated item', () => {
+    const items = listUnifiedInbox(store.db, eligible, authority, { limit: 200 }).items
+    for (const item of items) {
+      if (item.rfc822MessageId === null) continue
+      expect(resolveReplyTarget(store.db, item.messageId)).toEqual({
+        rfc822MessageId: item.rfc822MessageId,
+        sourceId: item.sourceId,
+      })
+    }
   })
 
   it('keeps null/malformed identities distinct and rejects them as reply targets', () => {
@@ -544,7 +565,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     const expected = [
       101, 202, 302, 402, 601, 602, 604, 603,
       700, 702, 701, 704, 703, 706, 705, 708, 707, 710, 709, 712, 711,
-      714, 713, 716, 715, 718, 717, 720, 719, 722, 721, 723, 501, 606, 605,
+      714, 713, 716, 715, 718, 717, 720, 719, 722, 721, 723, 501, 550, 606, 605,
     ]
     const seen: number[] = []
     let cursor: string | undefined
@@ -618,16 +639,16 @@ describe('msgvaultAdapter — unified inbox projection', () => {
 
   it('fails loudly on malformed storage classes and invalid page input', () => {
     raw.prepare(`INSERT INTO sources(id,source_type,identifier) VALUES(5,'gmail',?)`).run(Buffer.from('bad'))
-    raw.exec(`INSERT INTO conversations(id,source_id,conversation_type) VALUES(15,5,'email_thread');
+    raw.exec(`INSERT INTO conversations(id,source_id,conversation_type) VALUES(17,5,'email_thread');
       INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,is_read,attachment_count)
-      VALUES(950,15,5,'<bad-storage@example.com>','email','2036-01-01',1,0)`)
+      VALUES(950,17,5,'<bad-storage@example.com>','email','2036-01-01',1,0)`)
     expect(() => listUnifiedInbox(
       store.db, [{ sourceId: 5, identities: ['bad@example.com'] }], authority,
     )).toThrow(/source_identifier must be non-empty text/)
     raw.exec(`INSERT INTO sources(id,source_type,identifier) VALUES(6,'gmail','time@example.com');
-      INSERT INTO conversations(id,source_id,conversation_type) VALUES(16,6,'email_thread');
+      INSERT INTO conversations(id,source_id,conversation_type) VALUES(18,6,'email_thread');
       INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,is_read,attachment_count)
-      VALUES(951,16,6,'<bad-time@example.com>','email','2036-01-01T00:00:00+01:00',1,0)`)
+      VALUES(951,18,6,'<bad-time@example.com>','email','2036-01-01T00:00:00+01:00',1,0)`)
     expect(() => listUnifiedInbox(
       store.db, [{ sourceId: 6, identities: ['time@example.com'] }], authority,
     )).toThrowError(expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/canonical UTC/) }))

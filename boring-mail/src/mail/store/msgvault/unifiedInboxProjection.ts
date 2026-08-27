@@ -221,8 +221,11 @@ function readCursor(
   if (normalized.t !== null) canonicalUtcTimestamp(normalized.t, 'cursor timestamp', 'invalid_input')
   return normalized
 }
-function liveEmail(alias: string): string {
-  return `${alias}.message_type='email' AND ${alias}.deleted_at IS NULL AND ${alias}.deleted_from_source_at IS NULL`
+function liveMessage(alias: string): string {
+  return `${alias}.deleted_at IS NULL AND ${alias}.deleted_from_source_at IS NULL`
+}
+function replyableEmail(message: string, conversation: string): string {
+  return `${liveMessage(message)} AND ${message}.message_type='email' AND ${conversation}.conversation_type='email_thread'`
 }
 function requireUnifiedCapabilities(db: DatabaseSync): MsgvaultIndexCapabilities {
   const capabilities = indexCapabilities.get(db)
@@ -287,6 +290,7 @@ function decodeUnifiedInboxItem(row: Record<string, unknown>): UnifiedInboxItem 
 type UnifiedKeysetMode = 'all' | 'before-timestamp' | 'all-null' | 'before-null'
 export type UnifiedQueryStrategy = 'recent-window' | 'source-fallback'
 const MIN_RECENT_SCAN_WINDOW = 2_000
+const MAX_RECENT_CORRELATION_COPIES = 64
 
 function unifiedInboxSql(
   capabilities: MsgvaultIndexCapabilities,
@@ -305,84 +309,148 @@ function unifiedInboxSql(
       AND lower(recipient.recipient_type) IN ('to','cc')
   )`
   const timestamp = 'COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date)'
-  const keyset = mode === 'before-timestamp'
-    ? `AND ${timestamp} IS NOT NULL
-       AND ${timestamp}<=?
-       AND (${timestamp}<? OR candidate.id<?)`
+  const keysetFor = (time: string, id: string): string => mode === 'before-timestamp'
+    ? `AND ${time} IS NOT NULL
+       AND ${time}<=?
+       AND (${time}<? OR ${id}<?)`
     : mode === 'all-null'
-      ? `AND ${timestamp} IS NULL`
+      ? `AND ${time} IS NULL`
       : mode === 'before-null'
-        ? `AND ${timestamp} IS NULL AND candidate.id<?`
+        ? `AND ${time} IS NULL AND ${id}<?`
         : ''
-  const recentCte = strategy === 'recent-window' ? `,
-    recent_candidates AS MATERIALIZED (
+  const candidateKeyset = keysetFor(timestamp, 'candidate.id')
+  const representativeKeyset = keysetFor('ranked.message_at', 'ranked.message_id')
+  const eligibleSources = `eligible_sources AS NOT MATERIALIZED (
+    SELECT CAST(json_extract(value,'$.sourceId') AS INTEGER) AS source_id,
+           json_extract(value,'$.identities') AS identities_json
+      FROM json_each(?)
+  )`
+
+  if (strategy === 'source-fallback') {
+    return `
+      WITH ${eligibleSources},
+      source_candidates AS MATERIALIZED (
+        SELECT candidate.id AS message_id,
+               candidate.conversation_id,
+               candidate.source_id,
+               source.identifier AS source_identifier,
+               boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
+               candidate.subject,
+               candidate.snippet,
+               ${timestamp} AS message_at,
+               candidate.is_read,
+               candidate.attachment_count,
+               CASE WHEN boring_mail_message_id(candidate.rfc822_message_id) IS NULL
+                    THEN '#'||candidate.id ELSE candidate.rfc822_message_id END AS correlation_key,
+               ${addressed('candidate', 'candidate_source')} AS addressed
+          FROM eligible_sources candidate_source
+          JOIN messages candidate INDEXED BY ${sourceIndex}
+            ON candidate.source_id=candidate_source.source_id
+          JOIN conversations conversation
+            ON conversation.id=candidate.conversation_id
+           AND conversation.source_id=candidate.source_id
+          JOIN sources source ON source.id=candidate.source_id
+         WHERE ${replyableEmail('candidate', 'conversation')}
+      ),
+      ranked_candidates AS MATERIALIZED (
+        SELECT source_candidates.*,
+               count(*) OVER (PARTITION BY correlation_key) AS copy_count,
+               row_number() OVER (
+                 PARTITION BY correlation_key
+                 ORDER BY addressed DESC,message_at DESC NULLS LAST,source_id ASC,message_id ASC
+               ) AS representative_rank
+          FROM source_candidates
+      )
+      SELECT message_id,conversation_id,source_id,source_identifier,
+             valid_rfc822_message_id,subject,snippet,message_at,is_read,
+             attachment_count,copy_count
+        FROM ranked_candidates ranked
+       WHERE representative_rank=1
+         ${representativeKeyset}
+       ORDER BY message_at DESC NULLS LAST,message_id DESC
+       LIMIT ?
+    `
+  }
+
+  return `
+    WITH ${eligibleSources},
+    recent_rows AS MATERIALIZED (
       SELECT candidate.*
         FROM messages candidate INDEXED BY ${liveIndex}
-       WHERE ${liveEmail('candidate')}
-         ${keyset}
+       WHERE ${liveMessage('candidate')}
+         ${candidateKeyset}
        ORDER BY ${timestamp} DESC NULLS LAST,candidate.id DESC
        LIMIT ?
-    )` : ''
-  const candidateFrom = strategy === 'recent-window'
-    ? `recent_candidates candidate
-       JOIN eligible_sources candidate_source ON candidate_source.source_id=candidate.source_id`
-    : `eligible_sources candidate_source
-       JOIN messages candidate INDEXED BY ${sourceIndex}
-         ON candidate.source_id=candidate_source.source_id`
-  const outerKeyset = strategy === 'source-fallback' ? keyset : ''
-  const outerLive = strategy === 'source-fallback' ? liveEmail('candidate') : '1=1'
-  return `
-    WITH eligible_sources AS NOT MATERIALIZED (
-      SELECT CAST(json_extract(value,'$.sourceId') AS INTEGER) AS source_id,
-             json_extract(value,'$.identities') AS identities_json
-        FROM json_each(?)
-    )${recentCte}
+    ),
+    recent_candidates AS MATERIALIZED (
+      SELECT candidate.*,
+             boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
+             CASE WHEN boring_mail_message_id(candidate.rfc822_message_id) IS NULL
+                  THEN '#'||candidate.id ELSE candidate.rfc822_message_id END AS correlation_key
+        FROM recent_rows candidate
+        JOIN eligible_sources candidate_source ON candidate_source.source_id=candidate.source_id
+        JOIN conversations conversation
+          ON conversation.id=candidate.conversation_id
+         AND conversation.source_id=candidate.source_id
+       WHERE ${replyableEmail('candidate', 'conversation')}
+    ),
+    recent_correlations AS MATERIALIZED (
+      SELECT correlation_key,valid_rfc822_message_id,min(id) AS row_id,count(*) AS recent_copy_count
+        FROM recent_candidates
+       GROUP BY correlation_key,valid_rfc822_message_id
+    ),
+    recent_safety AS MATERIALIZED (
+      SELECT coalesce(max(recent_copy_count),0)<=${MAX_RECENT_CORRELATION_COPIES} AS safe
+        FROM recent_correlations
+    ),
+    selected_correlations AS MATERIALIZED (
+      SELECT correlation.correlation_key,
+             CASE WHEN safety.safe=0 THEN NULL
+                  WHEN correlation.valid_rfc822_message_id IS NULL THEN correlation.row_id ELSE (
+               SELECT primary_copy.id
+                 FROM messages primary_copy INDEXED BY ${rfc822Index}
+                 JOIN eligible_sources primary_source ON primary_source.source_id=primary_copy.source_id
+                 JOIN conversations primary_conversation
+                   ON primary_conversation.id=primary_copy.conversation_id
+                  AND primary_conversation.source_id=primary_copy.source_id
+                WHERE primary_copy.rfc822_message_id=correlation.valid_rfc822_message_id
+                  AND ${replyableEmail('primary_copy', 'primary_conversation')}
+                ORDER BY ${addressed('primary_copy', 'primary_source')} DESC,
+                         COALESCE(primary_copy.sent_at,primary_copy.received_at,primary_copy.internal_date) DESC NULLS LAST,
+                         primary_copy.source_id ASC,primary_copy.id ASC
+                LIMIT 1
+             ) END AS message_id,
+             CASE WHEN safety.safe=0 THEN 0
+                  WHEN correlation.valid_rfc822_message_id IS NULL THEN 1 ELSE (
+               SELECT count(*)
+                 FROM messages copy INDEXED BY ${rfc822Index}
+                 JOIN eligible_sources copy_source ON copy_source.source_id=copy.source_id
+                 JOIN conversations copy_conversation
+                   ON copy_conversation.id=copy.conversation_id
+                  AND copy_conversation.source_id=copy.source_id
+                WHERE copy.rfc822_message_id=correlation.valid_rfc822_message_id
+                  AND ${replyableEmail('copy', 'copy_conversation')}
+             ) END AS copy_count
+        FROM recent_correlations correlation
+        CROSS JOIN recent_safety safety
+       WHERE safety.safe=1
+    )
     SELECT candidate.id AS message_id,
            candidate.conversation_id,
            candidate.source_id,
            source.identifier AS source_identifier,
-           boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
+           candidate.valid_rfc822_message_id,
            candidate.subject,
            candidate.snippet,
-           ${timestamp} AS message_at,
+           COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) AS message_at,
            candidate.is_read,
            candidate.attachment_count,
-           CASE WHEN boring_mail_message_id(candidate.rfc822_message_id) IS NULL THEN 1 ELSE (
-             SELECT count(*)
-               FROM messages copy INDEXED BY ${rfc822Index}
-               JOIN eligible_sources copy_source ON copy_source.source_id=copy.source_id
-               JOIN conversations copy_conversation
-                 ON copy_conversation.id=copy.conversation_id
-                AND copy_conversation.source_id=copy.source_id
-              WHERE copy.rfc822_message_id=candidate.rfc822_message_id
-                AND ${liveEmail('copy')}
-           ) END AS copy_count
-      FROM ${candidateFrom}
+           selected.copy_count
+      FROM selected_correlations selected
+      JOIN recent_candidates candidate ON candidate.id=selected.message_id
       JOIN sources source ON source.id=candidate.source_id
-      JOIN conversations conversation
-        ON conversation.id=candidate.conversation_id
-       AND conversation.source_id=candidate.source_id
-     WHERE ${outerLive}
-       ${outerKeyset}
-       AND (
-         boring_mail_message_id(candidate.rfc822_message_id) IS NULL OR
-         candidate.id=(
-           SELECT primary_copy.id
-             FROM messages primary_copy INDEXED BY ${rfc822Index}
-             JOIN eligible_sources primary_source ON primary_source.source_id=primary_copy.source_id
-             JOIN conversations primary_conversation
-               ON primary_conversation.id=primary_copy.conversation_id
-              AND primary_conversation.source_id=primary_copy.source_id
-            WHERE primary_copy.rfc822_message_id=candidate.rfc822_message_id
-              AND ${liveEmail('primary_copy')}
-            ORDER BY ${addressed('primary_copy', 'primary_source')} DESC,
-                     COALESCE(primary_copy.sent_at,primary_copy.received_at,primary_copy.internal_date) DESC NULLS LAST,
-                     primary_copy.source_id ASC,
-                     primary_copy.id ASC
-            LIMIT 1
-         )
-       )
-     ORDER BY ${timestamp} DESC NULLS LAST,candidate.id DESC
+     ORDER BY COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) DESC NULLS LAST,
+              candidate.id DESC
      LIMIT ?
   `
 }

@@ -172,7 +172,7 @@ export interface UnifiedInboxItem {
 }
 export interface UnifiedInboxOptions {
   limit?: number
-  /** Opaque, signed cursor returned by the preceding page. */
+  /** Opaque, generation-bound cursor; canonical but intentionally not authenticated or signed. */
   cursor?: string
 }
 export interface UnifiedInboxPage {

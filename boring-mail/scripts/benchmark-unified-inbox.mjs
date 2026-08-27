@@ -33,7 +33,11 @@ function timedPage(db, eligible, authority, options) {
   return { page, elapsedMs: Number((performance.now() - started).toFixed(2)) }
 }
 
-function runScenario(name, total, ineligiblePrefix) {
+function runScenario(name, options) {
+  const { total, ineligiblePrefix = 0, nonEmailPrefix = 0, highFanout = 0 } = options
+  if (ineligiblePrefix && nonEmailPrefix) throw new Error('benchmark prefixes are mutually exclusive')
+  const prefix = ineligiblePrefix + nonEmailPrefix
+  const eligibleCount = total - prefix
   const root = mkdtempSync(join(tmpdir(), `boring-mail-${name}-`))
   const path = join(root, 'msgvault.db')
   const writer = new DatabaseSync(path)
@@ -44,7 +48,8 @@ function runScenario(name, total, ineligiblePrefix) {
       INSERT INTO conversations VALUES
         (1,1,'email_thread',NULL,0,0,NULL,NULL),
         (2,2,'email_thread',NULL,0,0,NULL,NULL),
-        (3,3,'email_thread',NULL,0,0,NULL,NULL);
+        (3,3,'email_thread',NULL,0,0,NULL,NULL),
+        (4,2,'calendar',NULL,0,0,NULL,NULL);
     `)
     if (ineligiblePrefix > 0) {
       writer.exec(`WITH RECURSIVE n(x) AS (
@@ -52,17 +57,26 @@ function runScenario(name, total, ineligiblePrefix) {
       ) INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,is_read,attachment_count)
         SELECT x,1,1,'<'||x||'@archive.test>','email',datetime('2040-01-01','-'||x||' seconds')||'+00:00',1,0 FROM n`)
     }
-    const eligibleCount = total - ineligiblePrefix
+    if (nonEmailPrefix > 0) {
+      writer.exec(`WITH RECURSIVE n(x) AS (
+        VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<${nonEmailPrefix}
+      ) INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,is_read,attachment_count)
+        SELECT x,4,2,'<'||x||'@calendar.test>','calendar',datetime('2040-01-01','-'||x||' seconds')||'+00:00',1,0 FROM n`)
+    }
     writer.exec(`WITH RECURSIVE n(x) AS (
       VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<${eligibleCount}
     ) INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,is_read,attachment_count)
-      SELECT ${ineligiblePrefix}+x,2,2,
-        CASE WHEN x<=1000 THEN '<duplicate-'||CAST((x+1)/2 AS INTEGER)||'@bench.test>' ELSE '<eligible-'||x||'@bench.test>' END,
+      SELECT ${prefix}+x,2,2,
+        CASE
+          WHEN ${highFanout}>0 AND x<=${highFanout} THEN '<high-fanout@bench.test>'
+          WHEN ${highFanout}=0 AND x<=1000 THEN '<duplicate-'||CAST((x+1)/2 AS INTEGER)||'@bench.test>'
+          ELSE '<eligible-'||x||'@bench.test>'
+        END,
         'email',datetime('2030-01-01','-'||x||' seconds')||'+00:00',1,0 FROM n`)
-    // Half of the first 1,000 eligible rows are duplicate losers on another
-    // connected source, exercising representative rejection after the sparse scan.
-    writer.exec(`UPDATE messages SET conversation_id=3,source_id=3
-      WHERE id>${ineligiblePrefix} AND id<=${ineligiblePrefix + Math.min(1000, eligibleCount)} AND id%2=0`)
+    if (highFanout === 0) {
+      writer.exec(`UPDATE messages SET conversation_id=3,source_id=3
+        WHERE id>${prefix} AND id<=${prefix + Math.min(1000, eligibleCount)} AND id%2=0`)
+    }
   } finally {
     writer.close()
   }
@@ -74,28 +88,61 @@ function runScenario(name, total, ineligiblePrefix) {
       { sourceId: 3, identities: ['alias@example.test'] },
     ]
     const authority = { scope: `benchmark-${name}` }
-    const first = timedPage(store.db, eligible, authority, { limit: 200 })
-    if (!first.page.nextCursor) throw new Error(`${name} did not produce a deep cursor`)
-    const deep = timedPage(store.db, eligible, authority, { limit: 200, cursor: first.page.nextCursor })
-    const after = {
-      messageAt: first.page.items.at(-1)?.messageAt ?? null,
-      messageId: first.page.items.at(-1)?.messageId ?? 1,
+    const expectedIds = []
+    for (let x = 1; x <= eligibleCount; x++) {
+      if (highFanout > 0 ? x > 1 && x <= highFanout : x <= 1000 && x % 2 === 0) continue
+      expectedIds.push(prefix + x)
     }
-    const plan = {
-      recentWindow: explainUnifiedInboxQueryPlan(store.db, eligible, after, 'recent-window')
-        .filter((detail) => /(?:SCAN|SEARCH) candidate USING INDEX/.test(detail)),
-      sourceFallback: explainUnifiedInboxQueryPlan(store.db, eligible, after, 'source-fallback')
-        .filter((detail) => /(?:SCAN|SEARCH) candidate USING INDEX/.test(detail)),
+
+    const pages = []
+    const seen = []
+    let cursor
+    for (let pageNumber = 0; pageNumber < 5 && seen.length < expectedIds.length; pageNumber++) {
+      const timed = timedPage(store.db, eligible, authority, { limit: 200, ...(cursor ? { cursor } : {}) })
+      pages.push(timed.elapsedMs)
+      seen.push(...timed.page.items.map((item) => item.messageId))
+      cursor = timed.page.nextCursor ?? undefined
+      if (!cursor) break
+    }
+    const expected = expectedIds.slice(0, seen.length)
+    if (JSON.stringify(seen) !== JSON.stringify(expected) || new Set(seen).size !== seen.length) {
+      throw new Error(`${name} traversal differs from the synthetic oracle`)
+    }
+    if (seen.length < Math.min(800, expectedIds.length)) {
+      throw new Error(`${name} did not traverse a meaningful deep page`)
+    }
+    const first = listUnifiedInbox(store.db, eligible, authority, { limit: 200 })
+    if (highFanout > 0) {
+      const group = first.items.find((item) => item.rfc822MessageId === '<high-fanout@bench.test>')
+      if (!group || group.messageId !== prefix + 1 || group.copyCount !== highFanout || !group.coalesced) {
+        throw new Error(`${name} high-fanout group was not coalesced exactly once`)
+      }
+    }
+    const after = {
+      messageAt: first.items.at(-1)?.messageAt ?? null,
+      messageId: first.items.at(-1)?.messageId ?? 1,
+    }
+    const recentPlan = explainUnifiedInboxQueryPlan(store.db, eligible, after, 'recent-window')
+    const fallbackPlan = explainUnifiedInboxQueryPlan(store.db, eligible, after, 'source-fallback')
+    const recentEvidence = recentPlan.filter((detail) => /(?:SCAN|SEARCH) candidate USING INDEX/.test(detail))
+    const fallbackEvidence = fallbackPlan.filter((detail) => /(?:SCAN|SEARCH) candidate USING INDEX/.test(detail))
+    if (!recentEvidence.some((detail) => /live_message_recency/.test(detail))) {
+      throw new Error(`${name} recent plan does not use live_message_recency`)
+    }
+    if (!fallbackEvidence.some((detail) => /SEARCH candidate USING INDEX messages_by_source/.test(detail))) {
+      throw new Error(`${name} fallback plan does not search messages_by_source`)
     }
     return {
       name,
       total,
       ineligiblePrefix,
-      firstPageMs: first.elapsedMs,
-      deepPageMs: deep.elapsedMs,
-      firstCount: first.page.items.length,
-      deepCount: deep.page.items.length,
-      plan,
+      nonEmailPrefix,
+      highFanout,
+      firstPageMs: pages[0],
+      deepPageMs: pages.at(-1),
+      traversed: seen.length,
+      exactOracle: true,
+      plan: { recentWindow: recentEvidence, sourceFallback: fallbackEvidence },
     }
   } finally {
     store.db.close()
@@ -104,13 +151,14 @@ function runScenario(name, total, ineligiblePrefix) {
 }
 
 const results = [
-  runScenario('baseline-100k', 100_000, 0),
-  runScenario('sparse-500k', 500_000, 498_000),
+  runScenario('baseline-100k', { total: 100_000 }),
+  runScenario('sparse-500k', { total: 500_000, ineligiblePrefix: 498_000 }),
+  runScenario('non-email-prefix-100k', { total: 100_000, nonEmailPrefix: 98_000 }),
+  runScenario('high-fanout-50k', { total: 50_000, highFanout: 30_000 }),
 ]
 console.log(JSON.stringify(results, null, 2))
-if (results.some((result) => result.firstCount !== 200 || result.deepCount !== 200)) process.exit(1)
-// This is an evidence tripwire, not a microbenchmark promise. Multi-second
-// first-page latency means the read-only archive needs a new indexed seam.
-if (results[1].firstPageMs > 2_000) {
-  throw new Error(`sparse 500k first page is not interactive: ${results[1].firstPageMs}ms`)
+// Evidence tripwire, not a microbenchmark promise. Multi-second first-page
+// latency means the read-only archive needs a different indexed seam.
+if (results.some((result) => result.firstPageMs > 2_000)) {
+  throw new Error('a scale scenario exceeded the interactive evidence bound')
 }
