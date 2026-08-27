@@ -1,0 +1,183 @@
+import { DatabaseSync } from 'node:sqlite'
+import { ProductStoreError } from './types.js'
+
+export const PRODUCT_SCHEMA_VERSION = 1
+
+const V1_SCHEMA = `
+CREATE TABLE mail_accounts (
+ account_id TEXT PRIMARY KEY, provider_source_id INTEGER NOT NULL UNIQUE,
+ primary_address TEXT NOT NULL,
+ send_as_json TEXT NOT NULL CHECK(json_valid(send_as_json) AND json_type(send_as_json)='array'),
+ connected INTEGER NOT NULL CHECK(connected IN(0,1)), created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL
+) STRICT;
+CREATE TABLE mail_drafts (
+ id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, revision INTEGER NOT NULL CHECK(revision>0),
+ account_id TEXT NOT NULL REFERENCES mail_accounts(account_id), send_as_address TEXT NOT NULL,
+ reply_message_id INTEGER, reply_rfc822_message_id TEXT, reply_source_id INTEGER,
+ to_json TEXT NOT NULL CHECK(json_valid(to_json) AND json_type(to_json)='array'),
+ cc_json TEXT NOT NULL CHECK(json_valid(cc_json) AND json_type(cc_json)='array'),
+ bcc_json TEXT NOT NULL CHECK(json_valid(bcc_json) AND json_type(bcc_json)='array'),
+ subject TEXT NOT NULL, body_markdown TEXT NOT NULL,
+ attachments_json TEXT NOT NULL CHECK(json_valid(attachments_json) AND json_type(attachments_json)='array'),
+ content_digest TEXT NOT NULL, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+ CHECK((reply_message_id IS NULL)=(reply_rfc822_message_id IS NULL) AND (reply_message_id IS NULL)=(reply_source_id IS NULL))
+) STRICT;
+CREATE TABLE mail_outbox (
+ id TEXT PRIMARY KEY, draft_id TEXT NOT NULL REFERENCES mail_drafts(id),
+ draft_revision INTEGER NOT NULL CHECK(draft_revision>0), account_id TEXT NOT NULL REFERENCES mail_accounts(account_id),
+ send_as_address TEXT NOT NULL, reply_message_id INTEGER, reply_rfc822_message_id TEXT, reply_source_id INTEGER,
+ to_json TEXT NOT NULL CHECK(json_valid(to_json) AND json_type(to_json)='array'),
+ cc_json TEXT NOT NULL CHECK(json_valid(cc_json) AND json_type(cc_json)='array'),
+ bcc_json TEXT NOT NULL CHECK(json_valid(bcc_json) AND json_type(bcc_json)='array'),
+ subject TEXT NOT NULL, body_markdown TEXT NOT NULL,
+ attachments_json TEXT NOT NULL CHECK(json_valid(attachments_json) AND json_type(attachments_json)='array'),
+ message_id TEXT NOT NULL, content_digest TEXT NOT NULL, operation_key TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN('pending_approval','approved','claimed','dispatched','unknown','human_decision','sent','failed','rejected','cancelled','stale')),
+ approval_cap_hash TEXT, approval_session_hash TEXT, approval_expires_ms INTEGER, approval_consumed_ms INTEGER,
+ lease_owner TEXT, lease_expires_ms INTEGER, pre_dispatch_history_id TEXT,
+ reconcile_deadline_ms INTEGER, reconcile_next_ms INTEGER, reconcile_attempts INTEGER, reconcile_detail TEXT,
+ provider_message_id TEXT, delivery_basis TEXT, failure_code TEXT, failure_detail TEXT,
+ terminal_reason TEXT, retry_of TEXT REFERENCES mail_outbox(id), created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+ UNIQUE(account_id,message_id), UNIQUE(account_id,operation_key),
+ CHECK((reply_message_id IS NULL)=(reply_rfc822_message_id IS NULL) AND (reply_message_id IS NULL)=(reply_source_id IS NULL)),
+ CHECK((approval_cap_hash IS NULL)=(approval_session_hash IS NULL) AND (approval_cap_hash IS NULL)=(approval_expires_ms IS NULL)),
+ CHECK(status='pending_approval' OR (approval_cap_hash IS NULL AND approval_session_hash IS NULL AND approval_expires_ms IS NULL)),
+ CHECK(status IN('pending_approval','rejected') OR approval_consumed_ms IS NOT NULL OR status='stale'),
+ CHECK(status NOT IN('pending_approval','rejected') OR approval_consumed_ms IS NULL),
+ CHECK(status IN('claimed','dispatched') OR (lease_owner IS NULL AND lease_expires_ms IS NULL)),
+ CHECK(status NOT IN('claimed','dispatched') OR (lease_owner IS NOT NULL AND lease_expires_ms IS NOT NULL)),
+ CHECK((lease_owner IS NULL)=(lease_expires_ms IS NULL)),
+ CHECK(
+   (pre_dispatch_history_id IS NOT NULL AND (
+     status IN('dispatched','unknown','human_decision','sent','failed') OR
+     (status='cancelled' AND terminal_reason='retry')
+   )) OR
+   (pre_dispatch_history_id IS NULL AND (
+     status IN('pending_approval','approved','claimed','rejected','stale') OR
+     (status='cancelled' AND terminal_reason='cancelled')
+   ))
+ ),
+ CHECK(status IN('unknown','human_decision') OR (reconcile_deadline_ms IS NULL AND reconcile_next_ms IS NULL AND reconcile_attempts IS NULL AND reconcile_detail IS NULL)),
+ CHECK(status!='unknown' OR (reconcile_deadline_ms IS NOT NULL AND reconcile_next_ms IS NOT NULL AND reconcile_attempts IS NOT NULL AND reconcile_detail IS NOT NULL)),
+ CHECK(status!='human_decision' OR (reconcile_deadline_ms IS NOT NULL AND reconcile_next_ms IS NULL AND reconcile_attempts IS NOT NULL AND reconcile_detail IS NOT NULL)),
+ CHECK(reconcile_attempts IS NULL OR reconcile_attempts>=0),
+ CHECK(status!='sent' OR ((delivery_basis='provider' AND provider_message_id IS NOT NULL) OR (delivery_basis='human' AND provider_message_id IS NULL))),
+ CHECK(status='sent' OR (delivery_basis IS NULL AND provider_message_id IS NULL)),
+ CHECK(status!='failed' OR (failure_code IS NOT NULL AND failure_detail IS NOT NULL)),
+ CHECK(status='failed' OR (failure_code IS NULL AND failure_detail IS NULL)),
+ CHECK(status!='cancelled' OR terminal_reason IN('cancelled','retry')),
+ CHECK(status='cancelled' OR terminal_reason IS NULL)
+) STRICT;
+CREATE INDEX idx_mail_outbox_status ON mail_outbox(status,account_id);
+CREATE INDEX idx_mail_outbox_reconcile ON mail_outbox(status,reconcile_next_ms);
+CREATE TRIGGER mail_outbox_snapshot_immutable BEFORE UPDATE OF
+ draft_id,draft_revision,account_id,send_as_address,reply_message_id,reply_rfc822_message_id,reply_source_id,
+ to_json,cc_json,bcc_json,subject,body_markdown,attachments_json,message_id,content_digest,operation_key,retry_of
+ON mail_outbox BEGIN SELECT RAISE(ABORT,'mail_outbox send snapshot is immutable'); END;
+CREATE TRIGGER mail_outbox_history_immutable BEFORE UPDATE OF pre_dispatch_history_id ON mail_outbox
+WHEN OLD.pre_dispatch_history_id IS NOT NULL OR NEW.status!='dispatched'
+BEGIN SELECT RAISE(ABORT,'mail_outbox dispatch history is immutable'); END;
+CREATE TABLE mail_attention (
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN('approval_required','send_unknown')),
+ account_id TEXT NOT NULL REFERENCES mail_accounts(account_id),
+ outbox_id TEXT NOT NULL REFERENCES mail_outbox(id), title TEXT NOT NULL, detail TEXT NOT NULL,
+ resolved_ms INTEGER, created_ms INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_mail_attention_open ON mail_attention(resolved_ms,created_ms);
+CREATE UNIQUE INDEX idx_mail_attention_unique_open ON mail_attention(outbox_id,kind) WHERE resolved_ms IS NULL;
+`
+
+interface SchemaObject { type: string; name: string; sql: string }
+/** Collapse formatting whitespace without changing quoted SQL tokens. */
+function canonicalSql(sql: string): string {
+  let result = ''
+  let quote: "'" | '"' | '`' | '[' | null = null
+  let space = false
+  for (let i = 0; i < sql.length; i++) {
+    const char = sql[i]
+    if (quote) {
+      result += char
+      const close = quote === '[' ? ']' : quote
+      if (char === close) {
+        if (quote !== '[' && sql[i + 1] === close) result += sql[++i]
+        else quote = null
+      }
+      continue
+    }
+    if (char === "'" || char === '"' || char === '`' || char === '[') {
+      if (space && result) result += ' '
+      space = false
+      quote = char
+      result += char
+    } else if (/\s/.test(char)) {
+      space = true
+    } else {
+      if (space && result) result += ' '
+      space = false
+      result += char
+    }
+  }
+  return result.trim()
+}
+function manifest(db: DatabaseSync): Map<string, string> {
+  const rows = db.prepare(`
+    SELECT type,name,sql FROM sqlite_master
+    WHERE type IN('table','index','trigger','view') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+  `).all() as unknown as SchemaObject[]
+  return new Map(rows.map((row) => [`${row.type}:${row.name}`, canonicalSql(row.sql)]))
+}
+let expectedManifest: Map<string, string> | undefined
+function expected(): Map<string, string> {
+  if (expectedManifest) return expectedManifest
+  const reference = new DatabaseSync(':memory:')
+  try {
+    reference.exec('PRAGMA foreign_keys=ON')
+    reference.exec(V1_SCHEMA)
+    expectedManifest = manifest(reference)
+    return expectedManifest
+  } finally {
+    reference.close()
+  }
+}
+function validate(db: DatabaseSync): void {
+  const actual = manifest(db)
+  const wanted = expected()
+  for (const [object, definition] of wanted) {
+    const found = actual.get(object)
+    if (found === undefined) throw new ProductStoreError('unsupported_schema', `current schema missing ${object}`)
+    if (found !== definition) throw new ProductStoreError('unsupported_schema', `current schema definition mismatch: ${object}`)
+  }
+  for (const object of actual.keys()) {
+    if (!wanted.has(object)) throw new ProductStoreError('unsupported_schema', `current schema has unexpected ${object}`)
+  }
+  const integrity = db.prepare('PRAGMA integrity_check').all() as Array<{ integrity_check: string }>
+  if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
+    throw new ProductStoreError('corrupt_data', 'product database integrity check failed')
+  }
+  if (db.prepare('PRAGMA foreign_key_check').all().length) {
+    throw new ProductStoreError('corrupt_data', 'product database has foreign-key violations')
+  }
+}
+
+export function migrateProductDatabase(db: DatabaseSync): void {
+  db.exec('PRAGMA foreign_keys=ON')
+  db.exec('PRAGMA busy_timeout=5000')
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const version = Number((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)
+    if (version > PRODUCT_SCHEMA_VERSION) {
+      throw new ProductStoreError('unsupported_schema', `product database schema ${version} is newer than supported ${PRODUCT_SCHEMA_VERSION}`)
+    }
+    if (version === 0) {
+      const existing = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'mail_%'`).all()
+      if (existing.length) throw new ProductStoreError('unsupported_schema', 'unversioned product tables found')
+      db.exec(V1_SCHEMA)
+      db.exec(`PRAGMA user_version=${PRODUCT_SCHEMA_VERSION}`)
+    }
+    validate(db)
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}

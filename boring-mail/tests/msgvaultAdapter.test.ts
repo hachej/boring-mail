@@ -10,10 +10,12 @@ import { DatabaseSync } from 'node:sqlite'
 import {
   attachmentAbsolutePath,
   getThreadMessages,
+  hasMessageAtSource,
   listAttachments,
   listThreads,
   openMsgvaultStore,
   readRawMessage,
+  resolveReplyTarget,
   searchMessages,
 } from '../src/mail/store/msgvaultAdapter.js'
 
@@ -88,7 +90,13 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
 );
 `
 
-function mimeMessage(opts: { from: string; to: string; subject: string; body: string; messageId: string }): Buffer {
+function mimeMessage(opts: {
+  from: string
+  to: string
+  subject: string
+  body: string
+  messageId: string
+}): Buffer {
   const raw = [
     `From: ${opts.from}`,
     `To: ${opts.to}`,
@@ -144,7 +152,9 @@ describe('msgvaultAdapter', () => {
     db.prepare(
       `INSERT INTO message_raw (message_id, raw_data, raw_format, compression) VALUES (?, ?, 'mime', 'zlib')`,
     ).run(2, raw)
-    db.exec(`INSERT INTO labels (id, source_id, name, label_type) VALUES (1, 1, 'INBOX', 'system'), (2, 1, 'UNREAD', 'system')`)
+    db.exec(
+      `INSERT INTO labels (id, source_id, name, label_type) VALUES (1, 1, 'INBOX', 'system'), (2, 1, 'UNREAD', 'system')`,
+    )
     db.exec(`INSERT INTO message_labels VALUES (1, 1), (2, 1), (2, 2)`)
     db.prepare(
       `INSERT INTO messages_fts (message_id, subject, body, from_addr) VALUES (2, 'Re: Quarterly report', 'See attached numbers for Q3.', 'alice@example.com')`,
@@ -173,6 +183,20 @@ describe('msgvaultAdapter', () => {
     db.close() // store.db aliases the same connection
   })
 
+  it('rejects an all-column archive whose trusted messages.id is not the single integer PK', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'msgvault-bad-identity-')), 'bad.db')
+    const bad = new DatabaseSync(path)
+    bad.exec(
+      SCHEMA.replace('id INTEGER PRIMARY KEY,\n  conversation_id', 'id TEXT,\n  conversation_id')
+        .replace(/ REFERENCES messages\(id\)( ON DELETE CASCADE)?/g, ''),
+    )
+    bad.exec(`INSERT INTO sources(id,kind,email) VALUES(1,'gmail','fixture@example.com');
+      INSERT INTO conversations(id,source_id,conversation_type) VALUES(1,1,'email_thread');
+      INSERT INTO messages(id,conversation_id,source_id) VALUES('duplicate',1,1),('duplicate',1,1)`)
+    bad.close()
+    expect(() => openMsgvaultStore(path)).toThrow(/messages\.id must have INTEGER affinity and be the single primary key/)
+  })
+
   it('opens read-only and rejects schema drift', async () => {
     const opened = openMsgvaultStore(dbPath)
     expect(opened.db.prepare('SELECT COUNT(*) c FROM messages').get()).toEqual({ c: 3 })
@@ -182,6 +206,37 @@ describe('msgvaultAdapter', () => {
     empty.exec('CREATE TABLE other(x)')
     empty.close()
     expect(() => openMsgvaultStore(notAnArchive)).toThrow(/schema drift/)
+
+    const missingJoinColumn = join(mkdtempSync(join(tmpdir(), 'msgvault-column-drift-')), 'drift.db')
+    const drift = new DatabaseSync(missingJoinColumn)
+    drift.exec(`
+      CREATE TABLE messages (id INTEGER, rfc822_message_id TEXT, deleted_at TEXT);
+      CREATE TABLE conversations (id INTEGER); CREATE TABLE participants (id INTEGER);
+      CREATE TABLE message_labels (id INTEGER); CREATE TABLE labels (id INTEGER);
+      CREATE TABLE message_raw (id INTEGER); CREATE TABLE attachments (id INTEGER);
+      CREATE TABLE messages_fts (id INTEGER);
+    `)
+    drift.close()
+    expect(() => openMsgvaultStore(missingJoinColumn)).toThrow(/messages missing column\(s\):.*source_id/)
+
+    const missingReferenced = join(mkdtempSync(join(tmpdir(), 'msgvault-all-columns-')), 'drift.db')
+    const missingDb = new DatabaseSync(missingReferenced)
+    missingDb.exec(SCHEMA.replace('storage_path TEXT NOT NULL', 'storage_path_renamed TEXT NOT NULL'))
+    missingDb.close()
+    expect(() => openMsgvaultStore(missingReferenced)).toThrow(
+      /attachments missing column\(s\): storage_path/,
+    )
+
+    const fakeFts = join(mkdtempSync(join(tmpdir(), 'msgvault-fake-fts-')), 'drift.db')
+    const fakeDb = new DatabaseSync(fakeFts)
+    fakeDb.exec(
+      SCHEMA.replace(
+        /CREATE VIRTUAL TABLE messages_fts[\s\S]*?\);/,
+        'CREATE TABLE messages_fts(message_id INTEGER, subject TEXT);',
+      ),
+    )
+    fakeDb.close()
+    expect(() => openMsgvaultStore(fakeFts)).toThrow(/not an FTS5 virtual table/)
     expect(() => openMsgvaultStore(join(tmpdir(), 'does-not-exist.db'))).toThrow(/REMEDIATION/)
   })
 
@@ -196,6 +251,15 @@ describe('msgvaultAdapter', () => {
     expect(listThreads(store.db, { unreadOnly: true })).toHaveLength(1)
     expect(listThreads(store.db, { label: 'SENT' })).toHaveLength(0)
     expect(listThreads(store.db, { label: 'INBOX' })).toHaveLength(1)
+  })
+
+  it('resolves immutable message row ownership and verifies exact pairs', () => {
+    expect(resolveReplyTarget(store.db, 2)).toEqual({ rfc822MessageId: '<q2@example.com>', sourceId: 1 })
+    expect(resolveReplyTarget(store.db, 3)).toBeNull()
+    expect(hasMessageAtSource(store.db, '<q2@example.com>', 1)).toBe(true)
+    expect(hasMessageAtSource(store.db, '<q2@example.com>', 999)).toBe(false)
+    expect(hasMessageAtSource(store.db, '<missing@example.com>', 1)).toBe(false)
+    expect(hasMessageAtSource(store.db, '<d@example.com>', 1)).toBe(false) // soft-deleted
   })
 
   it('returns thread messages with sender, labels and unread flag', async () => {
@@ -248,9 +312,11 @@ describe('msgvaultAdapter — review-finding edges', () => {
       `INSERT INTO messages (id, conversation_id, source_id, rfc822_message_id, subject, snippet, deleted_at)
        VALUES (10, 1, 1, '<e1@example.com>', 'Deleted edge', 'gone', CURRENT_TIMESTAMP)`,
     )
-    raw.prepare(
-      `INSERT INTO messages_fts (message_id, subject, body, from_addr) VALUES (10, 'Deleted edge', 'body', 'x@example.com')`,
-    ).run()
+    raw
+      .prepare(
+        `INSERT INTO messages_fts (message_id, subject, body, from_addr) VALUES (10, 'Deleted edge', 'body', 'x@example.com')`,
+      )
+      .run()
     store = openMsgvaultStore(dbPath)
   })
 

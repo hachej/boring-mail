@@ -4,12 +4,22 @@
   "private": false,
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.22 <23"
+  },
+  "os": ["linux"],
   "description": "Agent-native Boring UI mail workbench plugin with .mail.md draft surfaces and an agent mail tool.",
   "exports": {
     "./front": "./src/boring-ui/front.tsx",
     "./server": "./src/boring-ui/server.ts",
-    "./mail-agent-tool": "./src/mail/server/mailAgentTool.ts"
+    "./mail-agent-tool": "./src/mail/server/mailAgentTool.ts",
+    "./mail-store": {
+      "types": "./dist/mail/store/productDb.d.ts",
+      "import": "./dist/mail/store/productDb.js",
+      "default": "./dist/mail/store/productDb.js"
+    }
   },
+  "files": ["src", "dist"],
   "boring": {
     "id": "boring-mail",
     "label": "Mail",
@@ -19,7 +29,9 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run -c vitest.config.ts",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json && node scripts/smoke-mail-store-worker.mjs",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@hachej/boring-workspace": "0.1.103",
