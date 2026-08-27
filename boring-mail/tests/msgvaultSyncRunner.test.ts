@@ -6,8 +6,10 @@ import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
 import { discoverMsgvaultGmailAccounts } from '../src/mail/store/msgvault/gmailAccounts.js'
 import {
+  appendBoundedMsgvaultOutputTail,
   classifyMsgvaultSyncOutput,
   createMsgvaultSyncRunner,
+  MSGVAULT_OUTPUT_TAIL_BYTES,
   serializeMsgvaultSyncRunner,
   StickyMsgvaultItemErrorDetector,
 } from '../src/mail/sync/msgvaultSyncRunner.js'
@@ -87,10 +89,31 @@ describe('msgvault Gmail discovery and sync runner', () => {
     expect(maxRunning).toBe(1)
   })
 
-  it('detects sticky item errors across arbitrary chunks without crossing streams', () => {
+  it('detects sticky item errors across arbitrary UTF-8 chunks without crossing streams', () => {
     const split = new StickyMsgvaultItemErrorDetector()
     for (const chunk of ['E', 'rro', 'rs', ':', ' ', '0', '4']) split.push(chunk)
     expect(split.finish()).toBe(true)
+
+    for (const whitespace of ['\u00a0', '\u2028']) {
+      const encoded = Buffer.from(`!Errors:${whitespace}01;`, 'utf8')
+      const detector = new StickyMsgvaultItemErrorDetector()
+      for (let index = 0; index < encoded.length; index++) {
+        detector.push(encoded.subarray(index, index + 1))
+      }
+      expect(detector.finish()).toBe(true)
+      expect(classifyMsgvaultSyncOutput(`Errors:${whitespace}01`)).toBe('error')
+    }
+
+    for (const output of ['xErrors: 1', '_Errors: 1', 'Errors: 1x', 'Errors: 1_']) {
+      const detector = new StickyMsgvaultItemErrorDetector()
+      detector.push(output)
+      expect(detector.finish()).toBe(false)
+    }
+    for (const output of ['Errors: 1', '!Errors: 1;', '\u00e9Errors: 1.']) {
+      const detector = new StickyMsgvaultItemErrorDetector()
+      detector.push(output)
+      expect(detector.finish()).toBe(true)
+    }
 
     const huge = new StickyMsgvaultItemErrorDetector()
     huge.push(Buffer.from(`Errors: 1\n${'x'.repeat(70_000)}`))
@@ -112,6 +135,27 @@ describe('msgvault Gmail discovery and sync runner', () => {
     stderr.push('ors: 9\n')
     expect(stdout.finish()).toBe(false)
     expect(stderr.finish()).toBe(false)
+  })
+
+  it('copies every bounded output-tail path into a bounded backing allocation', () => {
+    const suffix = Buffer.from('physical-tail-sentinel')
+    const huge = Buffer.alloc(MSGVAULT_OUTPUT_TAIL_BYTES * 48, 120)
+    suffix.copy(huge, huge.length - suffix.length)
+    const hugeTail = appendBoundedMsgvaultOutputTail(Buffer.alloc(0), huge)
+    expect(hugeTail).toHaveLength(MSGVAULT_OUTPUT_TAIL_BYTES)
+    expect(hugeTail.buffer.byteLength).toBeLessThanOrEqual(MSGVAULT_OUTPUT_TAIL_BYTES)
+    expect(hugeTail.subarray(-suffix.length)).toEqual(suffix)
+
+    const sharedParent = Buffer.alloc(MSGVAULT_OUTPUT_TAIL_BYTES * 4, 121)
+    const sharedSlice = sharedParent.subarray(100, 120)
+    const fittingTail = appendBoundedMsgvaultOutputTail(Buffer.alloc(0), sharedSlice)
+    expect(fittingTail).toEqual(sharedSlice)
+    expect(fittingTail.buffer.byteLength).toBeLessThanOrEqual(MSGVAULT_OUTPUT_TAIL_BYTES)
+
+    const overflowTail = appendBoundedMsgvaultOutputTail(hugeTail, sharedSlice)
+    expect(overflowTail).toHaveLength(MSGVAULT_OUTPUT_TAIL_BYTES)
+    expect(overflowTail.buffer.byteLength).toBeLessThanOrEqual(MSGVAULT_OUTPUT_TAIL_BYTES)
+    expect(overflowTail.subarray(-sharedSlice.length)).toEqual(sharedSlice)
   })
 
   it('classifies final bounded output and keeps failures redacted', async () => {
@@ -181,6 +225,12 @@ process.stdout.write('x'.repeat(70_000))
 process.stdout.write('\\nChanges: 0 processed, 0 added\\n')
 `)
     await expect(createMsgvaultSyncRunner({ executable })('x@test')).resolves.toEqual({ changed: false })
+
+    writeFileSync(executable, `#!/usr/bin/env node
+const bytes = Buffer.from('Errors:\\u00a01\\nChanges: 0 processed, 0 added\\n')
+for (const byte of bytes) process.stdout.write(Buffer.of(byte))
+`)
+    await expect(createMsgvaultSyncRunner({ executable })('x@test')).rejects.toThrow(/completed with item errors/)
 
     writeFileSync(executable, `#!/usr/bin/env node
 process.stdout.write('Err')

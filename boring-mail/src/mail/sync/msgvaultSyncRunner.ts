@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 import type { MsgvaultArchiveLock } from './msgvaultArchiveLock.ts'
 
-const MAX_CAPTURE_BYTES = 64 * 1024
+export const MSGVAULT_OUTPUT_TAIL_BYTES = 64 * 1024
 
 // Pinned msgvault v0.19.3 normally routes `sync` through an auto-started
 // daemon. Its own foreground daemon sets this marker to its immediate PID when
@@ -22,27 +23,30 @@ export interface MsgvaultSyncRunnerOptions {
 export type MsgvaultOutputClassification = 'changed' | 'empty' | 'unknown' | 'error'
 export type MsgvaultSyncRunner = (account: string) => Promise<{ changed: boolean }>
 
-const ERROR_SUMMARY_TOKEN = Buffer.from('errors:', 'ascii')
+const ERROR_SUMMARY_TOKEN = 'errors:'
+const JAVASCRIPT_WHITESPACE = /^\s$/u
 
 type ErrorDetectorStage = 'search' | 'token' | 'space' | 'digits'
 
-function isAsciiWord(byte: number): boolean {
-  return byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte === 95 || byte >= 97 && byte <= 122
+function isAsciiWord(character: string): boolean {
+  const codePoint = character.codePointAt(0)!
+  return codePoint >= 48 && codePoint <= 57 || codePoint >= 65 && codePoint <= 90 ||
+    codePoint === 95 || codePoint >= 97 && codePoint <= 122
 }
 
-function isAsciiWhitespace(byte: number): boolean {
-  return byte === 9 || byte === 10 || byte === 11 || byte === 12 || byte === 13 || byte === 32
-}
-
-function asciiLower(byte: number): number {
-  return byte >= 65 && byte <= 90 ? byte + 32 : byte
+function asciiLower(character: string): string {
+  const codePoint = character.codePointAt(0)!
+  return codePoint >= 65 && codePoint <= 90 ? String.fromCodePoint(codePoint + 32) : character
 }
 
 /**
- * Incrementally recognize `Errors: N` with O(1) state. One detector belongs to
- * one child stream so independently emitted bytes can never synthesize a token.
+ * Incrementally recognize `Errors: N` with O(1) parser/decoder state. One
+ * detector belongs to one child stream so independently emitted bytes can
+ * never synthesize a token. StringDecoder preserves JavaScript `\s` semantics
+ * when a Unicode whitespace code point is split across UTF-8 Buffer chunks.
  */
 export class StickyMsgvaultItemErrorDetector {
+  private readonly decoder = new StringDecoder('utf8')
   private stage: ErrorDetectorStage = 'search'
   private tokenIndex = 0
   private previousWasWord = false
@@ -51,66 +55,72 @@ export class StickyMsgvaultItemErrorDetector {
 
   push(chunk: unknown): void {
     const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
-    for (const byte of incoming) this.pushByte(byte)
+    this.pushText(this.decoder.write(incoming))
   }
 
   finish(): boolean {
+    this.pushText(this.decoder.end())
     if (this.stage === 'digits' && this.candidateIsNonzero) this.sticky = true
     return this.sticky
   }
 
-  private startSearch(byte: number, previousWasWord: boolean): void {
+  private pushText(text: string): void {
+    for (const character of text) this.pushCharacter(character)
+  }
+
+  private startSearch(character: string, previousWasWord: boolean): void {
     this.stage = 'search'
     this.tokenIndex = 0
     this.candidateIsNonzero = false
-    if (!previousWasWord && asciiLower(byte) === ERROR_SUMMARY_TOKEN[0]) {
+    if (!previousWasWord && asciiLower(character) === ERROR_SUMMARY_TOKEN[0]) {
       this.stage = 'token'
       this.tokenIndex = 1
     }
   }
 
-  private pushByte(byte: number): void {
+  private pushCharacter(character: string): void {
     const previousWasWord = this.previousWasWord
-    const currentIsWord = isAsciiWord(byte)
+    const currentIsWord = isAsciiWord(character)
+    const codePoint = character.codePointAt(0)!
 
     if (this.stage === 'digits') {
-      if (byte >= 48 && byte <= 57) {
-        if (byte !== 48) this.candidateIsNonzero = true
+      if (codePoint >= 48 && codePoint <= 57) {
+        if (codePoint !== 48) this.candidateIsNonzero = true
       } else {
         if (!currentIsWord && this.candidateIsNonzero) this.sticky = true
-        this.startSearch(byte, previousWasWord)
+        this.startSearch(character, previousWasWord)
       }
       this.previousWasWord = currentIsWord
       return
     }
 
     if (this.stage === 'space') {
-      if (isAsciiWhitespace(byte)) {
+      if (JAVASCRIPT_WHITESPACE.test(character)) {
         this.previousWasWord = currentIsWord
         return
       }
-      if (byte >= 48 && byte <= 57) {
+      if (codePoint >= 48 && codePoint <= 57) {
         this.stage = 'digits'
-        this.candidateIsNonzero = byte !== 48
+        this.candidateIsNonzero = codePoint !== 48
       } else {
-        this.startSearch(byte, previousWasWord)
+        this.startSearch(character, previousWasWord)
       }
       this.previousWasWord = currentIsWord
       return
     }
 
     if (this.stage === 'token') {
-      if (asciiLower(byte) === ERROR_SUMMARY_TOKEN[this.tokenIndex]) {
+      if (asciiLower(character) === ERROR_SUMMARY_TOKEN[this.tokenIndex]) {
         this.tokenIndex++
         if (this.tokenIndex === ERROR_SUMMARY_TOKEN.length) this.stage = 'space'
       } else {
-        this.startSearch(byte, previousWasWord)
+        this.startSearch(character, previousWasWord)
       }
       this.previousWasWord = currentIsWord
       return
     }
 
-    this.startSearch(byte, previousWasWord)
+    this.startSearch(character, previousWasWord)
     this.previousWasWord = currentIsWord
   }
 }
@@ -150,13 +160,24 @@ export function classifyMsgvaultSyncOutput(output: string): MsgvaultOutputClassi
   return classifyMsgvaultChanges(output)
 }
 
-/** Keep final bytes for change/empty classification; errors are detected while streaming. */
-function appendBoundedTail(current: Buffer, chunk: unknown): Buffer {
+/**
+ * Keep final bytes for change/empty classification; errors are detected while
+ * streaming. Every return path copies retained bytes into a physically bounded
+ * backing allocation rather than retaining an oversized source Buffer.
+ */
+export function appendBoundedMsgvaultOutputTail(current: Buffer, chunk: unknown): Buffer {
   const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
-  if (incoming.length >= MAX_CAPTURE_BYTES) return incoming.subarray(incoming.length - MAX_CAPTURE_BYTES)
-  if (current.length + incoming.length <= MAX_CAPTURE_BYTES) return Buffer.concat([current, incoming])
-  const keep = MAX_CAPTURE_BYTES - incoming.length
-  return Buffer.concat([current.subarray(current.length - keep), incoming])
+  if (incoming.length >= MSGVAULT_OUTPUT_TAIL_BYTES) {
+    return Buffer.from(incoming.subarray(incoming.length - MSGVAULT_OUTPUT_TAIL_BYTES))
+  }
+  const boundedCurrent = current.length > MSGVAULT_OUTPUT_TAIL_BYTES
+    ? current.subarray(current.length - MSGVAULT_OUTPUT_TAIL_BYTES)
+    : current
+  if (boundedCurrent.length + incoming.length <= MSGVAULT_OUTPUT_TAIL_BYTES) {
+    return Buffer.concat([boundedCurrent, incoming])
+  }
+  const keep = MSGVAULT_OUTPUT_TAIL_BYTES - incoming.length
+  return Buffer.concat([boundedCurrent.subarray(boundedCurrent.length - keep), incoming])
 }
 
 /** Direct argv-only msgvault runner. Child output is never included in errors. */
@@ -195,11 +216,11 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
       })
       child.stdout?.on('data', (chunk) => {
         stdoutErrors.push(chunk)
-        output = appendBoundedTail(output, chunk)
+        output = appendBoundedMsgvaultOutputTail(output, chunk)
       })
       child.stderr?.on('data', (chunk) => {
         stderrErrors.push(chunk)
-        output = appendBoundedTail(output, chunk)
+        output = appendBoundedMsgvaultOutputTail(output, chunk)
       })
       child.once('error', (error: NodeJS.ErrnoException) => {
         if (settled) return
