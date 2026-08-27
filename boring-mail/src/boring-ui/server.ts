@@ -36,11 +36,12 @@ export default function createBoringMailServerPlugin(
     // Identity pin for the prebuilt-plugin path (required since workspace 0.1.103
     // for any plugin contributing agentTools/systemPrompt). Bump when the
     // executable contribution changes materially.
-    contentDigest: 'boring-mail-server-plugin-v2',
+    contentDigest: 'boring-mail-server-plugin-v3',
     routes: async (app) => {
-      const syncLease = await acquireMsgvaultSyncRuntime(options.sync, {
-        onError: (message) => app.log.warn({ component: 'boring-mail-msgvault-sync' }, message),
-      })
+      const syncLease = await acquireMsgvaultSyncRuntime(
+        options.sync,
+        (message) => app.log.warn({ component: 'boring-mail-msgvault-sync' }, message),
+      )
       app.addHook('onClose', async () => syncLease.release())
       app.post('/api/boring-mail/drafts', async (request, reply) => {
         const body = request.body as { path?: unknown; to?: unknown; cc?: unknown; subject?: unknown; bodyMarkdown?: unknown } | undefined

@@ -7,9 +7,7 @@ export const SUSPEND_HEARTBEAT_MS = 30_000
 export const SUSPEND_LATE_AFTER_MS = 60_000
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
-export interface SyncRunResult {
-  changed: boolean
-}
+export interface SyncRunResult { changed: boolean }
 
 export interface MsgvaultSyncSupervisorDependencies {
   discoverAccounts(): Promise<string[]>
@@ -41,9 +39,17 @@ export interface AccountSyncHealth {
   readonly lastError: string | null
 }
 
+interface ArmedTimer {
+  handle: unknown
+  hasHandle: boolean
+  active: boolean
+  arming: boolean
+  firedSynchronously: boolean
+}
+
 interface AccountState {
   account: string
-  timer: unknown | null
+  timer: ArmedTimer | null
   nextRunAt: number | null
   inFlight: Promise<void> | null
   followUp: boolean
@@ -53,6 +59,8 @@ interface AccountState {
   removed: boolean
   scheduleFailed: boolean
 }
+
+type MaintenanceMode = 'none' | 'additions' | 'all'
 
 function finitePositiveTimer(value: number, name: string): number {
   if (!Number.isFinite(value) || value <= 0 || value > MAX_TIMER_DELAY_MS) {
@@ -80,7 +88,7 @@ function sanitizedError(error: unknown, account: string): string {
   return redacted.slice(0, 240) || 'sync failed'
 }
 
-/** One process-local scheduler with serialized discovery and lifecycle. */
+/** One process-local scheduler with one serialized account-maintenance engine. */
 export class MsgvaultSyncSupervisor {
   readonly #deps: MsgvaultSyncSupervisorDependencies
   readonly #activeIntervalMs: number
@@ -96,11 +104,11 @@ export class MsgvaultSyncSupervisor {
   #startPromise: Promise<void> | null = null
   #stopPromise: Promise<void> | null = null
   #refreshPromise: Promise<AccountState[]> | null = null
-  #reconcileWave: Promise<void> | null = null
-  #heartbeat: unknown | null = null
+  #maintenancePromise: Promise<void> | null = null
+  #maintenancePending: MaintenanceMode = 'none'
+  #heartbeat: ArmedTimer | null = null
   #heartbeatDueAt: number | null = null
-  #resumeWave: Promise<void> | null = null
-  #resumePending = false
+  #heartbeatRetryQueued = false
 
   constructor(deps: MsgvaultSyncSupervisorDependencies, options: MsgvaultSyncSupervisorOptions = {}) {
     this.#deps = deps
@@ -164,8 +172,7 @@ export class MsgvaultSyncSupervisor {
       await this.#request(state)
       return
     }
-    await this.#refreshAccounts()
-    await Promise.all([...this.#accounts.values()].filter((state) => !state.removed).map((state) => this.#request(state)))
+    await this.#requestMaintenance('all')
   }
 
   stop(): Promise<void> {
@@ -176,9 +183,8 @@ export class MsgvaultSyncSupervisor {
       await this.#startPromise?.catch(() => undefined)
       this.#clearTimers()
       await this.#refreshPromise?.catch(() => undefined)
-      await this.#reconcileWave?.catch(() => undefined)
-      this.#resumePending = false
-      await this.#resumeWave?.catch(() => undefined)
+      this.#maintenancePending = 'none'
+      await this.#maintenancePromise?.catch(() => undefined)
       for (;;) {
         const active = [...this.#accounts.values()].map((state) => state.inFlight).filter(Boolean) as Promise<void>[]
         if (active.length === 0) break
@@ -190,25 +196,60 @@ export class MsgvaultSyncSupervisor {
     return this.#stopPromise
   }
 
-  #clearTimer(handle: unknown, account = ''): void {
-    try { this.#deps.clearTimeout(handle) }
-    catch (error) {
-      const message = sanitizedError(error, account)
-      this.#reportError(message)
+  #armTimer(callback: () => void, delayMs: number): ArmedTimer {
+    const timer: ArmedTimer = {
+      handle: undefined,
+      hasHandle: false,
+      active: true,
+      arming: true,
+      firedSynchronously: false,
     }
+    try {
+      timer.handle = this.#deps.setTimeout(() => {
+        if (!timer.active) return
+        if (timer.arming) {
+          timer.firedSynchronously = true
+          return
+        }
+        callback()
+      }, delayMs)
+      timer.hasHandle = true
+      timer.arming = false
+      if (timer.firedSynchronously) {
+        this.#cancelTimer(timer)
+        throw new Error('setTimeout callbacks must run asynchronously')
+      }
+      return timer
+    } catch (error) {
+      timer.arming = false
+      if (timer.active && timer.hasHandle) this.#clearExternalTimer(timer.handle)
+      timer.active = false
+      throw error
+    }
+  }
+
+  #clearExternalTimer(handle: unknown, account = ''): void {
+    try { this.#deps.clearTimeout(handle) }
+    catch (error) { this.#reportError(sanitizedError(error, account)) }
+  }
+
+  #cancelTimer(timer: ArmedTimer, account = ''): void {
+    if (!timer.active) return
+    timer.active = false
+    if (timer.hasHandle) this.#clearExternalTimer(timer.handle, account)
   }
 
   #clearTimers(): void {
     const heartbeat = this.#heartbeat
     this.#heartbeat = null
     this.#heartbeatDueAt = null
-    if (heartbeat !== null) this.#clearTimer(heartbeat)
+    if (heartbeat) this.#cancelTimer(heartbeat)
     for (const state of this.#accounts.values()) {
       const timer = state.timer
       state.timer = null
       state.nextRunAt = null
       state.followUp = false
-      if (timer !== null) this.#clearTimer(timer, state.account)
+      if (timer) this.#cancelTimer(timer, state.account)
     }
   }
 
@@ -230,22 +271,23 @@ export class MsgvaultSyncSupervisor {
     const previous = state.timer
     state.timer = null
     state.nextRunAt = null
-    if (previous !== null) this.#clearTimer(previous, state.account)
-    let handle: unknown
+    if (previous) this.#cancelTimer(previous, state.account)
     try {
-      handle = this.#deps.setTimeout(() => {
-        if (state.timer !== handle) return
+      let timer!: ArmedTimer
+      timer = this.#armTimer(() => {
+        if (state.timer !== timer) return
         state.timer = null
         state.nextRunAt = null
+        timer.active = false
         void this.#request(state)
       }, delayMs)
+      state.timer = timer
+      state.nextRunAt = this.#deps.now() + delayMs
+      state.scheduleFailed = false
     } catch (error) {
       state.scheduleFailed = true
       throw error
     }
-    state.timer = handle
-    state.nextRunAt = this.#deps.now() + delayMs
-    state.scheduleFailed = false
   }
 
   #request(state: AccountState): Promise<void> {
@@ -253,7 +295,7 @@ export class MsgvaultSyncSupervisor {
     const timer = state.timer
     state.timer = null
     state.nextRunAt = null
-    if (timer !== null) this.#clearTimer(timer, state.account)
+    if (timer) this.#cancelTimer(timer, state.account)
     state.scheduleFailed = false
     if (state.inFlight) {
       state.followUp = true
@@ -322,7 +364,7 @@ export class MsgvaultSyncSupervisor {
         const timer = state.timer
         state.timer = null
         state.nextRunAt = null
-        if (timer !== null) this.#clearTimer(timer, state.account)
+        if (timer) this.#cancelTimer(timer, state.account)
         state.followUp = false
         if (!state.inFlight) this.#accounts.delete(state.account)
       }
@@ -335,36 +377,29 @@ export class MsgvaultSyncSupervisor {
     return tracked
   }
 
-  #scheduleHeartbeat(): void {
-    if (this.#stopping) return
-    let handle: unknown
-    const dueAt = this.#deps.now() + this.#heartbeatMs
-    handle = this.#deps.setTimeout(() => {
-      if (this.#heartbeat !== handle) return
-      this.#heartbeat = null
-      const lateBy = this.#deps.now() - (this.#heartbeatDueAt ?? this.#deps.now())
-      this.#heartbeatDueAt = null
-      // Execute this tick's work even when a transient timer rearm fails.
-      if (lateBy >= this.#suspendLateAfterMs) this.#requestResumeWave()
-      else void this.#refreshAndRunAdditions()
-      try { this.#scheduleHeartbeat() }
-      catch (error) {
-        const message = sanitizedError(error, '')
-        this.#reportError(message)
-        for (const state of this.#accounts.values()) state.lastError = message
-      }
-    }, this.#heartbeatMs)
-    this.#heartbeat = handle
-    this.#heartbeatDueAt = dueAt
+  #mergeMaintenanceMode(mode: Exclude<MaintenanceMode, 'none'>): void {
+    if (mode === 'all' || this.#maintenancePending === 'none') this.#maintenancePending = mode
   }
 
-  #refreshAndRunAdditions(): Promise<void> {
-    if (this.#reconcileWave) return this.#reconcileWave
+  #requestMaintenance(mode: Exclude<MaintenanceMode, 'none'>): Promise<void> {
+    if (this.#stopping) return Promise.resolve()
+    this.#mergeMaintenanceMode(mode)
+    if (this.#maintenancePromise) return this.#maintenancePromise
     const wave = (async () => {
       try {
-        const added = await this.#refreshAccounts()
-        const recover = [...this.#accounts.values()].filter((state) => state.scheduleFailed && !state.removed)
-        await Promise.all([...new Set([...added, ...recover])].map((state) => this.#request(state)))
+        while (this.#maintenancePending !== 'none' && !this.#stopping) {
+          const current = this.#maintenancePending
+          this.#maintenancePending = 'none'
+          const added = await this.#refreshAccounts()
+          if (this.#stopping) break
+          const targets = current === 'all'
+            ? [...this.#accounts.values()].filter((state) => !state.removed)
+            : [...new Set([
+                ...added,
+                ...[...this.#accounts.values()].filter((state) => state.scheduleFailed && !state.removed),
+              ])]
+          await Promise.all(targets.map((state) => this.#request(state)))
+        }
       } catch (error) {
         const message = sanitizedError(error, '')
         this.#reportError(message)
@@ -372,33 +407,56 @@ export class MsgvaultSyncSupervisor {
       }
     })()
     const tracked = wave.finally(() => {
-      if (this.#reconcileWave === tracked) this.#reconcileWave = null
+      if (this.#maintenancePromise === tracked) this.#maintenancePromise = null
     })
-    this.#reconcileWave = tracked
+    this.#maintenancePromise = tracked
     return tracked
+  }
+
+  #scheduleHeartbeat(): void {
+    if (this.#stopping) return
+    const dueAt = this.#deps.now() + this.#heartbeatMs
+    let timer!: ArmedTimer
+    timer = this.#armTimer(() => {
+      if (this.#heartbeat !== timer) return
+      this.#heartbeat = null
+      timer.active = false
+      const lateBy = this.#deps.now() - (this.#heartbeatDueAt ?? this.#deps.now())
+      this.#heartbeatDueAt = null
+      const maintenance = this.#requestMaintenance(lateBy >= this.#suspendLateAfterMs ? 'all' : 'additions')
+      try { this.#scheduleHeartbeat() }
+      catch (error) { this.#queueHeartbeatRetry(maintenance, error) }
+    }, this.#heartbeatMs)
+    this.#heartbeat = timer
+    this.#heartbeatDueAt = dueAt
+  }
+
+  #queueHeartbeatRetry(maintenance: Promise<void>, error: unknown): void {
+    const first = sanitizedError(error, '')
+    this.#reportError(first)
+    for (const state of this.#accounts.values()) state.lastError = first
+    if (this.#heartbeatRetryQueued || this.#stopping) return
+    this.#heartbeatRetryQueued = true
+    queueMicrotask(() => {
+      void (async () => {
+        await maintenance.catch(() => undefined)
+        this.#heartbeatRetryQueued = false
+        if (this.#stopping || this.#heartbeat) return
+        try { this.#scheduleHeartbeat() }
+        catch (retryError) {
+          const message = sanitizedError(
+            new Error(`sync maintenance degraded: ${retryError instanceof Error ? retryError.message : 'heartbeat timer unavailable'}`),
+            '',
+          )
+          this.#reportError(message)
+          for (const state of this.#accounts.values()) state.lastError = message
+        }
+      })()
+    })
   }
 
   #reportError(message: string): void {
     try { this.#deps.onError?.(message) }
     catch { /* diagnostics must never break scheduling */ }
-  }
-
-  #requestResumeWave(): void {
-    if (this.#stopping) return
-    if (this.#resumeWave) {
-      this.#resumePending = true
-      return
-    }
-    this.#resumeWave = (async () => {
-      do {
-        this.#resumePending = false
-        await this.#refreshAccounts()
-        await Promise.all([...this.#accounts.values()].filter((state) => !state.removed).map((state) => this.#request(state)))
-      } while (this.#resumePending && !this.#stopping)
-    })().catch((error) => {
-      const message = sanitizedError(error, '')
-      this.#reportError(message)
-      for (const state of this.#accounts.values()) state.lastError = message
-    }).finally(() => { this.#resumeWave = null })
   }
 }

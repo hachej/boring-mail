@@ -2,9 +2,9 @@ import {
   openMsgvaultReadOnly,
   readMsgvaultTableColumns,
   validateMsgvaultSourcesSchema,
-} from '../store/msgvault/schema.ts'
+} from './schema.ts'
 
-export interface MsgvaultAccountDiscoveryOptions {
+export interface MsgvaultGmailAccountDiscoveryOptions {
   dbPath: string
 }
 
@@ -12,9 +12,9 @@ function remediation(message: string): Error {
   return new Error(`REMEDIATION: ${message}`)
 }
 
-/** Discover active Gmail source identifiers through the shared v0.19 schema seam. */
+/** Typed v0.19 archive-reader boundary for Gmail source identifiers. */
 export async function discoverMsgvaultGmailAccounts(
-  options: MsgvaultAccountDiscoveryOptions,
+  options: MsgvaultGmailAccountDiscoveryOptions,
 ): Promise<string[]> {
   let db
   try {
@@ -33,13 +33,14 @@ export async function discoverMsgvaultGmailAccounts(
     const seen = new Set<string>()
     return rows.map((row) => {
       if (typeof row.identifier !== 'string') throw remediation('msgvault Gmail account identifier is not text')
-      const account = row.identifier.trim().toLowerCase()
+      const account = row.identifier.trim()
       if (!account || account.length > 320 || /[\s\x00-\x1f\x7f]/.test(account) ||
           account.indexOf('@') <= 0 || account.indexOf('@') !== account.lastIndexOf('@') || account.endsWith('@')) {
         throw remediation('msgvault Gmail account identifier is invalid')
       }
-      if (seen.has(account)) throw remediation('msgvault contains duplicate Gmail account identifiers')
-      seen.add(account)
+      const canonical = account.toLowerCase()
+      if (seen.has(canonical)) throw remediation('msgvault contains duplicate Gmail account identifiers')
+      seen.add(canonical)
       return account
     })
   } finally {

@@ -1,103 +1,11 @@
 // @vitest-environment node
-import { spawnSync } from 'node:child_process'
-import { EventEmitter } from 'node:events'
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  renameSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
-import createBoringMailServerPlugin from '../src/boring-ui/server.js'
-import { discoverMsgvaultGmailAccounts } from '../src/mail/sync/msgvaultAccounts.js'
-import { acquireMsgvaultArchiveLock } from '../src/mail/sync/msgvaultArchiveLock.js'
-import {
-  acquireMsgvaultSyncRuntime,
-  acquireSyncSupervisorSingleton,
-  resolveMsgvaultArchive,
-} from '../src/mail/sync/msgvaultSyncRuntime.js'
-import {
-  classifyMsgvaultSyncOutput,
-  createMsgvaultSyncRunner,
-} from '../src/mail/sync/msgvaultSyncRunner.js'
 import {
   MAX_TIMER_DELAY_MS,
   MsgvaultSyncSupervisor,
   type MsgvaultSyncSupervisorDependencies,
 } from '../src/mail/sync/msgvaultSyncSupervisor.js'
-
-const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve() }
-
-class FakeClock {
-  now = 0
-  nextId = 1
-  timers = new Map<number, { due: number; callback: () => void }>()
-  setTimeout = (callback: () => void, delay: number) => {
-    const id = this.nextId++
-    this.timers.set(id, { due: this.now + delay, callback })
-    return id
-  }
-  clearTimeout = (handle: unknown) => { this.timers.delete(handle as number) }
-  async advance(ms: number) {
-    this.now += ms
-    for (;;) {
-      const due = [...this.timers.entries()]
-        .filter(([, timer]) => timer.due <= this.now)
-        .sort((a, b) => a[1].due - b[1].due || a[0] - b[0])[0]
-      if (!due) break
-      this.timers.delete(due[0])
-      due[1].callback()
-      await flush()
-    }
-  }
-  delays() { return [...this.timers.values()].map((timer) => timer.due - this.now).sort((a, b) => a - b) }
-}
-
-function harness(
-  accounts: string[],
-  syncAccount: MsgvaultSyncSupervisorDependencies['syncAccount'],
-  random = () => 0.5,
-  options: ConstructorParameters<typeof MsgvaultSyncSupervisor>[1] = {},
-) {
-  const clock = new FakeClock()
-  const supervisor = new MsgvaultSyncSupervisor({
-    discoverAccounts: async () => accounts,
-    syncAccount,
-    now: () => clock.now,
-    random,
-    setTimeout: clock.setTimeout,
-    clearTimeout: clock.clearTimeout,
-  }, { heartbeatMs: 1_000_000, suspendLateAfterMs: 1_000_000, ...options })
-  return { clock, supervisor }
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  let reject!: (error: unknown) => void
-  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
-  return { promise, resolve, reject }
-}
-
-async function captureError(promise: Promise<unknown>): Promise<Error> {
-  try { await promise }
-  catch (error) { return error instanceof Error ? error : new Error(String(error)) }
-  throw new Error('expected promise to reject')
-}
-
-async function waitForFile(path: string): Promise<void> {
-  const deadline = Date.now() + 5_000
-  while (!existsSync(path)) {
-    if (Date.now() >= deadline) throw new Error('timed out waiting for synthetic child')
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
-}
+import { deferred, FakeClock, flush, harness } from './helpers/msgvaultSyncHarness.js'
 
 describe('MsgvaultSyncSupervisor', () => {
   it('starts immediately and schedules active jitter only after completion', async () => {
@@ -343,13 +251,14 @@ describe('MsgvaultSyncSupervisor', () => {
     await supervisor.stop()
   })
 
-  it('executes heartbeat work when rearm fails and drains despite clear failures', async () => {
+  it('retries a failed heartbeat arm, discovers later accounts, and recovers failed account arms', async () => {
     const clock = new FakeClock()
     const accounts = ['a@test']
     const pending = deferred<{ changed: boolean }>()
     const calls: string[] = []
     const errors: string[] = []
     let heartbeatArms = 0
+    let failNextAccountArm = false
     const supervisor = new MsgvaultSyncSupervisor({
       discoverAccounts: async () => accounts,
       syncAccount: async (account) => {
@@ -361,6 +270,10 @@ describe('MsgvaultSyncSupervisor', () => {
       random: () => 0.5,
       setTimeout(callback, delay) {
         if (delay === 10 && ++heartbeatArms === 2) throw new Error('heartbeat rearm failed')
+        if (delay === 1_000 && failNextAccountArm) {
+          failNextAccountArm = false
+          throw new Error('later account arm failed')
+        }
         return clock.setTimeout(callback, delay)
       },
       clearTimeout(handle) {
@@ -374,6 +287,15 @@ describe('MsgvaultSyncSupervisor', () => {
     await clock.advance(10); await flush()
     expect(calls).toContain('b@test')
     expect(errors).toContain('heartbeat rearm failed')
+
+    failNextAccountArm = true
+    accounts.push('c@test')
+    await clock.advance(10); await flush()
+    expect(calls.filter((account) => account === 'c@test')).toHaveLength(1)
+    expect(supervisor.health().find((health) => health.account === 'c@test')).toMatchObject({ nextRunAt: null })
+    await clock.advance(10); await flush()
+    expect(calls.filter((account) => account === 'c@test')).toHaveLength(2)
+
     let stopped = false
     const stop = supervisor.stop().then(() => { stopped = true })
     await flush()
@@ -381,6 +303,52 @@ describe('MsgvaultSyncSupervisor', () => {
     pending.resolve({ changed: true })
     await stop
     expect(errors).toContain('clear failed')
+  })
+
+  it('uses internal timer identity when external handles are null', async () => {
+    const callbacks: Array<() => void> = []
+    let clears = 0, discoveries = 0, calls = 0
+    const supervisor = new MsgvaultSyncSupervisor({
+      discoverAccounts: async () => { discoveries++; return ['a@test'] },
+      syncAccount: async () => { calls++; return { changed: true } },
+      now: () => 0,
+      random: () => 0.5,
+      setTimeout(callback) { callbacks.push(callback); return null },
+      clearTimeout(handle) { expect(handle).toBeNull(); clears++ },
+    }, { activeIntervalMs: 1_000, heartbeatMs: 10, suspendLateAfterMs: 1_000 })
+    await supervisor.start()
+    const initialAccount = callbacks[0]!
+    const staleHeartbeat = callbacks[1]!
+    initialAccount(); await flush()
+    expect(calls).toBe(1)
+    const staleAccount = callbacks[2]!
+    await supervisor.syncNow('a@test')
+    expect(calls).toBe(2)
+    staleAccount(); await flush()
+    expect(calls).toBe(2)
+    await supervisor.stop()
+    const discoveriesAtStop = discoveries
+    staleHeartbeat(); await flush()
+    expect(discoveries).toBe(discoveriesAtStop)
+    expect(clears).toBeGreaterThan(0)
+  })
+
+  it('rejects callbacks invoked synchronously while a timer is arming', async () => {
+    const synchronous = (accounts: string[]) => new MsgvaultSyncSupervisor({
+      discoverAccounts: async () => accounts,
+      syncAccount: async () => ({ changed: true }),
+      now: () => 0,
+      random: () => 0.5,
+      setTimeout(callback) { callback(); return null },
+      clearTimeout: () => undefined,
+    })
+    const accountTimer = synchronous(['a@test'])
+    await expect(accountTimer.start()).rejects.toThrow(/must run asynchronously/)
+    expect(accountTimer.health()[0]).toMatchObject({ nextRunAt: null, inFlight: false })
+    await accountTimer.stop()
+    const heartbeatTimer = synchronous([])
+    await expect(heartbeatTimer.start()).rejects.toThrow(/must run asynchronously/)
+    await heartbeatTimer.stop()
   })
 
   it('coalesces remove and re-add during an in-flight run and rejects restart after stop', async () => {
@@ -408,336 +376,5 @@ describe('MsgvaultSyncSupervisor', () => {
     await expect(supervisor.start()).rejects.toThrow(/stopping/)
     await stopping
     await expect(supervisor.start()).rejects.toThrow(/stopping/)
-  })
-})
-
-describe('msgvault discovery, runner and singleton', () => {
-  it('discovers normalized Gmail accounts and fails closed on drift/duplicates', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mv-accounts-'))
-    const path = join(root, 'msgvault.db')
-    const db = new DatabaseSync(path)
-    db.exec(readFileSync(new URL('./fixtures/msgvault-v0.19.sql', import.meta.url), 'utf8'))
-    db.exec(`INSERT INTO sources VALUES(1,'gmail','A@Example.Test'),(2,'imap','skip@example.test')`)
-    db.close()
-    await expect(discoverMsgvaultGmailAccounts({ dbPath: path })).resolves.toEqual(['a@example.test'])
-
-    const duplicate = new DatabaseSync(path)
-    duplicate.exec(`INSERT INTO sources VALUES(3,'gmail','a@example.test')`)
-    duplicate.close()
-    await expect(discoverMsgvaultGmailAccounts({ dbPath: path })).rejects.toThrow(/duplicate/)
-
-    const driftPath = join(root, 'drift.db')
-    const drift = new DatabaseSync(driftPath)
-    drift.exec(`CREATE TABLE sources(id TEXT,source_type TEXT,identifier TEXT)`); drift.close()
-    await expect(discoverMsgvaultGmailAccounts({ dbPath: driftPath })).rejects.toThrow(/schema drifted/)
-  })
-
-  it('classifies output and spawns direct safe argv with bounded errors', async () => {
-    expect(classifyMsgvaultSyncOutput('Changes: 94 processed, 94 added')).toBe('changed')
-    expect(classifyMsgvaultSyncOutput('Changes: 0 processed, 0 added')).toBe('empty')
-    expect(classifyMsgvaultSyncOutput('Changes: 0 processed, 0 added\nErrors: 400')).toBe('error')
-    expect(classifyMsgvaultSyncOutput('Changes: 2 processed, 2 added\nErrors: 1')).toBe('error')
-    expect(classifyMsgvaultSyncOutput('updated messages: 2')).toBe('changed')
-    expect(classifyMsgvaultSyncOutput('new messages: 0 updated messages: 0')).toBe('empty')
-    expect(classifyMsgvaultSyncOutput('summary unavailable')).toBe('unknown')
-    expect(classifyMsgvaultSyncOutput('Changes: 2 processed, 2 added\nChanges: 0 processed, 0 added')).toBe('empty')
-    expect(classifyMsgvaultSyncOutput('Changes: 0 processed, 0 added\nChanges: 2 processed, 2 added')).toBe('changed')
-
-    const root = mkdtempSync(join(tmpdir(), 'mv-runner-'))
-    const executable = join(root, 'fake-msgvault')
-    const argvPath = join(root, 'argv.json')
-    writeFileSync(executable, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.ARGV_PATH,JSON.stringify(process.argv.slice(2)));console.log('updated messages: 2')\n`)
-    chmodSync(executable, 0o700)
-    const before = process.env.ARGV_PATH
-    process.env.ARGV_PATH = argvPath
-    try {
-      await expect(createMsgvaultSyncRunner({ executable, home: root })('synthetic@example.test')).resolves.toEqual({ changed: true })
-      expect(JSON.parse(readFileSync(argvPath, 'utf8'))).toEqual([
-        '--home', root, '--no-log-file', 'sync', '--', 'synthetic@example.test',
-      ])
-    } finally {
-      if (before === undefined) delete process.env.ARGV_PATH
-      else process.env.ARGV_PATH = before
-    }
-    await expect(createMsgvaultSyncRunner({ executable: join(root, 'missing') })('x@test')).rejects.toThrow(/executable was not found/)
-
-    const failing = join(root, 'failing-msgvault')
-    writeFileSync(failing, '#!/usr/bin/env node\nconsole.error("oauth_token=do-not-leak");process.exit(7)\n'); chmodSync(failing, 0o700)
-    const failure = await captureError(createMsgvaultSyncRunner({ executable: failing })('x@test'))
-    expect(failure.message).toMatch(/exit 7.*inspect msgvault logs/)
-    expect(failure.message).not.toContain('do-not-leak')
-
-    const partial = join(root, 'partial-msgvault')
-    writeFileSync(partial, '#!/usr/bin/env node\nprocess.stdout.write("x".repeat(70000));console.log("\\nChanges: 0 processed, 0 added\\nErrors: 400")\n')
-    chmodSync(partial, 0o700)
-    const partialFailure = await captureError(createMsgvaultSyncRunner({ executable: partial })('-user@example.test'))
-    expect(partialFailure.message).toMatch(/completed with item errors/)
-    expect(partialFailure.message).not.toContain('400')
-
-    writeFileSync(partial, '#!/usr/bin/env node\nprocess.stdout.write("x".repeat(70000));console.log("\\nChanges: 0 processed, 0 added\\nErrors: 0")\n')
-    await expect(createMsgvaultSyncRunner({ executable: partial })('-user@example.test')).resolves.toEqual({ changed: false })
-  })
-
-  it('keeps custom database discovery and CLI home coherent', async () => {
-    const defaultBase = mkdtempSync(join(tmpdir(), 'mv-default-'))
-    const defaultRoot = join(defaultBase, '.msgvault')
-    mkdirSync(defaultRoot)
-    const customRoot = mkdtempSync(join(tmpdir(), 'mv-custom-'))
-    for (const [root, account] of [[defaultRoot, 'default@test'], [customRoot, 'custom@test']] as const) {
-      const db = new DatabaseSync(join(root, 'msgvault.db'))
-      db.exec(`CREATE TABLE sources(id INTEGER PRIMARY KEY,source_type TEXT NOT NULL,identifier TEXT NOT NULL);
-        INSERT INTO sources VALUES(1,'gmail','${account}')`)
-      db.close()
-    }
-    expect(resolveMsgvaultArchive({}, {
-      HOME: defaultBase,
-      MSGVAULT_DB_PATH: join(customRoot, 'msgvault.db'),
-    })).toEqual({ home: customRoot, dbPath: join(customRoot, 'msgvault.db') })
-    expect(() => resolveMsgvaultArchive({}, {
-      MSGVAULT_HOME: defaultRoot,
-      MSGVAULT_DB_PATH: join(customRoot, 'msgvault.db'),
-    })).toThrow(/home and database conflict/)
-    expect(() => resolveMsgvaultArchive({ dbPath: join(customRoot, 'archive.db') }, {})).toThrow(/<home>\/msgvault.db/)
-
-    const executable = join(customRoot, 'fake-msgvault')
-    const executableAlias = join(customRoot, 'msgvault-alias')
-    const argvPath = join(customRoot, 'runtime-argv.json')
-    writeFileSync(executable, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.ARGV_PATH,JSON.stringify(process.argv.slice(2)));console.log('Changes: 0 processed, 0 added')\n`)
-    chmodSync(executable, 0o700)
-    symlinkSync(executable, executableAlias)
-    const clock = new FakeClock()
-    const injected = {
-      now: () => clock.now,
-      random: () => 0.5,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    }
-    const before = process.env.ARGV_PATH
-    process.env.ARGV_PATH = argvPath
-    try {
-      const first = await acquireMsgvaultSyncRuntime({ enabled: true, dbPath: join(customRoot, 'msgvault.db'), executable }, injected)
-      const second = await acquireMsgvaultSyncRuntime({ enabled: true, dbPath: join(customRoot, 'msgvault.db'), executable: executableAlias }, injected)
-      const previousDb = process.env.MSGVAULT_DB_PATH
-      const previousHome = process.env.MSGVAULT_HOME
-      let blankHints: Awaited<ReturnType<typeof acquireMsgvaultSyncRuntime>>
-      try {
-        process.env.MSGVAULT_DB_PATH = join(customRoot, 'msgvault.db')
-        delete process.env.MSGVAULT_HOME
-        blankHints = await acquireMsgvaultSyncRuntime({ home: '   ', dbPath: '   ', executable }, injected)
-      } finally {
-        if (previousDb === undefined) delete process.env.MSGVAULT_DB_PATH
-        else process.env.MSGVAULT_DB_PATH = previousDb
-        if (previousHome === undefined) delete process.env.MSGVAULT_HOME
-        else process.env.MSGVAULT_HOME = previousHome
-      }
-      expect(second.supervisor).toBe(first.supervisor)
-      expect(blankHints.supervisor).toBe(first.supervisor)
-      expect(first.supervisor?.health().map((health) => health.account)).toEqual(['custom@test'])
-      await first.supervisor?.syncNow('custom@test')
-      expect(JSON.parse(readFileSync(argvPath, 'utf8'))).toEqual([
-        '--home', '/proc/self/fd/3', '--no-log-file', 'sync', '--', 'custom@test',
-      ])
-      await expect(acquireMsgvaultSyncRuntime({
-        enabled: true,
-        dbPath: join(customRoot, 'msgvault.db'),
-        executable,
-        activeIntervalMs: 121_000,
-      }, injected)).rejects.toThrow(/conflicting sync supervisor configuration/)
-
-      const contended = spawnSync('flock', ['-n', '-E', '73', customRoot, '/bin/true'])
-      expect(contended.status).toBe(73)
-      await first.release()
-      await blankHints.release()
-      expect(spawnSync('flock', ['-n', '-E', '73', customRoot, '/bin/true']).status).toBe(73)
-      await second.release()
-      expect(spawnSync('flock', ['-n', '-E', '73', customRoot, '/bin/true']).status).toBe(0)
-    } finally {
-      if (before === undefined) delete process.env.ARGV_PATH
-      else process.env.ARGV_PATH = before
-    }
-  })
-
-  it('holds and releases cross-process archive inode ownership', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mv-lock-'))
-    const dbPath = join(root, 'msgvault.db')
-    writeFileSync(dbPath, '')
-    const lock = await acquireMsgvaultArchiveLock(dbPath)
-    expect(spawnSync('flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(73)
-    await lock.release()
-    expect(spawnSync('flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(0)
-  })
-
-  it('retains ownership after holder death until parent descriptors release', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mv-holder-death-'))
-    const dbPath = join(root, 'msgvault.db')
-    writeFileSync(dbPath, '')
-    const lock = await acquireMsgvaultArchiveLock(dbPath)
-    process.kill(lock.holderPid, 'SIGKILL')
-    await lock.holderClosed
-    expect(spawnSync('/usr/bin/flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(73)
-    await lock.release()
-    expect(spawnSync('/usr/bin/flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(0)
-  })
-
-  it('keeps ownership on an inherited sync child after owner descriptors close', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mv-child-lock-'))
-    const dbPath = join(root, 'msgvault.db')
-    const executable = join(root, 'fake-msgvault')
-    const readyPath = join(root, 'ready')
-    const finishPath = join(root, 'finish')
-    writeFileSync(dbPath, '')
-    writeFileSync(executable, `#!/usr/bin/env node
-const fs=require('node:fs');fs.fstatSync(3);fs.fstatSync(4);fs.writeFileSync(process.env.READY_PATH,'');
-const wait=()=>fs.existsSync(process.env.FINISH_PATH)?console.log('Changes: 0 processed, 0 added'):setTimeout(wait,10);wait();
-`)
-    chmodSync(executable, 0o700)
-    const previousReady = process.env.READY_PATH
-    const previousFinish = process.env.FINISH_PATH
-    process.env.READY_PATH = readyPath
-    process.env.FINISH_PATH = finishPath
-    try {
-      const lock = await acquireMsgvaultArchiveLock(dbPath)
-      const running = createMsgvaultSyncRunner({ executable, archiveLock: lock })('a@test')
-      await waitForFile(readyPath)
-      process.kill(lock.holderPid, 'SIGKILL')
-      await lock.holderClosed
-      await lock.release()
-      expect(spawnSync('/usr/bin/flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(73)
-      writeFileSync(finishPath, '')
-      await expect(running).resolves.toEqual({ changed: false })
-      expect(spawnSync('/usr/bin/flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(0)
-    } finally {
-      if (previousReady === undefined) delete process.env.READY_PATH
-      else process.env.READY_PATH = previousReady
-      if (previousFinish === undefined) delete process.env.FINISH_PATH
-      else process.env.FINISH_PATH = previousFinish
-    }
-  })
-
-  it('pins ownership utilities, rejects FIFO archives, and fails closed on home replacement', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mv-lock-hardening-'))
-    const dbPath = join(root, 'msgvault.db')
-    writeFileSync(dbPath, '')
-    const fakeBin = mkdtempSync(join(tmpdir(), 'mv-fake-path-'))
-    writeFileSync(join(fakeBin, 'flock'), '#!/bin/sh\nprintf "ready\\n"\n'); chmodSync(join(fakeBin, 'flock'), 0o700)
-    const previousPath = process.env.PATH
-    process.env.PATH = fakeBin
-    try {
-      const lock = await acquireMsgvaultArchiveLock(dbPath)
-      expect(spawnSync('/usr/bin/flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(73)
-      const moved = `${root}-moved`
-      renameSync(root, moved)
-      mkdirSync(root)
-      writeFileSync(join(root, 'msgvault.db'), '')
-      expect(() => lock.databasePath()).toThrow(/identity changed/)
-      expect(() => lock.spawnContext()).toThrow(/identity changed/)
-      await lock.release()
-    } finally {
-      if (previousPath === undefined) delete process.env.PATH
-      else process.env.PATH = previousPath
-    }
-
-    const fifoRoot = mkdtempSync(join(tmpdir(), 'mv-fifo-'))
-    const fifoPath = join(fifoRoot, 'msgvault.db')
-    expect(spawnSync('/usr/bin/mkfifo', [fifoPath]).status).toBe(0)
-    const started = Date.now()
-    await expect(acquireMsgvaultArchiveLock(fifoPath)).rejects.toThrow(/single-link regular file/)
-    expect(Date.now() - started).toBeLessThan(2_000)
-  })
-
-  it('delivers diagnostics to surviving leases and keeps ownership on stop failure', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mv-subscribers-'))
-    const dbPath = join(root, 'msgvault.db')
-    const executable = join(root, 'fake-msgvault')
-    const db = new DatabaseSync(dbPath)
-    db.exec(`CREATE TABLE sources(id INTEGER PRIMARY KEY,source_type TEXT NOT NULL,identifier TEXT NOT NULL)`)
-    db.close()
-    writeFileSync(executable, '#!/bin/sh\nexit 0\n'); chmodSync(executable, 0o700)
-    const clock = new FakeClock()
-    const common = {
-      discoverAccounts: async () => ['a@test'],
-      syncAccount: async () => { throw new Error('synthetic failure') },
-      now: () => clock.now,
-      random: () => 0.5,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    }
-    const firstErrors: string[] = [], secondErrors: string[] = []
-    const first = await acquireMsgvaultSyncRuntime({ enabled: true, dbPath, executable }, {
-      ...common, onError: (message) => firstErrors.push(message),
-    })
-    const second = await acquireMsgvaultSyncRuntime({ enabled: true, dbPath, executable }, {
-      ...common, onError: (message) => secondErrors.push(message),
-    })
-    expect(first.supervisor).toBe(second.supervisor)
-    await first.release()
-    await clock.advance(0); await flush()
-    expect(firstErrors).toEqual([])
-    expect(secondErrors).toEqual(['synthetic failure'])
-    await second.release()
-
-    let released = 0
-    class StopFailureSupervisor extends MsgvaultSyncSupervisor {
-      override stop(): Promise<void> { return Promise.reject(new Error('drain failed')) }
-    }
-    const deps: MsgvaultSyncSupervisorDependencies = {
-      discoverAccounts: async () => [], syncAccount: async () => ({ changed: true }),
-      now: () => 0, random: () => 0.5, setTimeout: () => 1, clearTimeout: () => undefined,
-    }
-    const key = `stop-failure-${Date.now()}-${Math.random()}`
-    const lease = await acquireSyncSupervisorSingleton(key, () => new StopFailureSupervisor(deps), {
-      acquireOwnership: async () => ({
-        holderPid: -1, holderClosed: Promise.resolve(), databasePath: () => '',
-        spawnContext: () => ({ home: '', inheritedFds: [0, 0] }),
-        release: async () => { released++ },
-      }),
-    })
-    await expect(lease.release()).rejects.toThrow(/drain failed/)
-    expect(released).toBe(0)
-    await expect(acquireSyncSupervisorSingleton(key, () => new StopFailureSupervisor(deps))).rejects.toThrow(/drain failed/)
-  })
-
-  it('registers sync shutdown on the server lifecycle without disturbing routes', async () => {
-    const hooks: Array<() => Promise<void>> = []
-    const posts: string[] = []
-    const plugin = createBoringMailServerPlugin({ workspaceRoot: '/tmp', sync: false })
-    await plugin.routes!({
-      addHook(name: string, hook: () => Promise<void>) {
-        if (name === 'onClose') hooks.push(hook)
-      },
-      post(path: string) { posts.push(path) },
-    } as never, {} as never)
-    expect(posts).toEqual(['/api/boring-mail/drafts'])
-    expect(hooks).toHaveLength(1)
-    await hooks[0]!()
-  })
-
-  it('reference-counts one process singleton and stops only on final release', async () => {
-    let starts = 0, runs = 0
-    const clock = new FakeClock()
-    const create = () => {
-      starts++
-      return new MsgvaultSyncSupervisor({
-        discoverAccounts: async () => ['a@test'],
-        syncAccount: async () => { runs++; return { changed: true } },
-        now: () => clock.now,
-        random: () => 0.5,
-        setTimeout: clock.setTimeout,
-        clearTimeout: clock.clearTimeout,
-      }, { heartbeatMs: 1_000_000, suspendLateAfterMs: 1_000_000 })
-    }
-    const key = `test-${Date.now()}-${Math.random()}`
-    const [first, second] = await Promise.all([
-      acquireSyncSupervisorSingleton(key, create),
-      acquireSyncSupervisorSingleton(key, create),
-    ])
-    expect(starts).toBe(1)
-    expect(first.supervisor).toBe(second.supervisor)
-    await clock.advance(0)
-    expect(runs).toBe(1)
-    await first.release()
-    expect(clock.timers.size).toBeGreaterThan(0)
-    await second.release()
-    expect(clock.timers.size).toBe(0)
   })
 })
