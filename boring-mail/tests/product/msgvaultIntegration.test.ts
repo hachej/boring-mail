@@ -8,10 +8,11 @@ import { openMsgvaultStore, resolveReplyTarget } from '../../src/mail/store/msgv
 import { openProductStore } from '../../src/mail/store/internalProductStore.js'
 const schema = `
 CREATE TABLE sources(id INTEGER PRIMARY KEY,source_type TEXT NOT NULL,identifier TEXT NOT NULL);
-CREATE TABLE conversations(id INTEGER,source_id INTEGER NOT NULL,conversation_type TEXT,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);
+CREATE TABLE conversations(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL,conversation_type TEXT,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);
 CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);
 CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER,source_id INTEGER NOT NULL,rfc822_message_id TEXT,message_type TEXT NOT NULL DEFAULT 'email',subject TEXT,snippet TEXT,sent_at TEXT,received_at TEXT,internal_date TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT,deleted_from_source_at TEXT);
 CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);
+CREATE INDEX idx_messages_source ON messages(source_id);
 CREATE INDEX idx_messages_live_sent_at ON messages(COALESCE(sent_at,received_at,internal_date) DESC,id DESC) WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
 CREATE TABLE message_recipients(message_id INTEGER NOT NULL,recipient_type TEXT NOT NULL,email_address TEXT);
 CREATE INDEX idx_message_recipients_message ON message_recipients(message_id);
@@ -44,9 +45,16 @@ describe('trusted msgvault integration', () => {
       path = join(root, 'mv.db'),
       raw = new DatabaseSync(path)
     raw.exec(schema)
-    raw.exec(
-      `INSERT INTO messages(id,source_id,rfc822_message_id)VALUES(1,42,'<same@x>'),(2,43,'<same@x>'),(3,42,'<gone@x>'),(4,42,''),(5,'bad','<bad@x>');UPDATE messages SET deleted_at='x' WHERE id=3`,
-    )
+    raw.exec(`
+      INSERT INTO sources(id,source_type,identifier) VALUES(42,'gmail','a@x'),(43,'gmail','b@x');
+      INSERT INTO conversations(id,source_id,conversation_type) VALUES
+        (420,42,'email_thread'),(430,43,'email_thread'),(431,43,'calendar');
+      INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type) VALUES
+        (1,420,42,'<same@x>','email'),(2,430,43,'<same@x>','email'),
+        (3,420,42,'<gone@x>','email'),(4,420,42,'','email'),
+        (5,999,42,'<incoherent@x>','email'),(6,431,43,'<calendar@x>','calendar');
+      UPDATE messages SET deleted_at='x' WHERE id=3;
+    `)
     raw.close()
     const mv = openMsgvaultStore(path),
       product = openProductStore(join(root, 'product.db'), {
@@ -82,7 +90,9 @@ describe('trusted msgvault integration', () => {
       ).toMatchObject({ accountId: 'b' })
       expect(() => product.saveDraft({ ...base, path: 'gone.mail.md', replyToMessageId: 3 })).toThrow(/absent/)
       expect(resolveReplyTarget(mv.db, 4)).toBeNull()
-      expect(() => resolveReplyTarget(mv.db, 5)).toThrow(/invalid source id/)
+      expect(resolveReplyTarget(mv.db, 5)).toBeNull()
+      expect(resolveReplyTarget(mv.db, 6)).toBeNull()
+      expect(() => product.saveDraft({ ...base, path: 'calendar.mail.md', replyToMessageId: 6 })).toThrow(/absent/)
       expect(() => resolveReplyTarget(mv.db, 0)).toThrow(/positive safe integer/)
     } finally {
       product.close()

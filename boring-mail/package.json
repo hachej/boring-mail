@@ -31,6 +31,7 @@
     "test": "vitest run -c vitest.config.ts",
     "lint": "tsc -p tsconfig.json --noEmit",
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json && node scripts/smoke-mail-store-worker.mjs",
+    "benchmark:unified-inbox": "node scripts/benchmark-unified-inbox.mjs",
     "prepack": "npm run build"
   },
   "dependencies": {

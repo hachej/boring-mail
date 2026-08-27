@@ -1,5 +1,5 @@
 /** Dedicated DatabaseSync owner, run as an emitted child process in production. */
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import {
   fstatSync,
   lstatSync,
@@ -149,7 +149,7 @@ async function start(): Promise<void> {
     }
     vault = config.msgvaultDbPath ? openMsgvaultStore(config.msgvaultDbPath) : null
     const productStore = store
-    const cursorAuthority = { scope: randomUUID(), secret: randomBytes(32) }
+    const cursorAuthority = { scope: randomUUID() }
     const handlers: RpcHandlers = {
       upsertAccount: (input) => productStore.upsertAccount(input),
       saveDraft: (input, id) => productStore.saveDraft(input, id),

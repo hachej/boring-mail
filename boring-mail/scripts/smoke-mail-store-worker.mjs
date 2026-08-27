@@ -24,6 +24,7 @@ CREATE TABLE conversations(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL,con
 CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);
 CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER NOT NULL,source_id INTEGER NOT NULL,rfc822_message_id TEXT,message_type TEXT NOT NULL,subject TEXT,snippet TEXT,sent_at TEXT,received_at TEXT,internal_date TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT,deleted_from_source_at TEXT);
 CREATE INDEX correlation_by_message_id ON messages(rfc822_message_id,source_id);
+CREATE INDEX messages_by_source ON messages(source_id);
 CREATE INDEX live_message_recency ON messages(COALESCE(sent_at,received_at,internal_date) DESC,id DESC) WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
 CREATE TABLE message_recipients(message_id INTEGER NOT NULL,recipient_type TEXT NOT NULL,email_address TEXT);
 CREATE INDEX recipients_by_message ON message_recipients(message_id,recipient_type);
@@ -39,9 +40,9 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED,subject);
   fixture.exec(`INSERT INTO sources VALUES(1,'smoke@example.test');
     INSERT INTO conversations VALUES(1,1,'email_thread',NULL,3,0,NULL,NULL);
     INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,subject,sent_at,is_read,attachment_count)
-    VALUES(1,1,1,'<one@example.test>','email','one','2030-01-03',1,0),
-          (2,1,1,'<two@example.test>','email','two','2030-01-02',1,0),
-          (3,1,1,'<three@example.test>','email','three','2030-01-01',1,0)`)
+    VALUES(1,1,1,'<one@example.test>','email','one','2030-01-03 00:00:00+00:00',1,0),
+          (2,1,1,'<two@example.test>','email','two','2030-01-02 00:00:00+00:00',1,0),
+          (3,1,1,'<three@example.test>','email','three','2030-01-01 00:00:00+00:00',1,0)`)
   fixture.close()
 }
 const moduleUrl = new URL('../dist/mail/store/productDb.js', import.meta.url).href
@@ -148,9 +149,25 @@ try {
   if (firstInboxPage.items.length !== 1 || !firstInboxPage.nextCursor) {
     throw new Error('public async unified inbox did not return a cursor page')
   }
+  await store.listUnifiedInbox(null).then(
+    () => { throw new Error('malformed unified inbox options were accepted') },
+    (error) => { if (error?.code !== 'invalid_input') throw error },
+  )
+  await store.upsertAccount({
+    accountId: 'smoke', providerSourceId: 1,
+    primaryAddress: 'smoke@example.test', sendAs: ['smoke@example.test'], connected: false,
+  })
+  await store.listUnifiedInbox({ cursor: firstInboxPage.nextCursor }).then(
+    () => { throw new Error('account eligibility mutation did not invalidate unified inbox cursor') },
+    (error) => { if (error?.code !== 'stale_cursor') throw error },
+  )
+  await store.upsertAccount({
+    accountId: 'smoke', providerSourceId: 1,
+    primaryAddress: 'smoke@example.test', sendAs: ['smoke@example.test'], connected: true,
+  })
   const msgvaultWriter = new DatabaseSync(msgvaultDbPath)
   msgvaultWriter.exec(`INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,subject,sent_at,is_read,attachment_count)
-    VALUES(4,1,1,'<four@example.test>','email','four','2030-01-04',1,0)`)
+    VALUES(4,1,1,'<four@example.test>','email','four','2030-01-04 00:00:00+00:00',1,0)`)
   msgvaultWriter.close()
   await store.listUnifiedInbox({ cursor: firstInboxPage.nextCursor }).then(
     () => { throw new Error('sync mutation did not invalidate unified inbox cursor') },
@@ -214,9 +231,7 @@ try {
   const restartedStore = await openMailStore({ productDbPath, msgvaultDbPath })
   await restartedStore.listUnifiedInbox({ cursor: restartCursor }).then(
     () => { throw new Error('storage-process restart did not invalidate unified inbox cursor') },
-    (error) => {
-      if (error?.code !== 'invalid_input' && error?.code !== 'stale_cursor') throw error
-    },
+    (error) => { if (error?.code !== 'stale_cursor') throw error },
   )
   await restartedStore.close()
   const reopened = childOpen()
