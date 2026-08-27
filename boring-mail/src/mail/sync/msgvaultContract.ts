@@ -18,7 +18,6 @@ function appendBounded(current: Buffer, chunk: unknown): Buffer {
  * output is bounded and never copied into errors.
  */
 export async function verifyMsgvaultContract(
-  executable: string,
   archiveLock: Pick<MsgvaultArchiveLock, 'spawnContext'>,
   options: { timeoutMs?: number } = {},
 ): Promise<string> {
@@ -27,7 +26,7 @@ export async function verifyMsgvaultContract(
   await new Promise<void>((resolve, reject) => {
     let settled = false
     let timeoutError: Error | null = null
-    const child = spawn(executable, [
+    const child = spawn(locked.executablePath, [
       '--home', locked.home,
       '--config', locked.configPath,
       '--no-log-file',
@@ -49,6 +48,12 @@ export async function verifyMsgvaultContract(
       timeoutError = new Error('REMEDIATION: msgvault version probe timed out; install exact msgvault v0.19.3')
       try { if (child.pid) process.kill(-child.pid, 'SIGKILL') }
       catch { child.kill('SIGKILL') }
+      // Do not let an escaped descendant retaining a capture pipe make the
+      // attestation promise unbounded. It also retains ownership OFDs, so any
+      // malicious escape remains fail-closed against a replacement runtime.
+      child.stdout?.destroy()
+      child.stderr?.destroy()
+      finish(timeoutError)
     }, options.timeoutMs ?? VERSION_TIMEOUT_MS)
     timeout.unref()
     child.stdout?.on('data', (chunk) => { output = appendBounded(output, chunk) })

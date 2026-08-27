@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { spawnSync } from 'node:child_process'
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, symlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -109,7 +109,9 @@ fs.writeFileSync(${JSON.stringify(observedPath)},fs.readFileSync(config));consol
     try {
       writeFileSync(configPath, '# changed after acquisition\n')
       await lease.supervisor?.syncNow('config@test')
-      expect(readFileSync(observedPath, 'utf8')).toBe('# original config\n')
+      expect(readFileSync(observedPath, 'utf8')).toBe(
+        'data.database_url = "/proc/self/fd/4"\n# original config\n',
+      )
     } finally {
       await lease.release()
     }
@@ -119,6 +121,30 @@ fs.writeFileSync(${JSON.stringify(observedPath)},fs.readFileSync(config));consol
     await expect(acquireMsgvaultSyncRuntime({ enabled: true, dbPath, executable, configPath }))
       .rejects.toThrow(/storage overrides are unsupported/)
     expect(existsSync(join(target, 'msgvault.db'))).toBe(false)
+  })
+
+  it('executes the verified held executable after atomic pathname replacement', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-executable-pin-'))
+    const dbPath = createArchive(root, 'pin@test')
+    const marker = join(root, 'executed')
+    const executable = createExecutable(root,
+      `require('node:fs').appendFileSync(${JSON.stringify(marker)},'old\\n');console.log('Changes: 0 processed, 0 added')`)
+    const lease = await acquireMsgvaultSyncRuntime({ enabled: true, dbPath, executable })
+    try {
+      const replacement = join(root, 'replacement-msgvault')
+      writeFileSync(replacement, `#!/usr/bin/env node
+if (process.argv.includes('version')) { console.log('msgvault v0.19.3'); process.exit(0) }
+require('node:fs').appendFileSync(${JSON.stringify(marker)},'new\\n');console.log('Changes: 0 processed, 0 added')
+`)
+      chmodSync(replacement, 0o700)
+      renameSync(executable, join(root, 'verified-msgvault'))
+      renameSync(replacement, executable)
+      writeFileSync(marker, '')
+      await lease.supervisor?.syncNow('pin@test')
+      expect(readFileSync(marker, 'utf8')).toBe('old\n')
+    } finally {
+      await lease.release()
+    }
   })
 
   it('requires the exact pinned msgvault version before scheduling', async () => {
@@ -135,11 +161,37 @@ fs.writeFileSync(${JSON.stringify(observedPath)},fs.readFileSync(config));consol
     const dbPath = createArchive(root, 'timeout@test')
     const executable = join(root, 'hanging-msgvault')
     writeFileSync(executable, '#!/bin/sh\nexec sleep 10\n'); chmodSync(executable, 0o700)
-    const lock = await acquireMsgvaultArchiveLock(dbPath)
+    const lock = await acquireMsgvaultArchiveLock(dbPath, { executablePath: executable })
     try {
-      await expect(verifyMsgvaultContract(executable, lock, { timeoutMs: 20 }))
+      await expect(verifyMsgvaultContract(lock, { timeoutMs: 20 }))
         .rejects.toThrow(/version probe timed out/)
     } finally {
+      await lock.release()
+    }
+  })
+
+  it('settles a version timeout even when a setsid descendant escapes capture pipes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-version-escape-'))
+    const dbPath = createArchive(root, 'escape@test')
+    const executable = join(root, 'escaping-msgvault')
+    const pidPath = join(root, 'escaped.pid')
+    writeFileSync(executable, `#!/bin/sh
+setsid sh -c 'echo $$ > "${pidPath}"; sleep 10' &
+exec sleep 10
+`)
+    chmodSync(executable, 0o700)
+    const lock = await acquireMsgvaultArchiveLock(dbPath, { executablePath: executable })
+    const started = Date.now()
+    try {
+      await expect(verifyMsgvaultContract(lock, { timeoutMs: 20 })).rejects.toThrow(/timed out/)
+      expect(Date.now() - started).toBeLessThan(1_000)
+    } finally {
+      const deadline = Date.now() + 1_000
+      while (!existsSync(pidPath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+      if (existsSync(pidPath)) {
+        const pid = Number(readFileSync(pidPath, 'utf8').trim())
+        try { process.kill(-pid, 'SIGKILL') } catch { /* already gone */ }
+      }
       await lock.release()
     }
   })

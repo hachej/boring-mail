@@ -79,7 +79,7 @@ describe('msgvault archive ownership', () => {
     const finishPath = join(root, 'finish')
     writeFileSync(dbPath, '')
     writeFileSync(executable, `#!/usr/bin/env node
-const fs=require('node:fs');for(const fd of [3,4,5,6,7])fs.fstatSync(fd);if(process.env.MSGVAULT_DAEMON_CLI_PARENT_PID!==String(process.ppid))process.exit(8);fs.writeFileSync(process.env.READY_PATH,'');
+const fs=require('node:fs');for(const fd of [3,4,5,6,7,8])fs.fstatSync(fd);let readOnly=false;try{fs.writeSync(7,Buffer.from('mutate'))}catch{readOnly=true}if(!readOnly)process.exit(9);if(process.env.MSGVAULT_DAEMON_CLI_PARENT_PID!==String(process.ppid))process.exit(8);fs.writeFileSync(process.env.READY_PATH,'');
 const wait=()=>fs.existsSync(process.env.FINISH_PATH)?console.log('Changes: 0 processed, 0 added'):setTimeout(wait,10);wait();
 `)
     chmodSync(executable, 0o700)
@@ -90,7 +90,7 @@ const wait=()=>fs.existsSync(process.env.FINISH_PATH)?console.log('Changes: 0 pr
     let lock: Awaited<ReturnType<typeof acquireMsgvaultArchiveLock>> | null = null
     let running: Promise<{ changed: boolean }> | null = null
     try {
-      lock = await acquireMsgvaultArchiveLock(dbPath)
+      lock = await acquireMsgvaultArchiveLock(dbPath, { executablePath: executable })
       running = createMsgvaultSyncRunner({ executable, archiveLock: lock })('a@test')
       await waitForFile(readyPath)
       process.kill(lock.holderPid, 'SIGKILL')
@@ -143,6 +143,17 @@ const wait=()=>fs.existsSync(process.env.FINISH_PATH)?console.log('Changes: 0 pr
         .rejects.toThrow(/storage overrides are unsupported/)
       expect(ownershipPaths(root).map(probe)).toEqual([0, 0, 0, 0])
     }
+  })
+
+  it('bounds config snapshot growth and inherits it read-only', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-config-bounds-'))
+    const dbPath = join(root, 'msgvault.db')
+    const configPath = join(root, 'config.toml')
+    writeFileSync(dbPath, '')
+    writeFileSync(configPath, Buffer.alloc(1024 * 1024 + 1, 0x61))
+    await expect(acquireMsgvaultArchiveLock(dbPath, { configPath }))
+      .rejects.toThrow(/no larger than 1 MiB/)
+    expect(ownershipPaths(root).map(probe)).toEqual([0, 0, 0, 0])
   })
 
   it('pins ownership utilities, rejects FIFO archives, and fails closed on home replacement', async () => {

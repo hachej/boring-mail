@@ -47,10 +47,15 @@ Key structures relevant to boring-mail:
   invokes the same parent-bound direct worker branch that v0.19.3's daemon uses
   (`MSGVAULT_DAEMON_CLI_PARENT_PID`, implemented in
   `daemon_cli_subprocess.go` / `sync.go`) so the supervised child remains the
-  actual writer. It holds msgvault's `daemon.lock` and `db.write.lock` plus
-  canonical home/database inode locks for the whole runtime. Config bytes are
-  snapshotted into an anonymous descriptor; storage redirects are rejected.
-  Upgrades must re-verify this upstream contract before changing the pin. The
+  actual writer. Because that direct branch assumes the daemon's serial
+  operation gate, Boring Mail reproduces it with one fair archive-wide writer
+  FIFO; account scheduling/coalescing remains independent, but direct writers
+  never overlap. The runtime holds msgvault's `daemon.lock` and `db.write.lock`
+  plus canonical home/database inode locks. Config bytes are captured boundedly
+  into an anonymous read-only descriptor, SQLite is pinned to the held database
+  FD, and storage redirects are rejected. The exact executable is likewise
+  retained and invoked through its descriptor. Upgrades must re-verify this
+  upstream contract before changing the pin. The
   installed-binary `smoke:msgvault-direct` skips only when msgvault is absent;
   generic CI without that optional binary is not a process-contract attestation,
   so release-host proof remains mandatory.

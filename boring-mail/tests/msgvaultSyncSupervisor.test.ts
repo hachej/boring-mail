@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest'
+import { serializeMsgvaultSyncRunner } from '../src/mail/sync/msgvaultSyncRunner.js'
 import {
   MAX_TIMER_DELAY_MS,
   MsgvaultSyncSupervisor,
@@ -78,6 +79,62 @@ describe('MsgvaultSyncSupervisor', () => {
     expect(maxRunning.get('a@test')).toBe(1)
     expect(queues.get('a@test')).toHaveLength(2)
     await supervisor.stop()
+  })
+
+  it('serializes production-style archive writers across initial, manual, and resume triggers', async () => {
+    const accounts = ['a@test', 'b@test']
+    const gates: Array<ReturnType<typeof deferred<{ changed: boolean }>>> = []
+    const started: string[] = []
+    let running = 0, maxRunning = 0
+    const serialized = serializeMsgvaultSyncRunner(async (account) => {
+      started.push(account)
+      running++; maxRunning = Math.max(maxRunning, running)
+      const gate = deferred<{ changed: boolean }>()
+      gates.push(gate)
+      try { return await gate.promise } finally { running-- }
+    })
+    const { clock, supervisor } = harness(accounts, serialized, () => 0.5, {
+      activeIntervalMs: 1_000_000, heartbeatMs: 10, suspendLateAfterMs: 5,
+    })
+    await supervisor.start(); await clock.advance(0)
+    expect(started).toEqual(['a@test'])
+    const manualA = supervisor.syncNow('a@test')
+    const manualB = supervisor.syncNow('b@test')
+    await clock.advance(30) // coalesced all-account resume wave
+    const expected = ['a@test', 'b@test', 'a@test', 'b@test']
+    for (let index = 0; index < expected.length; index++) {
+      expect(started).toEqual(expected.slice(0, index + 1))
+      gates[index]!.resolve({ changed: true })
+      await flush()
+    }
+    await Promise.all([manualA, manualB])
+    expect(started).toEqual(expected)
+    expect(maxRunning).toBe(1)
+    await supervisor.stop()
+  })
+
+  it('drains the serialized archive writer queue before shutdown completes', async () => {
+    const gates: Array<ReturnType<typeof deferred<{ changed: boolean }>>> = []
+    const started: string[] = []
+    const serialized = serializeMsgvaultSyncRunner(async (account) => {
+      started.push(account)
+      const gate = deferred<{ changed: boolean }>()
+      gates.push(gate)
+      return gate.promise
+    })
+    const { clock, supervisor } = harness(['a@test', 'b@test'], serialized)
+    await supervisor.start(); await clock.advance(0)
+    let stopped = false
+    const stop = supervisor.stop().then(() => { stopped = true })
+    await flush()
+    expect(started).toEqual(['a@test'])
+    expect(stopped).toBe(false)
+    gates[0]!.resolve({ changed: true }); await flush()
+    expect(started).toEqual(['a@test', 'b@test'])
+    expect(stopped).toBe(false)
+    gates[1]!.resolve({ changed: true })
+    await stop
+    expect(stopped).toBe(true)
   })
 
   it('detects suspend lateness and issues one all-account wave', async () => {

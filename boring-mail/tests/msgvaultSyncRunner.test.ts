@@ -8,8 +8,9 @@ import { discoverMsgvaultGmailAccounts } from '../src/mail/store/msgvault/gmailA
 import {
   classifyMsgvaultSyncOutput,
   createMsgvaultSyncRunner,
+  serializeMsgvaultSyncRunner,
 } from '../src/mail/sync/msgvaultSyncRunner.js'
-import { captureError } from './helpers/msgvaultSyncHarness.js'
+import { captureError, deferred, flush } from './helpers/msgvaultSyncHarness.js'
 
 describe('msgvault Gmail discovery and sync runner', () => {
   it('preserves exact source spelling through discovery and sync argv', async () => {
@@ -57,6 +58,32 @@ describe('msgvault Gmail discovery and sync runner', () => {
     drift.exec(`CREATE TABLE sources(id TEXT,source_type TEXT,identifier TEXT)`)
     drift.close()
     await expect(discoverMsgvaultGmailAccounts({ dbPath: driftPath })).rejects.toThrow(/schema drifted/)
+  })
+
+  it('serializes direct writers FIFO across accounts and continues after failure', async () => {
+    const gates = [deferred<{ changed: boolean }>(), deferred<{ changed: boolean }>(), deferred<{ changed: boolean }>()]
+    const started: string[] = []
+    let running = 0
+    let maxRunning = 0
+    const serialized = serializeMsgvaultSyncRunner(async (account) => {
+      started.push(account)
+      running++
+      maxRunning = Math.max(maxRunning, running)
+      const gate = gates[started.length - 1]!
+      try { return await gate.promise } finally { running-- }
+    })
+    const first = serialized('a@test')
+    const second = serialized('b@test')
+    const third = serialized('c@test')
+    await flush()
+    expect(started).toEqual(['a@test'])
+    gates[0]!.resolve({ changed: true }); await first; await flush()
+    expect(started).toEqual(['a@test', 'b@test'])
+    gates[1]!.reject(new Error('synthetic')); await expect(second).rejects.toThrow(/synthetic/); await flush()
+    expect(started).toEqual(['a@test', 'b@test', 'c@test'])
+    gates[2]!.resolve({ changed: false })
+    await expect(third).resolves.toEqual({ changed: false })
+    expect(maxRunning).toBe(1)
   })
 
   it('classifies final bounded output and keeps failures redacted', async () => {

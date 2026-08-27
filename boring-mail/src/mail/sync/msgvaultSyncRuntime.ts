@@ -4,7 +4,7 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:pa
 import { discoverMsgvaultGmailAccounts } from '../store/msgvault/gmailAccounts.ts'
 import { acquireMsgvaultArchiveLock, type MsgvaultArchiveLock } from './msgvaultArchiveLock.ts'
 import { SUPPORTED_MSGVAULT_VERSION, verifyMsgvaultContract } from './msgvaultContract.ts'
-import { createMsgvaultSyncRunner } from './msgvaultSyncRunner.ts'
+import { createMsgvaultSyncRunner, serializeMsgvaultSyncRunner } from './msgvaultSyncRunner.ts'
 import {
   ACTIVE_SYNC_INTERVAL_MS,
   ACTIVE_SYNC_JITTER_FRACTION,
@@ -164,11 +164,6 @@ export async function acquireMsgvaultSyncRuntime(
       : null
   const executable = resolveExecutable(normalized.executable)
   const executableId = executableIdentity(executable)
-  const assertExecutableIdentity = () => {
-    if (executableIdentity(executable) !== executableId) {
-      throw new Error('REMEDIATION: msgvault executable changed after verification; restart with exact v0.19.3')
-    }
-  }
   const key = archiveIdentity(home, dbPath)
   const fingerprint = normalizedFingerprint(normalized, executable, executableId, configPath)
   // One wrapper per lease lets identical callbacks be independently removed.
@@ -197,19 +192,20 @@ export async function acquireMsgvaultSyncRuntime(
       }
       candidate.ready = (async () => {
         try {
-          candidate.ownership = await acquireMsgvaultArchiveLock(
-            dbPath,
-            configPath ? { configPath } : {},
-          )
+          candidate.ownership = await acquireMsgvaultArchiveLock(dbPath, {
+            ...(configPath ? { configPath } : {}),
+            executablePath: executable,
+          })
           const ownership = candidate.ownership
-          await verifyMsgvaultContract(executable, ownership)
-          assertExecutableIdentity()
-          const runner = createMsgvaultSyncRunner({
+          if (ownership.executableIdentity() !== executableId) {
+            throw new Error('REMEDIATION: msgvault executable changed during acquisition; retry with exact v0.19.3')
+          }
+          await verifyMsgvaultContract(ownership)
+          const runner = serializeMsgvaultSyncRunner(createMsgvaultSyncRunner({
             executable,
             home,
             archiveLock: ownership,
-            assertExecutableIdentity,
-          })
+          }))
           candidate.supervisor = new MsgvaultSyncSupervisor({
             discoverAccounts: () => discoverMsgvaultGmailAccounts({ dbPath: ownership.databasePath() }),
             syncAccount: runner,

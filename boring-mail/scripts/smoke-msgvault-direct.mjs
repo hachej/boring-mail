@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { acquireMsgvaultArchiveLock } from '../src/mail/sync/msgvaultArchiveLock.ts'
 import { verifyMsgvaultContract } from '../src/mail/sync/msgvaultContract.ts'
 
-const executable = process.env.MSGVAULT_EXECUTABLE?.trim() || 'msgvault'
-const version = spawnSync(executable, ['version'], { encoding: 'utf8' })
+const requestedExecutable = process.env.MSGVAULT_EXECUTABLE?.trim() || 'msgvault'
+const version = spawnSync(requestedExecutable, ['version'], { encoding: 'utf8' })
 if (version.error?.code === 'ENOENT') {
   console.log('↷ msgvault direct-worker smoke skipped: executable unavailable')
   process.exit(0)
@@ -15,6 +15,10 @@ if (version.error?.code === 'ENOENT') {
 if (version.status !== 0 || !/(?:^|\n)msgvault v0\.19\.3(?:\r?\n|$)/.test(`${version.stdout}\n${version.stderr}`)) {
   throw new Error('msgvault direct-worker smoke requires exact installed msgvault v0.19.3')
 }
+const executable = realpathSync(requestedExecutable.includes('/')
+  ? requestedExecutable
+  : (process.env.PATH ?? '').split(':').map((directory) => join(directory, requestedExecutable))
+      .find((candidate) => existsSync(candidate)) ?? requestedExecutable)
 
 function directEnv() {
   return { ...process.env, MSGVAULT_DAEMON_CLI_PARENT_PID: String(process.pid) }
@@ -55,11 +59,14 @@ try {
     throw new Error('synthetic direct worker did not produce the pinned empty-archive outcome')
   }
 
-  lock = await acquireMsgvaultArchiveLock(dbPath)
+  // Exercise the pinned database key together with an existing explicit [data]
+  // section; TOML must remain valid in the exact installed binary.
+  writeFileSync(join(root, 'config.toml'), '[data]\nloose_attachments = true\n', { mode: 0o600 })
+  lock = await acquireMsgvaultArchiveLock(dbPath, { executablePath: executable })
   try {
-    await verifyMsgvaultContract(executable, lock)
+    await verifyMsgvaultContract(lock)
     const context = lock.spawnContext()
-    const positive = spawnSync(executable, [
+    const positive = spawnSync(context.executablePath, [
       '--home', context.home,
       '--config', context.configPath,
       '--no-log-file',
@@ -86,15 +93,27 @@ try {
     throw new Error('msgvault direct-worker smoke left an archive or daemon owner behind')
   }
 
-  // Real installed-binary redirect regression: hold the target's native writer
-  // lock, then prove config validation refuses before a target DB is created.
+  // First attest the pinned binary's redirect semantics in isolation. Then
+  // reset the target, hold its native writer lock, and prove Boring Mail rejects
+  // those exact config bytes before the redirected database can be created.
+  const redirectConfig = join(root, 'config.toml')
+  writeFileSync(redirectConfig, `[data]\ndata_dir = ${JSON.stringify(target)}\n`, { mode: 0o600 })
+  const upstreamRedirect = spawnSync(executable, [
+    '--home', root, '--config', redirectConfig, '--no-log-file', 'sync',
+  ], {
+    encoding: 'utf8', timeout: 30_000, maxBuffer: 128 * 1024, env: directEnv(),
+  })
+  if (upstreamRedirect.status !== 1 || !existsSync(join(target, 'msgvault.db'))) {
+    throw new Error('installed msgvault did not demonstrate the pinned config redirect semantics')
+  }
+  rmSync(target, { recursive: true, force: true })
+  mkdirSync(target, { mode: 0o700 })
   const targetWriteLock = join(target, 'db.write.lock')
   targetHolder = await holdExternalLock(targetWriteLock)
-  writeFileSync(join(root, 'config.toml'), `[data]\ndata_dir = ${JSON.stringify(target)}\n`, { mode: 0o600 })
   let redirected = false
   let unexpectedLock
   try {
-    unexpectedLock = await acquireMsgvaultArchiveLock(dbPath)
+    unexpectedLock = await acquireMsgvaultArchiveLock(dbPath, { executablePath: executable })
   } catch (error) {
     redirected = error instanceof Error && /storage overrides are unsupported/.test(error.message)
   } finally {

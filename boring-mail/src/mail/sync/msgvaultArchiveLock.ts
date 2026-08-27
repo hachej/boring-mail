@@ -1,16 +1,18 @@
-import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { spawn, type ChildProcess } from 'node:child_process'
 import {
   accessSync,
   closeSync,
   constants as fsConstants,
   existsSync,
   fstatSync,
+  fsyncSync,
   openSync,
-  readFileSync,
+  readSync,
   statSync,
   unlinkSync,
   writeFileSync,
+  type BigIntStats,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 
@@ -23,6 +25,7 @@ const CHILD_DATABASE_FD = 4
 const CHILD_DAEMON_LOCK_FD = 5
 const CHILD_WRITE_LOCK_FD = 6
 const CHILD_CONFIG_FD = 7
+const CHILD_EXECUTABLE_FD = 8
 const DAEMON_LOCK_FILE = 'daemon.lock'
 const WRITE_LOCK_FILE = 'db.write.lock'
 const MAX_CONFIG_BYTES = 1024 * 1024
@@ -30,22 +33,27 @@ const MAX_CONFIG_BYTES = 1024 * 1024
 export interface MsgvaultLockedSpawnContext {
   /** Descriptor-backed original home inside the spawned child. */
   readonly home: string
-  /** Immutable config snapshot inside the spawned child. */
+  /** Immutable read-only config snapshot inside the spawned child. */
   readonly configPath: string
-  /** Locked parent OFDs plus config snapshot copied into child fds 3–7. */
+  /** Verified executable inode inside the spawned child. */
+  readonly executablePath: string
+  /** Locked/snapshotted parent OFDs copied into child fds 3–8. */
   readonly inheritedFds: readonly [
     directoryFd: number,
     databaseFd: number,
     daemonLockFd: number,
     writeLockFd: number,
     configFd: number,
+    executableFd: number,
   ]
 }
 
 export interface MsgvaultArchiveLock {
   /** Descriptor path for read-only discovery in this Node process. */
   databasePath(): string
-  /** Validate named identities and return descriptors inherited by a sync child. */
+  /** Identity of the executable inode retained for this lease. */
+  executableIdentity(): string
+  /** Validate named identities and return descriptors inherited by a child. */
   spawnContext(): MsgvaultLockedSpawnContext
   /** Diagnostics/test seam; lock ownership remains on retained OFDs if this exits. */
   readonly holderPid: number
@@ -68,6 +76,50 @@ function closeAll(fds: number[]): void {
   if (first) throw first
 }
 
+function fileIdentity(stat: BigIntStats): string {
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`
+}
+
+function readStableConfig(path: string): Buffer {
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
+  try {
+    const before = fstatSync(fd, { bigint: true })
+    if (!before.isFile() || before.nlink !== 1n || before.size > BigInt(MAX_CONFIG_BYTES)) {
+      throw genericLockError('msgvault config must be a single-link regular file no larger than 1 MiB')
+    }
+    const bytes = Buffer.alloc(MAX_CONFIG_BYTES + 1)
+    let offset = 0
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, offset)
+      if (count === 0) break
+      offset += count
+    }
+    const after = fstatSync(fd, { bigint: true })
+    if (offset > MAX_CONFIG_BYTES || BigInt(offset) !== before.size ||
+        before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
+        before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+      bytes.fill(0)
+      throw genericLockError('msgvault config changed while its immutable snapshot was being captured')
+    }
+    return bytes.subarray(0, offset)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function rejectStorageOverrides(configBytes: Buffer): void {
+  const normalized = configBytes.toString('utf8').replace(
+    /\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))/gu,
+    (_match, short: string | undefined, long: string | undefined) =>
+      String.fromCodePoint(Number.parseInt(short ?? long!, 16)),
+  )
+  if (/(?:data_dir|database_url)/u.test(normalized)) {
+    throw new Error(
+      'REMEDIATION: msgvault config storage overrides are unsupported; remove data_dir/database_url and select the archive with MSGVAULT_HOME',
+    )
+  }
+}
+
 /**
  * Own the archive and msgvault 0.19's daemon/write-owner locks on retained
  * open-file descriptions. Every direct sync child inherits those OFDs, so a
@@ -76,16 +128,19 @@ function closeAll(fds: number[]): void {
  */
 export async function acquireMsgvaultArchiveLock(
   dbPath: string,
-  options: { configPath?: string } = {},
+  options: { configPath?: string; executablePath?: string } = {},
 ): Promise<MsgvaultArchiveLock> {
   const home = dirname(dbPath)
   const daemonLockPath = join(home, DAEMON_LOCK_FILE)
   const writeLockPath = join(home, WRITE_LOCK_FILE)
   const requestedConfigPath = options.configPath ?? join(home, 'config.toml')
   const configSourcePath = existsSync(requestedConfigPath) ? requestedConfigPath : null
-  const fds = [-1, -1, -1, -1, -1]
+  // directory, database, daemon lock, write lock, config snapshot, executable
+  const fds = [-1, -1, -1, -1, -1, -1]
   let child: ChildProcess | null = null
   let holderClosedCode: Promise<number> | null = null
+  let snapshotPath: string | null = null
+  let snapshotWriterFd = -1
   try {
     accessSync(FLOCK_PATH, fsConstants.X_OK)
     accessSync(CAT_PATH, fsConstants.X_OK)
@@ -96,6 +151,7 @@ export async function acquireMsgvaultArchiveLock(
     const lockOpenFlags = fsConstants.O_CREAT | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
     fds[2] = openSync(daemonLockPath, lockOpenFlags, 0o600)
     fds[3] = openSync(writeLockPath, lockOpenFlags, 0o600)
+    fds[5] = openSync(options.executablePath ?? '/bin/true', fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
 
     if (!fstatSync(fds[0]!).isDirectory()) throw genericLockError('msgvault home is not a directory')
     const labels = ['database', 'daemon lock', 'write-owner lock']
@@ -105,6 +161,11 @@ export async function acquireMsgvaultArchiveLock(
         throw genericLockError(`msgvault ${labels[index - 1]} must be a single-link regular file`)
       }
     }
+    const executableStat = fstatSync(fds[5]!, { bigint: true })
+    if (!executableStat.isFile() || executableStat.nlink !== 1n) {
+      throw genericLockError('msgvault executable must be a single-link regular file')
+    }
+    const heldExecutableIdentity = fileIdentity(executableStat)
 
     child = spawn('/bin/sh', [
       '-c',
@@ -154,45 +215,36 @@ export async function acquireMsgvaultArchiveLock(
     })
 
     // Snapshot exact config bytes only after all archive/native locks are held.
-    // The anonymous 0600 inode cannot be renamed or changed by later config
-    // edits, and every child reads only its inherited descriptor path.
-    let configBytes = Buffer.alloc(0)
-    if (configSourcePath) {
-      const sourceFd = openSync(configSourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
-      try {
-        const source = fstatSync(sourceFd)
-        if (!source.isFile() || source.nlink !== 1 || source.size > MAX_CONFIG_BYTES) {
-          throw genericLockError('msgvault config must be a single-link regular file no larger than 1 MiB')
-        }
-        configBytes = readFileSync(sourceFd)
-      } finally {
-        closeSync(sourceFd)
-      }
-    }
-    // Conservative fail-closed policy: msgvault 0.19 applies TOML after
-    // --home, so any storage override could redirect the direct worker away
-    // from the four owned archive/native lock OFDs.
-    const normalizedConfig = configBytes.toString('utf8').replace(
-      /\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))/gu,
-      (_match, short: string | undefined, long: string | undefined) =>
-        String.fromCodePoint(Number.parseInt(short ?? long!, 16)),
-    )
-    if (/(?:data_dir|database_url)/u.test(normalizedConfig)) {
-      throw new Error(
-        'REMEDIATION: msgvault config storage overrides are unsupported; remove data_dir/database_url and select the archive with MSGVAULT_HOME',
-      )
-    }
-    const snapshotPath = join(home, `.boring-mail-msgvault-config-${randomBytes(16).toString('hex')}`)
-    fds[4] = openSync(
-      snapshotPath,
-      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
-      0o600,
-    )
+    const sourceBytes = configSourcePath ? readStableConfig(configSourcePath) : Buffer.alloc(0)
     try {
-      writeFileSync(fds[4]!, configBytes)
+      rejectStorageOverrides(sourceBytes)
+      // Pin SQLite itself to the held database inode. msgvault 0.19.3 accepts
+      // an implicit dotted table before a later explicit [data] section.
+      const pinnedPrefix = Buffer.from(`data.database_url = "/proc/self/fd/${CHILD_DATABASE_FD}"\n`, 'utf8')
+      const snapshotBytes = Buffer.concat([pinnedPrefix, sourceBytes])
+      try {
+        snapshotPath = join(home, `.boring-mail-msgvault-config-${randomBytes(16).toString('hex')}`)
+        snapshotWriterFd = openSync(
+          snapshotPath,
+          fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+          0o600,
+        )
+        writeFileSync(snapshotWriterFd, snapshotBytes)
+        fsyncSync(snapshotWriterFd)
+        closeSync(snapshotWriterFd)
+        snapshotWriterFd = -1
+        fds[4] = openSync(snapshotPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+        const snapshotStat = fstatSync(fds[4]!)
+        if (!snapshotStat.isFile() || snapshotStat.nlink !== 1 || snapshotStat.size !== snapshotBytes.length) {
+          throw genericLockError('immutable msgvault config snapshot failed validation')
+        }
+        unlinkSync(snapshotPath)
+        snapshotPath = null
+      } finally {
+        snapshotBytes.fill(0)
+      }
     } finally {
-      unlinkSync(snapshotPath)
-      configBytes.fill(0)
+      sourceBytes.fill(0)
     }
 
     const identities = fds.slice(0, 4).map((fd) => fstatSync(fd, { bigint: true }))
@@ -210,6 +262,13 @@ export async function acquireMsgvaultArchiveLock(
         )
       }
     }
+    const assertHeldExecutable = () => {
+      try {
+        if (fileIdentity(fstatSync(fds[5]!, { bigint: true })) !== heldExecutableIdentity) throw new Error('identity mismatch')
+      } catch {
+        throw new Error('REMEDIATION: held msgvault executable changed after verification; restart with exact v0.19.3')
+      }
+    }
 
     let released = false
     let releasePromise: Promise<void> | null = null
@@ -223,13 +282,20 @@ export async function acquireMsgvaultArchiveLock(
         assertNamedIdentity()
         return `/proc/self/fd/${fds[1]}`
       },
+      executableIdentity() {
+        if (released) throw new Error('REMEDIATION: msgvault archive ownership was released')
+        assertHeldExecutable()
+        return heldExecutableIdentity
+      },
       spawnContext() {
         if (released) throw new Error('REMEDIATION: msgvault archive ownership was released')
         assertNamedIdentity()
+        assertHeldExecutable()
         return {
           home: `/proc/self/fd/${CHILD_DIRECTORY_FD}`,
           configPath: `/proc/self/fd/${CHILD_CONFIG_FD}`,
-          inheritedFds: [fds[0]!, fds[1]!, fds[2]!, fds[3]!, fds[4]!],
+          executablePath: `/proc/self/fd/${CHILD_EXECUTABLE_FD}`,
+          inheritedFds: [fds[0]!, fds[1]!, fds[2]!, fds[3]!, fds[4]!, fds[5]!],
         }
       },
       release() {
@@ -246,8 +312,14 @@ export async function acquireMsgvaultArchiveLock(
   } catch (error) {
     child?.stdin?.end()
     await holderClosedCode?.catch(() => undefined)
+    if (snapshotWriterFd >= 0) {
+      try { closeSync(snapshotWriterFd) } catch { /* continue cleanup */ }
+    }
+    if (snapshotPath) {
+      try { unlinkSync(snapshotPath) } catch { /* continue cleanup */ }
+    }
     try { closeAll(fds) } catch { /* preserve the actionable acquisition error */ }
     if (error instanceof Error && error.message.startsWith('REMEDIATION:')) throw error
-    throw genericLockError('inspect archive type, permissions, existing daemon, and util-linux installation')
+    throw genericLockError('inspect archive, config, executable, existing daemon, and util-linux installation')
   }
 }

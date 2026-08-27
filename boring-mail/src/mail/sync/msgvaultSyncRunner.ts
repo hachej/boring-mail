@@ -20,6 +20,22 @@ export interface MsgvaultSyncRunnerOptions {
 }
 
 export type MsgvaultOutputClassification = 'changed' | 'empty' | 'unknown' | 'error'
+export type MsgvaultSyncRunner = (account: string) => Promise<{ changed: boolean }>
+
+/**
+ * msgvault's daemon serializes all mutating operations before launching its
+ * direct workers. Boring Mail uses that same direct-worker branch, so one FIFO
+ * queue must reproduce the archive-wide single-writer invariant while the
+ * supervisor remains free to schedule different account triggers concurrently.
+ */
+export function serializeMsgvaultSyncRunner(runner: MsgvaultSyncRunner): MsgvaultSyncRunner {
+  let tail: Promise<void> = Promise.resolve()
+  return (account) => {
+    const result = tail.then(() => runner(account))
+    tail = result.then(() => undefined, () => undefined)
+    return result
+  }
+}
 
 /** Classify msgvault's final human summary centrally; unknown output stays active. */
 export function classifyMsgvaultSyncOutput(output: string): MsgvaultOutputClassification {
@@ -53,6 +69,7 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
   return async (account: string): Promise<{ changed: boolean }> => {
     options.assertExecutableIdentity?.()
     const locked = options.archiveLock?.spawnContext()
+    const executableForSpawn = locked?.executablePath ?? executable
     const home = locked?.home ?? options.home
     const configPath = locked?.configPath ?? options.configPath
     const args = [
@@ -66,7 +83,7 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
     let output: Buffer<ArrayBufferLike> = Buffer.alloc(0)
     await new Promise<void>((resolve, reject) => {
       let settled = false
-      const child = spawnProcess(executable, args, {
+      const child = spawnProcess(executableForSpawn, args, {
         shell: false,
         env: {
           ...process.env,
