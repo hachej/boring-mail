@@ -72,7 +72,7 @@ test.beforeAll(async () => {
     configFile: false,
     root: site,
     logLevel: 'silent',
-    plugins: [spike.plugin],
+    plugins: [...spike.plugins],
     server: spike.viteServer,
   })
   await vite.listen()

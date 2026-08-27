@@ -207,7 +207,7 @@ describe('standalone topology validation', () => {
         configFile: false,
         root,
         logLevel: 'silent',
-        plugins: [spike.plugin],
+        plugins: [...spike.plugins],
         server: { ...spike.viteServer, ...mismatch },
       })).rejects.toThrow(/resolved Vite .* topology|resolved Vite proxy target/)
       spike.dispose()
@@ -225,7 +225,7 @@ describe('standalone topology validation', () => {
       root,
       logLevel: 'silent',
       server: wsSpike.viteServer,
-      plugins: [wsSpike.plugin, {
+      plugins: [...wsSpike.plugins, {
         name: 'synthetic-late-ws-mutator',
         configResolved(config) {
           config.server.ws = { host: '0.0.0.0', port: 24_678, clientPort: 24_678 }
@@ -240,7 +240,7 @@ describe('standalone topology validation', () => {
       root,
       logLevel: 'silent',
       server: proxySpike.viteServer,
-      plugins: [proxySpike.plugin, {
+      plugins: [...proxySpike.plugins, {
         name: 'synthetic-late-proxy-mutator',
         configureServer(server) {
           if (server.config.server.proxy) {
@@ -250,6 +250,26 @@ describe('standalone topology validation', () => {
       }],
     })).rejects.toThrow(/resolved Vite proxy target/)
     proxySpike.dispose()
+
+    const returnedPostSpike = createHostAuthSpike(topology(path))
+    await expect(createViteServer({
+      configFile: false,
+      root,
+      logLevel: 'silent',
+      server: returnedPostSpike.viteServer,
+      plugins: [...returnedPostSpike.plugins, {
+        name: 'synthetic-returned-post-mutator',
+        configureServer(server) {
+          return () => {
+            if (server.config.server.proxy) {
+              server.config.server.proxy['/api/v1'] = 'http://127.0.0.1:5291'
+            }
+            server.httpServer?.prependListener('upgrade', () => undefined)
+          }
+        },
+      }],
+    })).rejects.toThrow(/resolved Vite proxy target/)
+    returnedPostSpike.dispose()
   })
 })
 
@@ -271,11 +291,19 @@ describe('real Vite server auth spike', () => {
       ...topology(tokenFile, vitePort),
       backendOrigin: `http://127.0.0.1:${backendPort}`,
     })
+    let returnedPostUpgradeHits = 0
     const vite = await createViteServer({
       configFile: false,
       root: join(root, 'site'),
       logLevel: 'silent',
-      plugins: [spike.plugin],
+      plugins: [...spike.plugins, {
+        name: 'synthetic-returned-post-upgrade-listener',
+        configureServer(server) {
+          return () => {
+            server.httpServer?.prependListener('upgrade', () => { returnedPostUpgradeHits += 1 })
+          }
+        },
+      }],
       server: spike.viteServer,
     })
     viteServers.push(vite)
@@ -318,7 +346,9 @@ describe('real Vite server auth spike', () => {
     expect(forwarded['x-boring-mail-principal-spoof']).toBeUndefined()
 
     expect(await websocketStatus(vitePort)).toMatch(/^HTTP\/1\.1 401 /)
+    expect(returnedPostUpgradeHits).toBe(0)
     expect(await websocketStatus(vitePort, basic(token))).toMatch(/^HTTP\/1\.1 101 /)
+    expect(returnedPostUpgradeHits).toBe(1)
 
     spike.dispose()
     expect((await fetch(`${origin}/`, { headers: { authorization: basic(token) } })).status).toBe(401)

@@ -28,7 +28,7 @@ export interface HostAuthSpikeOptions {
 }
 
 export interface ValidatedHostAuthSpike {
-  plugin: Plugin
+  plugins: readonly [Plugin, Plugin]
   proofHeader: typeof PROOF_HEADER
   principalHeader: typeof PRINCIPAL_HEADER
   viteServer: ServerOptions
@@ -322,16 +322,10 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
     expectedToken.fill(0)
     trustedProof.fill(0)
   }
-  const plugin: Plugin = {
-    name: 'boring-mail-host-auth-spike',
+  const authPlugin: Plugin = {
+    name: 'boring-mail-host-auth-spike:pre-auth',
     enforce: 'pre',
-    configResolved(config) {
-      assertResolvedViteTopology(config.server, expected)
-    },
     configureServer(server) {
-      // configResolved hooks may run concurrently. Reassert after Vite has
-      // created the server so a later resolver cannot win a mutation race.
-      assertResolvedViteTopology(server.config.server, expected)
       server.httpServer?.once('close', clearSecrets)
       server.middlewares.use((request, response, next) => {
         if (disposed || !authorize(request, expectedToken, trustedProof)) {
@@ -340,20 +334,33 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
         }
         next()
       })
-      // Vite treats this return value as a post-configure hook, not cleanup.
-      // Install after every plugin has registered its upgrade listener, then
-      // delegate to those listeners only after the Basic credential is consumed.
+    },
+  }
+  const finalizerPlugin: Plugin = {
+    name: 'boring-mail-host-auth-spike:finalizer',
+    enforce: 'post',
+    configResolved(config) {
+      assertResolvedViteTopology(config.server, expected)
+      const self = config.plugins.indexOf(finalizerPlugin)
+      if (self < 0 || config.plugins.slice(self + 1).some((plugin) => typeof plugin.configureServer === 'function')) {
+        fail('host-auth finalizer must be the last plugin with a configureServer hook')
+      }
+    },
+    configureServer(server) {
+      // configResolved hooks may run concurrently. Reassert after Vite has
+      // created the server so a later resolver cannot win a mutation race.
+      assertResolvedViteTopology(server.config.server, expected)
+      // Vite treats this return value as a post-configure hook. Because this
+      // finalizer is verified as the last configureServer plugin, its returned
+      // callback runs after every earlier plugin's returned callback.
       return () => {
-        // A later configureServer hook can still mutate proxy/config fields.
-        // Reassert after all ordinary configure hooks, immediately before the
-        // upgrade gate delegates to Vite's already-created websocket listener.
         assertResolvedViteTopology(server.config.server, expected)
         installUpgradeGate(server, expectedToken, trustedProof, () => disposed)
       }
     },
   }
   return {
-    plugin,
+    plugins: Object.freeze([authPlugin, finalizerPlugin]) as readonly [Plugin, Plugin],
     proofHeader: PROOF_HEADER,
     principalHeader: PRINCIPAL_HEADER,
     viteServer,
