@@ -1,4 +1,4 @@
 {
   "extends": "../tsconfig.base.json",
-  "include": ["src", "vite.config.ts"]
+  "include": ["src", "spikes", "e2e", "vite.config.ts", "vitest.config.ts", "playwright.config.ts"]
 }
