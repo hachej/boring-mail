@@ -114,8 +114,9 @@ function rejectStorageOverrides(configBytes: Buffer): void {
       String.fromCodePoint(Number.parseInt(short ?? long!, 16)),
   )
   // BurntSushi/toml, used by pinned msgvault v0.19.3, matches decoded
-  // struct field names case-insensitively. Mirror that behavior so spelling
-  // variations cannot bypass the storage boundary.
+  // struct field names case-insensitively. This is intentionally a conservative
+  // text scan: harmless mentions may be refused rather than risk a JS parser
+  // disagreeing with the pinned Go decoder about a storage redirect.
   if (/(?:data_dir|database_url)/iu.test(normalized)) {
     throw new Error(
       'REMEDIATION: msgvault config storage overrides are unsupported; remove data_dir/database_url and select the archive with MSGVAULT_HOME',

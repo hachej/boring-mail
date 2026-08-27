@@ -9,6 +9,7 @@ import {
   classifyMsgvaultSyncOutput,
   createMsgvaultSyncRunner,
   serializeMsgvaultSyncRunner,
+  StickyMsgvaultItemErrorDetector,
 } from '../src/mail/sync/msgvaultSyncRunner.js'
 import { captureError, deferred, flush } from './helpers/msgvaultSyncHarness.js'
 
@@ -86,6 +87,33 @@ describe('msgvault Gmail discovery and sync runner', () => {
     expect(maxRunning).toBe(1)
   })
 
+  it('detects sticky item errors across arbitrary chunks without crossing streams', () => {
+    const split = new StickyMsgvaultItemErrorDetector()
+    for (const chunk of ['E', 'rro', 'rs', ':', ' ', '0', '4']) split.push(chunk)
+    expect(split.finish()).toBe(true)
+
+    const huge = new StickyMsgvaultItemErrorDetector()
+    huge.push(Buffer.from(`Errors: 1\n${'x'.repeat(70_000)}`))
+    expect(huge.finish()).toBe(true)
+
+    const sticky = new StickyMsgvaultItemErrorDetector()
+    sticky.push('Errors: 7\n')
+    sticky.push('Errors: 0\n')
+    expect(sticky.finish()).toBe(true)
+
+    const zero = new StickyMsgvaultItemErrorDetector()
+    zero.push('Errors: ')
+    zero.push('000\n')
+    expect(zero.finish()).toBe(false)
+
+    const stdout = new StickyMsgvaultItemErrorDetector()
+    const stderr = new StickyMsgvaultItemErrorDetector()
+    stdout.push('Err')
+    stderr.push('ors: 9\n')
+    expect(stdout.finish()).toBe(false)
+    expect(stderr.finish()).toBe(false)
+  })
+
   it('classifies final bounded output and keeps failures redacted', async () => {
     expect(classifyMsgvaultSyncOutput('Changes: 94 processed, 94 added')).toBe('changed')
     expect(classifyMsgvaultSyncOutput('Changes: 0 processed, 0 added')).toBe('empty')
@@ -116,5 +144,49 @@ describe('msgvault Gmail discovery and sync runner', () => {
 
     writeFileSync(partial, '#!/usr/bin/env node\nprocess.stdout.write("x".repeat(70000));console.log("\\nChanges: 0 processed, 0 added\\nErrors: 0")\n')
     await expect(createMsgvaultSyncRunner({ executable: partial })('-user@example.test')).resolves.toEqual({ changed: false })
+  })
+
+  it('keeps streamed item errors sticky after tail eviction and across independent streams', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-sticky-errors-'))
+    const executable = join(root, 'fake-msgvault')
+
+    writeFileSync(executable, `#!/usr/bin/env node
+process.stdout.write('Changes: 0 processed, 0 added\\nErrors: 1\\n')
+process.stdout.write('x'.repeat(70_000))
+`)
+    chmodSync(executable, 0o700)
+    let failure = await captureError(createMsgvaultSyncRunner({ executable })('x@test'))
+    expect(failure.message).toMatch(/completed with item errors/)
+    expect(failure.message).not.toContain('Errors: 1')
+
+    writeFileSync(executable, `#!/usr/bin/env node
+process.stderr.write('Errors: 2\\n')
+process.stdout.write('x'.repeat(70_000))
+process.stdout.write('\\nChanges: 0 processed, 0 added\\n')
+`)
+    failure = await captureError(createMsgvaultSyncRunner({ executable })('x@test'))
+    expect(failure.message).toMatch(/completed with item errors/)
+    expect(failure.message).not.toContain('Errors: 2')
+
+    writeFileSync(executable, `#!/usr/bin/env node
+process.stdout.write('Errors: 3\\n')
+process.stdout.write('x'.repeat(70_000))
+process.stdout.write('\\nErrors: 0\\nChanges: 0 processed, 0 added\\n')
+`)
+    await expect(createMsgvaultSyncRunner({ executable })('x@test')).rejects.toThrow(/completed with item errors/)
+
+    writeFileSync(executable, `#!/usr/bin/env node
+process.stdout.write('Errors: 0\\n')
+process.stdout.write('x'.repeat(70_000))
+process.stdout.write('\\nChanges: 0 processed, 0 added\\n')
+`)
+    await expect(createMsgvaultSyncRunner({ executable })('x@test')).resolves.toEqual({ changed: false })
+
+    writeFileSync(executable, `#!/usr/bin/env node
+process.stdout.write('Err')
+process.stderr.write('ors: 9\\n')
+process.stdout.write('\\nChanges: 0 processed, 0 added\\n')
+`)
+    await expect(createMsgvaultSyncRunner({ executable })('x@test')).resolves.toEqual({ changed: false })
   })
 })

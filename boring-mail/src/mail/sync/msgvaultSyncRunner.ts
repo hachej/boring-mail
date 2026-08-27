@@ -22,6 +22,99 @@ export interface MsgvaultSyncRunnerOptions {
 export type MsgvaultOutputClassification = 'changed' | 'empty' | 'unknown' | 'error'
 export type MsgvaultSyncRunner = (account: string) => Promise<{ changed: boolean }>
 
+const ERROR_SUMMARY_TOKEN = Buffer.from('errors:', 'ascii')
+
+type ErrorDetectorStage = 'search' | 'token' | 'space' | 'digits'
+
+function isAsciiWord(byte: number): boolean {
+  return byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte === 95 || byte >= 97 && byte <= 122
+}
+
+function isAsciiWhitespace(byte: number): boolean {
+  return byte === 9 || byte === 10 || byte === 11 || byte === 12 || byte === 13 || byte === 32
+}
+
+function asciiLower(byte: number): number {
+  return byte >= 65 && byte <= 90 ? byte + 32 : byte
+}
+
+/**
+ * Incrementally recognize `Errors: N` with O(1) state. One detector belongs to
+ * one child stream so independently emitted bytes can never synthesize a token.
+ */
+export class StickyMsgvaultItemErrorDetector {
+  private stage: ErrorDetectorStage = 'search'
+  private tokenIndex = 0
+  private previousWasWord = false
+  private candidateIsNonzero = false
+  private sticky = false
+
+  push(chunk: unknown): void {
+    const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
+    for (const byte of incoming) this.pushByte(byte)
+  }
+
+  finish(): boolean {
+    if (this.stage === 'digits' && this.candidateIsNonzero) this.sticky = true
+    return this.sticky
+  }
+
+  private startSearch(byte: number, previousWasWord: boolean): void {
+    this.stage = 'search'
+    this.tokenIndex = 0
+    this.candidateIsNonzero = false
+    if (!previousWasWord && asciiLower(byte) === ERROR_SUMMARY_TOKEN[0]) {
+      this.stage = 'token'
+      this.tokenIndex = 1
+    }
+  }
+
+  private pushByte(byte: number): void {
+    const previousWasWord = this.previousWasWord
+    const currentIsWord = isAsciiWord(byte)
+
+    if (this.stage === 'digits') {
+      if (byte >= 48 && byte <= 57) {
+        if (byte !== 48) this.candidateIsNonzero = true
+      } else {
+        if (!currentIsWord && this.candidateIsNonzero) this.sticky = true
+        this.startSearch(byte, previousWasWord)
+      }
+      this.previousWasWord = currentIsWord
+      return
+    }
+
+    if (this.stage === 'space') {
+      if (isAsciiWhitespace(byte)) {
+        this.previousWasWord = currentIsWord
+        return
+      }
+      if (byte >= 48 && byte <= 57) {
+        this.stage = 'digits'
+        this.candidateIsNonzero = byte !== 48
+      } else {
+        this.startSearch(byte, previousWasWord)
+      }
+      this.previousWasWord = currentIsWord
+      return
+    }
+
+    if (this.stage === 'token') {
+      if (asciiLower(byte) === ERROR_SUMMARY_TOKEN[this.tokenIndex]) {
+        this.tokenIndex++
+        if (this.tokenIndex === ERROR_SUMMARY_TOKEN.length) this.stage = 'space'
+      } else {
+        this.startSearch(byte, previousWasWord)
+      }
+      this.previousWasWord = currentIsWord
+      return
+    }
+
+    this.startSearch(byte, previousWasWord)
+    this.previousWasWord = currentIsWord
+  }
+}
+
 /**
  * msgvault's daemon serializes all mutating operations before launching its
  * direct workers. Boring Mail uses that same direct-worker branch, so one FIFO
@@ -37,10 +130,7 @@ export function serializeMsgvaultSyncRunner(runner: MsgvaultSyncRunner): Msgvaul
   }
 }
 
-/** Classify msgvault's final human summary centrally; unknown output stays active. */
-export function classifyMsgvaultSyncOutput(output: string): MsgvaultOutputClassification {
-  const errors = [...output.matchAll(/\bErrors:\s*(\d+)\b/gi)].map((match) => Number(match[1]))
-  if (errors.some((count) => count > 0)) return 'error'
+function classifyMsgvaultChanges(output: string): Exclude<MsgvaultOutputClassification, 'error'> {
   const summaries = [...output.matchAll(/\bChanges:\s*(\d+)\s+processed,\s*(\d+)\s+added\b/gi)]
   const summary = summaries.at(-1)
   if (summary) return Number(summary[1]) > 0 || Number(summary[2]) > 0 ? 'changed' : 'empty'
@@ -53,7 +143,14 @@ export function classifyMsgvaultSyncOutput(output: string): MsgvaultOutputClassi
   return 'unknown'
 }
 
-/** Keep the final bytes, where msgvault 0.19 emits Changes/Errors summaries. */
+/** Classify complete msgvault output; streaming runners additionally retain sticky errors. */
+export function classifyMsgvaultSyncOutput(output: string): MsgvaultOutputClassification {
+  const errors = [...output.matchAll(/\bErrors:\s*(\d+)\b/gi)].map((match) => Number(match[1]))
+  if (errors.some((count) => count > 0)) return 'error'
+  return classifyMsgvaultChanges(output)
+}
+
+/** Keep final bytes for change/empty classification; errors are detected while streaming. */
 function appendBoundedTail(current: Buffer, chunk: unknown): Buffer {
   const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
   if (incoming.length >= MAX_CAPTURE_BYTES) return incoming.subarray(incoming.length - MAX_CAPTURE_BYTES)
@@ -81,6 +178,8 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
       account,
     ]
     let output: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+    const stdoutErrors = new StickyMsgvaultItemErrorDetector()
+    const stderrErrors = new StickyMsgvaultItemErrorDetector()
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const child = spawnProcess(executableForSpawn, args, {
@@ -94,8 +193,14 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
           : ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
-      child.stdout?.on('data', (chunk) => { output = appendBoundedTail(output, chunk) })
-      child.stderr?.on('data', (chunk) => { output = appendBoundedTail(output, chunk) })
+      child.stdout?.on('data', (chunk) => {
+        stdoutErrors.push(chunk)
+        output = appendBoundedTail(output, chunk)
+      })
+      child.stderr?.on('data', (chunk) => {
+        stderrErrors.push(chunk)
+        output = appendBoundedTail(output, chunk)
+      })
       child.once('error', (error: NodeJS.ErrnoException) => {
         if (settled) return
         settled = true
@@ -114,8 +219,9 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
         ))
       })
     })
-    const classification = classifyMsgvaultSyncOutput(output.toString('utf8'))
-    if (classification === 'error') {
+    const hasItemErrors = stdoutErrors.finish() || stderrErrors.finish()
+    const classification = classifyMsgvaultChanges(output.toString('utf8'))
+    if (hasItemErrors) {
       throw new Error('REMEDIATION: msgvault sync completed with item errors; inspect msgvault logs')
     }
     return { changed: classification !== 'empty' }
