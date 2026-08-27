@@ -107,7 +107,7 @@ import createBoringMailServerPlugin from '@hachej/boring-mail/server'
 
 The server plugin contributes a single agent tool named `mail`. It deliberately does not register any LLM/model provider. The playground uses the default Pi host configuration supplied by the environment.
 
-When `~/.msgvault/msgvault.db` (or `MSGVAULT_DB_PATH`) exists, the server plugin supervises `msgvault sync` for every Gmail source in that archive. Polling starts immediately, runs every 120 seconds with ±20% jitter, and backs off to 5–10 minutes after three empty runs. It continues while the server is running even when no browser is open. Set `MSGVAULT_HOME` for a non-default msgvault home, or pass `sync: false` to `createBoringMailServerPlugin` for fixture/mock-only hosts. The Fastify close lifecycle drains an in-flight sync before shutdown.
+When `~/.msgvault/msgvault.db` exists, the server plugin supervises `msgvault sync` for every Gmail source in that archive. Polling starts immediately, runs every 120 seconds with ±20% jitter, and backs off to 5–10 minutes after three empty runs. It continues while the server is running even when no browser is open. Set `MSGVAULT_HOME` for a non-default msgvault home. `MSGVAULT_DB_PATH` is also accepted only when it names the CLI-supported `<home>/msgvault.db` layout; it derives that home, and any conflicting `MSGVAULT_HOME` fails closed. Pass `sync: false` to `createBoringMailServerPlugin` for fixture/mock-only hosts. One Boring Mail process owns a canonical archive at a time through kernel locks. The Fastify close lifecycle drains an in-flight sync before releasing ownership.
 
 Product storage consumers import the compiled worker-backed entry:
 

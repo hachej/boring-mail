@@ -9,10 +9,12 @@ export interface MsgvaultSyncRunnerOptions {
   spawnProcess?: typeof spawn
 }
 
-export type MsgvaultOutputClassification = 'changed' | 'empty' | 'unknown'
+export type MsgvaultOutputClassification = 'changed' | 'empty' | 'unknown' | 'error'
 
-/** Classify msgvault's human summary centrally; unknown output stays active. */
+/** Classify msgvault's final human summary centrally; unknown output stays active. */
 export function classifyMsgvaultSyncOutput(output: string): MsgvaultOutputClassification {
+  const errors = [...output.matchAll(/\bErrors:\s*(\d+)\b/gi)].map((match) => Number(match[1]))
+  if (errors.some((count) => count > 0)) return 'error'
   const summary = /\bChanges:\s*(\d+)\s+processed,\s*(\d+)\s+added\b/i.exec(output)
   if (summary) return Number(summary[1]) > 0 || Number(summary[2]) > 0 ? 'changed' : 'empty'
   const counters = [...output.matchAll(
@@ -24,10 +26,13 @@ export function classifyMsgvaultSyncOutput(output: string): MsgvaultOutputClassi
   return 'unknown'
 }
 
-function appendBounded(current: string, chunk: unknown): string {
-  if (current.length >= MAX_CAPTURE_BYTES) return current
-  const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
-  return (current + text).slice(0, MAX_CAPTURE_BYTES)
+/** Keep the final bytes, where msgvault 0.19 emits Changes/Errors summaries. */
+function appendBoundedTail(current: Buffer, chunk: unknown): Buffer {
+  const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
+  if (incoming.length >= MAX_CAPTURE_BYTES) return incoming.subarray(incoming.length - MAX_CAPTURE_BYTES)
+  if (current.length + incoming.length <= MAX_CAPTURE_BYTES) return Buffer.concat([current, incoming])
+  const keep = MAX_CAPTURE_BYTES - incoming.length
+  return Buffer.concat([current.subarray(current.length - keep), incoming])
 }
 
 /** Direct argv-only msgvault runner. Child output is never included in errors. */
@@ -40,10 +45,11 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
       ...(options.configPath ? ['--config', options.configPath] : []),
       '--no-log-file',
       'sync',
+      '--',
       account,
     ]
-    let stdout = ''
-    let stderr = ''
+    let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+    let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0)
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const child = spawnProcess(executable, args, {
@@ -51,8 +57,8 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
-      child.stdout?.on('data', (chunk) => { stdout = appendBounded(stdout, chunk) })
-      child.stderr?.on('data', (chunk) => { stderr = appendBounded(stderr, chunk) })
+      child.stdout?.on('data', (chunk) => { stdout = appendBoundedTail(stdout, chunk) })
+      child.stderr?.on('data', (chunk) => { stderr = appendBoundedTail(stderr, chunk) })
       child.once('error', (error: NodeJS.ErrnoException) => {
         if (settled) return
         settled = true
@@ -71,7 +77,10 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
         ))
       })
     })
-    const classification = classifyMsgvaultSyncOutput(`${stdout}\n${stderr}`)
+    const classification = classifyMsgvaultSyncOutput(`${stdout.toString('utf8')}\n${stderr.toString('utf8')}`)
+    if (classification === 'error') {
+      throw new Error('REMEDIATION: msgvault sync completed with item errors; inspect msgvault logs')
+    }
     return { changed: classification !== 'empty' }
   }
 }

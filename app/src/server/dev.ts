@@ -36,46 +36,58 @@ let boot: Promise<void> | null = null
 
 export async function startBoringMailPlaygroundServer(): Promise<void> {
   if (boot) return boot
-  boot = (async () => {
+  const attempt = (async () => {
     seedPlaygroundWorkspace()
     const localRuntimeMode = process.env.BORING_AGENT_MODE?.trim() === 'direct' ? 'direct' : 'local'
     console.log(`[boring-mail] playground workspace root: ${PLAYGROUND_WORKSPACE_ROOT}`)
     console.log(`[boring-mail] agent runtime mode: ${localRuntimeMode}`)
     console.log('[boring-mail] LLM/model provider config: default Pi host settings')
 
-    const app = await createWorkspaceAgentServer({
-      workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
-      appRoot: APP_ROOT,
-      mode: localRuntimeMode,
-      logger: true,
-      externalPlugins: false,
-      installPluginAuthoring: false,
-      plugins: [createBoringMailServerPlugin({ workspaceRoot: PLAYGROUND_WORKSPACE_ROOT })],
-      defaultPluginPackages: ['@hachej/boring-ask-user'],
-      workspaceBridge: { allowInsecureLocalCliBrowserAuth: true },
-    })
-
-    app.get('/api/v1/workspace/meta', async () => ({
-      projectName: 'Boring Mail',
-      workspaceId: 'boring-mail-playground',
-      workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
-    }))
-
-    // 0.1.103: session routes moved from /api/v1/agent/pi-chat/sessions to
-    // /api/v1/agents/:agentTypeId/sessions (front default agentTypeId: "default").
-    const existingSessions = await app.inject({ method: 'GET', url: '/api/v1/agents/default/sessions' })
-    const sessions = existingSessions.statusCode === 200
-      ? (JSON.parse(existingSessions.body) as { sessions?: unknown[] }).sessions ?? []
-      : []
-    if (sessions.length === 0) {
-      await app.inject({
-        method: 'POST',
-        url: '/api/v1/agents/default/sessions',
-        payload: { title: 'Chief of Staff' },
+    let app: Awaited<ReturnType<typeof createWorkspaceAgentServer>> | null = null
+    try {
+      app = await createWorkspaceAgentServer({
+        workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
+        appRoot: APP_ROOT,
+        mode: localRuntimeMode,
+        logger: true,
+        externalPlugins: false,
+        installPluginAuthoring: false,
+        plugins: [createBoringMailServerPlugin({ workspaceRoot: PLAYGROUND_WORKSPACE_ROOT })],
+        defaultPluginPackages: ['@hachej/boring-ask-user'],
+        workspaceBridge: { allowInsecureLocalCliBrowserAuth: true },
       })
-    }
 
-    await app.listen({ port: AGENT_API_PORT, host: '127.0.0.1' })
+      app.get('/api/v1/workspace/meta', async () => ({
+        projectName: 'Boring Mail',
+        workspaceId: 'boring-mail-playground',
+        workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
+      }))
+
+      // 0.1.103: session routes moved from /api/v1/agent/pi-chat/sessions to
+      // /api/v1/agents/:agentTypeId/sessions (front default agentTypeId: "default").
+      const existingSessions = await app.inject({ method: 'GET', url: '/api/v1/agents/default/sessions' })
+      const sessions = existingSessions.statusCode === 200
+        ? (JSON.parse(existingSessions.body) as { sessions?: unknown[] }).sessions ?? []
+        : []
+      if (sessions.length === 0) {
+        await app.inject({
+          method: 'POST',
+          url: '/api/v1/agents/default/sessions',
+          payload: { title: 'Chief of Staff' },
+        })
+      }
+
+      await app.listen({ port: AGENT_API_PORT, host: '127.0.0.1' })
+    } catch (error) {
+      await app?.close().catch(() => undefined)
+      throw error
+    }
   })()
-  return boot
+  boot = attempt
+  try {
+    await attempt
+  } catch (error) {
+    if (boot === attempt) boot = null
+    throw error
+  }
 }

@@ -1,13 +1,19 @@
 // @vitest-environment node
+import { spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
 import createBoringMailServerPlugin from '../src/boring-ui/server.js'
 import { discoverMsgvaultGmailAccounts } from '../src/mail/sync/msgvaultAccounts.js'
-import { acquireSyncSupervisorSingleton } from '../src/mail/sync/msgvaultSyncRuntime.js'
+import { acquireMsgvaultArchiveLock } from '../src/mail/sync/msgvaultArchiveLock.js'
+import {
+  acquireMsgvaultSyncRuntime,
+  acquireSyncSupervisorSingleton,
+  resolveMsgvaultArchive,
+} from '../src/mail/sync/msgvaultSyncRuntime.js'
 import {
   classifyMsgvaultSyncOutput,
   createMsgvaultSyncRunner,
@@ -67,6 +73,12 @@ function deferred<T>() {
   let reject!: (error: unknown) => void
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
   return { promise, resolve, reject }
+}
+
+async function captureError(promise: Promise<unknown>): Promise<Error> {
+  try { await promise }
+  catch (error) { return error instanceof Error ? error : new Error(String(error)) }
+  throw new Error('expected promise to reject')
 }
 
 describe('MsgvaultSyncSupervisor', () => {
@@ -186,6 +198,103 @@ describe('MsgvaultSyncSupervisor', () => {
     expect(Object.isFrozen(health)).toBe(true)
     await second.supervisor.stop()
   })
+
+  it('discovers additions and removals during ordinary heartbeats', async () => {
+    const accounts = ['a@test']
+    const calls: string[] = []
+    const { clock, supervisor } = harness(accounts, async (account) => {
+      calls.push(account)
+      return { changed: true }
+    }, () => 0.5, { activeIntervalMs: 1_000_000, heartbeatMs: 10, suspendLateAfterMs: 1_000 })
+    await supervisor.start(); await clock.advance(0)
+    calls.length = 0
+    accounts.splice(0, 1, 'b@test')
+    await clock.advance(10); await flush()
+    expect(calls).toEqual(['b@test'])
+    expect(supervisor.health().map((health) => health.account)).toEqual(['b@test'])
+    await supervisor.stop()
+  })
+
+  it('coalesces a second suspend during a long resume wave into one follow-up', async () => {
+    const pending = deferred<{ changed: boolean }>()
+    let calls = 0
+    const { clock, supervisor } = harness(['a@test'], async () => {
+      calls++
+      if (calls === 2) return pending.promise
+      return { changed: true }
+    }, () => 0.5, { activeIntervalMs: 1_000_000, heartbeatMs: 10, suspendLateAfterMs: 5 })
+    await supervisor.start(); await clock.advance(0)
+    await clock.advance(30)
+    expect(calls).toBe(2)
+    await clock.advance(30)
+    pending.resolve({ changed: true })
+    for (let i = 0; i < 24; i++) await Promise.resolve()
+    expect(calls).toBe(3)
+    await supervisor.stop()
+  })
+
+  it('linearizes concurrent start/stop and cleans partial timer startup', async () => {
+    const discovery = deferred<string[]>()
+    const clock = new FakeClock()
+    const supervisor = new MsgvaultSyncSupervisor({
+      discoverAccounts: () => discovery.promise,
+      syncAccount: async () => ({ changed: true }),
+      now: () => clock.now,
+      random: () => 0.5,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    })
+    const firstStart = supervisor.start()
+    expect(supervisor.start()).toBe(firstStart)
+    const firstStop = supervisor.stop()
+    expect(supervisor.stop()).toBe(firstStop)
+    discovery.resolve(['a@test'])
+    await Promise.all([firstStart, firstStop])
+    expect(clock.timers.size).toBe(0)
+    expect(supervisor.health()).toHaveLength(0)
+
+    let schedules = 0
+    const partial = new MsgvaultSyncSupervisor({
+      discoverAccounts: async () => ['a@test', 'b@test'],
+      syncAccount: async () => ({ changed: true }),
+      now: () => clock.now,
+      random: () => 0.5,
+      setTimeout(callback, delay) {
+        schedules++
+        if (schedules === 2) throw new Error('timer unavailable')
+        return clock.setTimeout(callback, delay)
+      },
+      clearTimeout: clock.clearTimeout,
+    })
+    await expect(partial.start()).rejects.toThrow(/timer unavailable/)
+    expect(clock.timers.size).toBe(0)
+    await partial.stop()
+  })
+
+  it('rejects unsafe thresholds and guarantees positive custom delays', async () => {
+    const deps: MsgvaultSyncSupervisorDependencies = {
+      discoverAccounts: async () => ['a@test'],
+      syncAccount: async () => ({ changed: true }),
+      now: () => 0,
+      random: () => 0,
+      setTimeout: () => 1,
+      clearTimeout: () => undefined,
+    }
+    expect(() => new MsgvaultSyncSupervisor(deps, { idleAfterEmptyRuns: 0.5 })).toThrow(/positive safe integer/)
+    expect(() => new MsgvaultSyncSupervisor(deps, { activeJitterFraction: 1 })).toThrow(/less than one/)
+    const delays: number[] = []
+    const tiny = new MsgvaultSyncSupervisor({ ...deps, setTimeout: (_callback, delay) => { delays.push(delay); return 1 } }, {
+      activeIntervalMs: 0.1,
+      activeJitterFraction: 0.9,
+      heartbeatMs: 1_000,
+      suspendLateAfterMs: 1_000,
+    })
+    await tiny.start()
+    expect(delays[0]).toBe(0)
+    await tiny.syncNow('a@test')
+    expect(delays).toContain(1)
+    await tiny.stop()
+  })
 })
 
 describe('msgvault discovery, runner and singleton', () => {
@@ -212,6 +321,8 @@ describe('msgvault discovery, runner and singleton', () => {
   it('classifies output and spawns direct safe argv with bounded errors', async () => {
     expect(classifyMsgvaultSyncOutput('Changes: 94 processed, 94 added')).toBe('changed')
     expect(classifyMsgvaultSyncOutput('Changes: 0 processed, 0 added')).toBe('empty')
+    expect(classifyMsgvaultSyncOutput('Changes: 0 processed, 0 added\nErrors: 400')).toBe('error')
+    expect(classifyMsgvaultSyncOutput('Changes: 2 processed, 2 added\nErrors: 1')).toBe('error')
     expect(classifyMsgvaultSyncOutput('updated messages: 2')).toBe('changed')
     expect(classifyMsgvaultSyncOutput('new messages: 0 updated messages: 0')).toBe('empty')
     expect(classifyMsgvaultSyncOutput('summary unavailable')).toBe('unknown')
@@ -226,7 +337,7 @@ describe('msgvault discovery, runner and singleton', () => {
     try {
       await expect(createMsgvaultSyncRunner({ executable, home: root })('synthetic@example.test')).resolves.toEqual({ changed: true })
       expect(JSON.parse(readFileSync(argvPath, 'utf8'))).toEqual([
-        '--home', root, '--no-log-file', 'sync', 'synthetic@example.test',
+        '--home', root, '--no-log-file', 'sync', '--', 'synthetic@example.test',
       ])
     } finally {
       if (before === undefined) delete process.env.ARGV_PATH
@@ -236,7 +347,93 @@ describe('msgvault discovery, runner and singleton', () => {
 
     const failing = join(root, 'failing-msgvault')
     writeFileSync(failing, '#!/usr/bin/env node\nconsole.error("oauth_token=do-not-leak");process.exit(7)\n'); chmodSync(failing, 0o700)
-    await expect(createMsgvaultSyncRunner({ executable: failing })('x@test')).rejects.toThrow(/exit 7.*inspect msgvault logs/)
+    const failure = await captureError(createMsgvaultSyncRunner({ executable: failing })('x@test'))
+    expect(failure.message).toMatch(/exit 7.*inspect msgvault logs/)
+    expect(failure.message).not.toContain('do-not-leak')
+
+    const partial = join(root, 'partial-msgvault')
+    writeFileSync(partial, '#!/usr/bin/env node\nprocess.stdout.write("x".repeat(70000));console.log("\\nChanges: 0 processed, 0 added\\nErrors: 400")\n')
+    chmodSync(partial, 0o700)
+    const partialFailure = await captureError(createMsgvaultSyncRunner({ executable: partial })('-user@example.test'))
+    expect(partialFailure.message).toMatch(/completed with item errors/)
+    expect(partialFailure.message).not.toContain('400')
+
+    writeFileSync(partial, '#!/usr/bin/env node\nprocess.stdout.write("x".repeat(70000));console.log("\\nChanges: 0 processed, 0 added\\nErrors: 0")\n')
+    await expect(createMsgvaultSyncRunner({ executable: partial })('-user@example.test')).resolves.toEqual({ changed: false })
+  })
+
+  it('keeps custom database discovery and CLI home coherent', async () => {
+    const defaultBase = mkdtempSync(join(tmpdir(), 'mv-default-'))
+    const defaultRoot = join(defaultBase, '.msgvault')
+    mkdirSync(defaultRoot)
+    const customRoot = mkdtempSync(join(tmpdir(), 'mv-custom-'))
+    for (const [root, account] of [[defaultRoot, 'default@test'], [customRoot, 'custom@test']] as const) {
+      const db = new DatabaseSync(join(root, 'msgvault.db'))
+      db.exec(`CREATE TABLE sources(id INTEGER PRIMARY KEY,source_type TEXT NOT NULL,identifier TEXT NOT NULL);
+        INSERT INTO sources VALUES(1,'gmail','${account}')`)
+      db.close()
+    }
+    expect(resolveMsgvaultArchive({}, {
+      HOME: defaultBase,
+      MSGVAULT_DB_PATH: join(customRoot, 'msgvault.db'),
+    })).toEqual({ home: customRoot, dbPath: join(customRoot, 'msgvault.db') })
+    expect(() => resolveMsgvaultArchive({}, {
+      MSGVAULT_HOME: defaultRoot,
+      MSGVAULT_DB_PATH: join(customRoot, 'msgvault.db'),
+    })).toThrow(/home and database conflict/)
+    expect(() => resolveMsgvaultArchive({ dbPath: join(customRoot, 'archive.db') }, {})).toThrow(/<home>\/msgvault.db/)
+
+    const executable = join(customRoot, 'fake-msgvault')
+    const executableAlias = join(customRoot, 'msgvault-alias')
+    const argvPath = join(customRoot, 'runtime-argv.json')
+    writeFileSync(executable, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.ARGV_PATH,JSON.stringify(process.argv.slice(2)));console.log('Changes: 0 processed, 0 added')\n`)
+    chmodSync(executable, 0o700)
+    symlinkSync(executable, executableAlias)
+    const clock = new FakeClock()
+    const injected = {
+      now: () => clock.now,
+      random: () => 0.5,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    }
+    const before = process.env.ARGV_PATH
+    process.env.ARGV_PATH = argvPath
+    try {
+      const first = await acquireMsgvaultSyncRuntime({ enabled: true, dbPath: join(customRoot, 'msgvault.db'), executable }, injected)
+      const second = await acquireMsgvaultSyncRuntime({ enabled: true, dbPath: join(customRoot, 'msgvault.db'), executable: executableAlias }, injected)
+      expect(second.supervisor).toBe(first.supervisor)
+      expect(first.supervisor?.health().map((health) => health.account)).toEqual(['custom@test'])
+      await first.supervisor?.syncNow('custom@test')
+      expect(JSON.parse(readFileSync(argvPath, 'utf8'))).toEqual([
+        '--home', customRoot, '--no-log-file', 'sync', '--', 'custom@test',
+      ])
+      await expect(acquireMsgvaultSyncRuntime({
+        enabled: true,
+        dbPath: join(customRoot, 'msgvault.db'),
+        executable,
+        activeIntervalMs: 121_000,
+      }, injected)).rejects.toThrow(/conflicting sync supervisor configuration/)
+
+      const contended = spawnSync('flock', ['-n', '-E', '73', customRoot, '/bin/true'])
+      expect(contended.status).toBe(73)
+      await first.release()
+      expect(spawnSync('flock', ['-n', '-E', '73', customRoot, '/bin/true']).status).toBe(73)
+      await second.release()
+      expect(spawnSync('flock', ['-n', '-E', '73', customRoot, '/bin/true']).status).toBe(0)
+    } finally {
+      if (before === undefined) delete process.env.ARGV_PATH
+      else process.env.ARGV_PATH = before
+    }
+  })
+
+  it('holds and releases cross-process archive inode ownership', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-lock-'))
+    const dbPath = join(root, 'msgvault.db')
+    writeFileSync(dbPath, '')
+    const lock = await acquireMsgvaultArchiveLock(dbPath)
+    expect(spawnSync('flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(73)
+    await lock.release()
+    expect(spawnSync('flock', ['-n', '-E', '73', dbPath, '/bin/true']).status).toBe(0)
   })
 
   it('registers sync shutdown on the server lifecycle without disturbing routes', async () => {

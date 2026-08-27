@@ -4,10 +4,10 @@
 // domain types (src/shared/types.ts). Product state never lives here; joins to
 // product data happen by rfc822_message_id (+ source_id) at the product layer.
 //
-// msgvault is alpha software: this adapter and its focused internal projection
-// module are the ONLY modules allowed to know its schema. Shape-checked on open
-// and tested against 0.19; schema drift fails loudly here. msgvault exposes no
-// runtime release-version metadata to pin.
+// msgvault is alpha software: this adapter, its focused internal projection,
+// and sync/msgvaultAccounts.ts are the only modules allowed to know its schema.
+// Shape-checked on open and tested against 0.19; schema drift fails loudly here.
+// msgvault exposes no runtime release-version metadata to pin.
 import { DatabaseSync } from 'node:sqlite'
 import { inflateSync } from 'node:zlib'
 import { join } from 'node:path'

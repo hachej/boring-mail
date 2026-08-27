@@ -17,6 +17,7 @@ export interface MsgvaultSyncSupervisorDependencies {
   random(): number
   setTimeout(callback: () => void, delayMs: number): unknown
   clearTimeout(handle: unknown): void
+  onError?(message: string): void
 }
 
 export interface MsgvaultSyncSupervisorOptions {
@@ -56,6 +57,11 @@ function finitePositive(value: number, name: string): number {
   return value
 }
 
+function positiveSafeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer`)
+  return value
+}
+
 function boundedRandom(value: number): number {
   if (!Number.isFinite(value) || value < 0 || value >= 1) throw new Error('random() must return [0,1)')
   return value
@@ -64,17 +70,13 @@ function boundedRandom(value: number): number {
 function sanitizedError(error: unknown, account: string): string {
   const raw = error instanceof Error ? error.message : String(error)
   const firstLine = raw.split(/\r?\n/, 1)[0] ?? 'sync failed'
-  const redacted = firstLine
-    .replaceAll(account, '[account]')
+  const redacted = (account ? firstLine.replaceAll(account, '[account]') : firstLine)
     .replace(/(?:oauth|access|refresh|client)[_-]?(?:token|secret)\s*[:=]\s*\S+/gi, '[credential redacted]')
     .replace(/(?:[A-Za-z]:\\|\/)\S+/g, '[path]')
   return redacted.slice(0, 240) || 'sync failed'
 }
 
-/**
- * One process-local scheduler. Account timers are armed only after the prior
- * run (and one coalesced follow-up) has completed; setInterval is never used.
- */
+/** One process-local scheduler with serialized discovery and lifecycle. */
 export class MsgvaultSyncSupervisor {
   readonly #deps: MsgvaultSyncSupervisorDependencies
   readonly #activeIntervalMs: number
@@ -87,37 +89,47 @@ export class MsgvaultSyncSupervisor {
   readonly #accounts = new Map<string, AccountState>()
   #started = false
   #stopping = false
+  #startPromise: Promise<void> | null = null
+  #stopPromise: Promise<void> | null = null
+  #refreshPromise: Promise<AccountState[]> | null = null
+  #reconcileWave: Promise<void> | null = null
   #heartbeat: unknown | null = null
   #heartbeatDueAt: number | null = null
   #resumeWave: Promise<void> | null = null
+  #resumePending = false
 
   constructor(deps: MsgvaultSyncSupervisorDependencies, options: MsgvaultSyncSupervisorOptions = {}) {
     this.#deps = deps
     this.#activeIntervalMs = finitePositive(options.activeIntervalMs ?? ACTIVE_SYNC_INTERVAL_MS, 'activeIntervalMs')
     this.#activeJitterFraction = options.activeJitterFraction ?? ACTIVE_SYNC_JITTER_FRACTION
-    if (!Number.isFinite(this.#activeJitterFraction) || this.#activeJitterFraction < 0 || this.#activeJitterFraction > 1) {
-      throw new Error('activeJitterFraction must be between 0 and 1')
+    if (!Number.isFinite(this.#activeJitterFraction) || this.#activeJitterFraction < 0 || this.#activeJitterFraction >= 1) {
+      throw new Error('activeJitterFraction must be at least zero and less than one')
     }
     this.#idleMinMs = finitePositive(options.idleMinMs ?? IDLE_SYNC_MIN_MS, 'idleMinMs')
     this.#idleMaxMs = finitePositive(options.idleMaxMs ?? IDLE_SYNC_MAX_MS, 'idleMaxMs')
     if (this.#idleMaxMs < this.#idleMinMs) throw new Error('idleMaxMs must be >= idleMinMs')
-    this.#idleAfterEmptyRuns = Math.floor(finitePositive(options.idleAfterEmptyRuns ?? IDLE_AFTER_EMPTY_RUNS, 'idleAfterEmptyRuns'))
+    this.#idleAfterEmptyRuns = positiveSafeInteger(options.idleAfterEmptyRuns ?? IDLE_AFTER_EMPTY_RUNS, 'idleAfterEmptyRuns')
     this.#heartbeatMs = finitePositive(options.heartbeatMs ?? SUSPEND_HEARTBEAT_MS, 'heartbeatMs')
     this.#suspendLateAfterMs = finitePositive(options.suspendLateAfterMs ?? SUSPEND_LATE_AFTER_MS, 'suspendLateAfterMs')
   }
 
-  async start(): Promise<void> {
-    if (this.#started) return
-    if (this.#stopping) throw new Error('sync supervisor is stopping')
+  start(): Promise<void> {
+    if (this.#startPromise) return this.#startPromise
+    if (this.#stopping) return Promise.reject(new Error('sync supervisor is stopping'))
     this.#started = true
-    try {
-      await this.#refreshAccounts()
-      for (const state of this.#accounts.values()) this.#schedule(state, 0)
-      this.#scheduleHeartbeat()
-    } catch (error) {
-      this.#started = false
-      throw error
-    }
+    this.#startPromise = (async () => {
+      try {
+        await this.#refreshAccounts()
+        if (this.#stopping) return
+        for (const state of this.#accounts.values()) this.#schedule(state, 0)
+        this.#scheduleHeartbeat()
+      } catch (error) {
+        this.#clearTimers()
+        this.#started = false
+        throw error
+      }
+    })()
+    return this.#startPromise
   }
 
   health(): readonly AccountSyncHealth[] {
@@ -137,6 +149,7 @@ export class MsgvaultSyncSupervisor {
   }
 
   async syncNow(account?: string): Promise<void> {
+    await this.#startPromise
     if (!this.#started || this.#stopping) return
     if (account !== undefined) {
       const state = this.#accounts.get(account)
@@ -148,12 +161,29 @@ export class MsgvaultSyncSupervisor {
     await Promise.all([...this.#accounts.values()].filter((state) => !state.removed).map((state) => this.#request(state)))
   }
 
-  async stop(): Promise<void> {
-    if (this.#stopping) {
-      await Promise.all([...this.#accounts.values()].map((state) => state.inFlight).filter(Boolean))
-      return
-    }
+  stop(): Promise<void> {
+    if (this.#stopPromise) return this.#stopPromise
     this.#stopping = true
+    this.#stopPromise = (async () => {
+      this.#clearTimers()
+      await this.#startPromise?.catch(() => undefined)
+      this.#clearTimers()
+      await this.#refreshPromise?.catch(() => undefined)
+      await this.#reconcileWave?.catch(() => undefined)
+      this.#resumePending = false
+      await this.#resumeWave?.catch(() => undefined)
+      for (;;) {
+        const active = [...this.#accounts.values()].map((state) => state.inFlight).filter(Boolean) as Promise<void>[]
+        if (active.length === 0) break
+        await Promise.all(active)
+      }
+      this.#clearTimers()
+      this.#started = false
+    })()
+    return this.#stopPromise
+  }
+
+  #clearTimers(): void {
     if (this.#heartbeat !== null) this.#deps.clearTimeout(this.#heartbeat)
     this.#heartbeat = null
     this.#heartbeatDueAt = null
@@ -163,17 +193,15 @@ export class MsgvaultSyncSupervisor {
       state.nextRunAt = null
       state.followUp = false
     }
-    if (this.#resumeWave) await this.#resumeWave.catch(() => undefined)
-    await Promise.all([...this.#accounts.values()].map((state) => state.inFlight).filter(Boolean))
   }
 
   #activeDelay(): number {
     const random = boundedRandom(this.#deps.random())
-    return Math.round(this.#activeIntervalMs * (1 - this.#activeJitterFraction + 2 * this.#activeJitterFraction * random))
+    return Math.max(1, Math.round(this.#activeIntervalMs * (1 - this.#activeJitterFraction + 2 * this.#activeJitterFraction * random)))
   }
 
   #idleDelay(): number {
-    return Math.round(this.#idleMinMs + (this.#idleMaxMs - this.#idleMinMs) * boundedRandom(this.#deps.random()))
+    return Math.max(1, Math.round(this.#idleMinMs + (this.#idleMaxMs - this.#idleMinMs) * boundedRandom(this.#deps.random())))
   }
 
   #nextDelay(state: AccountState): number {
@@ -209,46 +237,68 @@ export class MsgvaultSyncSupervisor {
           state.lastError = null
           state.consecutiveEmpty = result.changed ? 0 : state.consecutiveEmpty + 1
         } catch (error) {
+          state.consecutiveEmpty = 0
           state.lastError = sanitizedError(error, state.account)
+          this.#reportError(state.lastError)
         }
       } while (state.followUp && !this.#stopping && !state.removed)
     })()
     state.inFlight = work.finally(() => {
       state.inFlight = null
-      if (!this.#stopping && !state.removed) this.#schedule(state, this.#nextDelay(state))
-      else if (state.removed) this.#accounts.delete(state.account)
+      if (!this.#stopping && !state.removed) {
+        try { this.#schedule(state, this.#nextDelay(state)) }
+        catch (error) {
+          state.lastError = sanitizedError(error, state.account)
+          this.#reportError(state.lastError)
+        }
+      } else if (state.removed) this.#accounts.delete(state.account)
     })
     return state.inFlight
   }
 
-  async #refreshAccounts(): Promise<void> {
-    const discovered = await this.#deps.discoverAccounts()
-    const active = new Set(discovered)
-    for (const account of discovered) {
-      if (this.#accounts.has(account)) {
-        this.#accounts.get(account)!.removed = false
-        continue
+  #refreshAccounts(): Promise<AccountState[]> {
+    if (this.#refreshPromise) return this.#refreshPromise
+    const refresh = (async () => {
+      const discovered = await this.#deps.discoverAccounts()
+      if (this.#stopping) return []
+      const active = new Set(discovered)
+      const added: AccountState[] = []
+      for (const account of discovered) {
+        const existing = this.#accounts.get(account)
+        if (existing) {
+          existing.removed = false
+          continue
+        }
+        const state: AccountState = {
+          account,
+          timer: null,
+          nextRunAt: null,
+          inFlight: null,
+          followUp: false,
+          consecutiveEmpty: 0,
+          lastSuccessAt: null,
+          lastError: null,
+          removed: false,
+        }
+        this.#accounts.set(account, state)
+        added.push(state)
       }
-      this.#accounts.set(account, {
-        account,
-        timer: null,
-        nextRunAt: null,
-        inFlight: null,
-        followUp: false,
-        consecutiveEmpty: 0,
-        lastSuccessAt: null,
-        lastError: null,
-        removed: false,
-      })
-    }
-    for (const state of this.#accounts.values()) {
-      if (active.has(state.account)) continue
-      state.removed = true
-      if (state.timer !== null) this.#deps.clearTimeout(state.timer)
-      state.timer = null
-      state.nextRunAt = null
-      if (!state.inFlight) this.#accounts.delete(state.account)
-    }
+      for (const state of this.#accounts.values()) {
+        if (active.has(state.account)) continue
+        state.removed = true
+        if (state.timer !== null) this.#deps.clearTimeout(state.timer)
+        state.timer = null
+        state.nextRunAt = null
+        state.followUp = false
+        if (!state.inFlight) this.#accounts.delete(state.account)
+      }
+      return added
+    })()
+    const tracked = refresh.finally(() => {
+      if (this.#refreshPromise === tracked) this.#refreshPromise = null
+    })
+    this.#refreshPromise = tracked
+    return tracked
   }
 
   #scheduleHeartbeat(): void {
@@ -260,16 +310,50 @@ export class MsgvaultSyncSupervisor {
       this.#heartbeatDueAt = null
       this.#scheduleHeartbeat()
       if (lateBy >= this.#suspendLateAfterMs) this.#requestResumeWave()
+      else void this.#refreshAndRunAdditions()
     }, this.#heartbeatMs)
   }
 
+  #refreshAndRunAdditions(): Promise<void> {
+    if (this.#reconcileWave) return this.#reconcileWave
+    const wave = (async () => {
+      try {
+        const added = await this.#refreshAccounts()
+        await Promise.all(added.map((state) => this.#request(state)))
+      } catch (error) {
+        const message = sanitizedError(error, '')
+        this.#reportError(message)
+        for (const state of this.#accounts.values()) state.lastError = message
+      }
+    })()
+    const tracked = wave.finally(() => {
+      if (this.#reconcileWave === tracked) this.#reconcileWave = null
+    })
+    this.#reconcileWave = tracked
+    return tracked
+  }
+
+  #reportError(message: string): void {
+    try { this.#deps.onError?.(message) }
+    catch { /* diagnostics must never break scheduling */ }
+  }
+
   #requestResumeWave(): void {
-    if (this.#stopping || this.#resumeWave) return
+    if (this.#stopping) return
+    if (this.#resumeWave) {
+      this.#resumePending = true
+      return
+    }
     this.#resumeWave = (async () => {
-      await this.#refreshAccounts()
-      await Promise.all([...this.#accounts.values()].filter((state) => !state.removed).map((state) => this.#request(state)))
+      do {
+        this.#resumePending = false
+        await this.#refreshAccounts()
+        await Promise.all([...this.#accounts.values()].filter((state) => !state.removed).map((state) => this.#request(state)))
+      } while (this.#resumePending && !this.#stopping)
     })().catch((error) => {
-      for (const state of this.#accounts.values()) state.lastError = sanitizedError(error, state.account)
+      const message = sanitizedError(error, '')
+      this.#reportError(message)
+      for (const state of this.#accounts.values()) state.lastError = message
     }).finally(() => { this.#resumeWave = null })
   }
 }
