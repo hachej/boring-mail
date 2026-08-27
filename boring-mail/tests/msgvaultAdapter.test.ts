@@ -67,10 +67,10 @@ describe('msgvaultAdapter', () => {
     )
     db.exec(
       `INSERT INTO messages (id, conversation_id, source_id, source_message_id, rfc822_message_id,
-        sent_at, sender_id, subject, snippet, is_read)
+        message_type, sent_at, sender_id, subject, snippet, is_read)
        VALUES
-        (1, 1, 1, 'gmsg_1', '<q1@example.com>', '2026-08-19 09:00:00+00:00', 2, 'Quarterly report', 'here are the numbers', 1),
-        (2, 1, 1, 'gmsg_2', '<q2@example.com>', '2026-08-20 12:00:00+00:00', 1, 'Re: Quarterly report', 'see attached numbers', 0)`,
+        (1, 1, 1, 'gmsg_1', '<q1@example.com>', 'email', '2026-08-19 09:00:00+00:00', 2, 'Quarterly report', 'here are the numbers', 1),
+        (2, 1, 1, 'gmsg_2', '<q2@example.com>', 'email', '2026-08-20 12:00:00+00:00', 1, 'Re: Quarterly report', 'see attached numbers', 0)`,
     )
     const raw = deflateSync(
       mimeMessage({
@@ -104,8 +104,8 @@ describe('msgvaultAdapter', () => {
        VALUES (2, 1, 'thr_2', 'email_thread', 'Deleted thing', 1)`,
     )
     db.exec(
-      `INSERT INTO messages (id, conversation_id, source_id, source_message_id, rfc822_message_id, subject, deleted_at)
-       VALUES (3, 2, 1, 'gmsg_3', '<d@example.com>', 'Deleted thing', CURRENT_TIMESTAMP)`,
+      `INSERT INTO messages (id, conversation_id, source_id, source_message_id, rfc822_message_id, message_type, subject, deleted_at)
+       VALUES (3, 2, 1, 'gmsg_3', '<d@example.com>', 'email', 'Deleted thing', CURRENT_TIMESTAMP)`,
     )
 
     store = { db }
@@ -124,7 +124,7 @@ describe('msgvaultAdapter', () => {
     )
     bad.exec(`INSERT INTO sources(id,source_type,identifier) VALUES(1,'gmail','fixture@example.com');
       INSERT INTO conversations(id,source_id,conversation_type) VALUES(1,1,'email_thread');
-      INSERT INTO messages(id,conversation_id,source_id) VALUES('duplicate',1,1),('duplicate',1,1)`)
+      INSERT INTO messages(id,conversation_id,source_id,message_type) VALUES('duplicate',1,1,'email'),('duplicate',1,1,'email')`)
     bad.close()
     expect(() => openMsgvaultStore(path)).toThrow(/messages\.id must have INTEGER affinity and be the single primary key/)
   })
@@ -337,8 +337,8 @@ describe('msgvaultAdapter — review-finding edges', () => {
        VALUES (1, 1, 't1', 'email_thread', 'Edge')`,
     )
     raw.exec(
-      `INSERT INTO messages (id, conversation_id, source_id, rfc822_message_id, subject, snippet, deleted_at)
-       VALUES (10, 1, 1, '<e1@example.com>', 'Deleted edge', 'gone', CURRENT_TIMESTAMP)`,
+      `INSERT INTO messages (id, conversation_id, source_id, rfc822_message_id, message_type, subject, snippet, deleted_at)
+       VALUES (10, 1, 1, '<e1@example.com>', 'email', 'Deleted edge', 'gone', CURRENT_TIMESTAMP)`,
     )
     raw
       .prepare(

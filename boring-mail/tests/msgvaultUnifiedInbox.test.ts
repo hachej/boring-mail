@@ -37,6 +37,11 @@ describe('msgvaultAdapter — unified inbox projection', () => {
         (11,1,'a-1','email_thread'), (12,2,'b-1','email_thread'),
         (13,3,'c-1','email_thread'), (14,4,'d-1','email_thread'),
         (15,2,'b-calendar','calendar');
+      INSERT INTO participants(id,email_address,display_name,domain) VALUES
+        (1001,'ALIAS-A@example.com',NULL,'example.com'),
+        (1002,'alias-a@example.com',NULL,'example.com'),
+        (1003,'owner-b@example.com',NULL,'example.com'),
+        (1004,'disconnected@example.com',NULL,'example.com');
     `)
     const insert = raw.prepare(`INSERT INTO messages(
       id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,
@@ -54,20 +59,20 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     // Alias-addressed source 1 wins over a newer non-addressed source 2 copy.
     message(101, 11, 1, '<alias@example.com>', '2030-01-07 00:00:00+00:00', 'alias owner')
     message(102, 12, 2, '<alias@example.com>', '2030-01-08 00:00:00+00:00', 'newer other')
-    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
-      VALUES(101,'To','ALIAS-A@example.com')`)
+    raw.exec(`INSERT INTO message_recipients(message_id,participant_id,recipient_type,email_address)
+      VALUES(101,1001,'To','ALIAS-A@example.com')`)
 
     // Cc is addressed; when both copies are addressed, newest addressed wins.
     message(201, 11, 1, '<cc@example.com>', '2030-01-05 00:00:00+00:00', 'older cc')
     message(202, 12, 2, '<cc@example.com>', '2030-01-06 00:00:00+00:00', 'newer to')
-    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address) VALUES
-      (201,'cc','alias-a@example.com'),(202,'TO','owner-b@example.com')`)
+    raw.exec(`INSERT INTO message_recipients(message_id,participant_id,recipient_type,email_address) VALUES
+      (201,1002,'cc','alias-a@example.com'),(202,1003,'TO','owner-b@example.com')`)
 
     // Bcc is addressed even with provider casing; it beats a newer unaddressed copy.
     message(211, 11, 1, '<bcc@example.com>', '2030-01-04 12:00:00+00:00', 'older bcc')
     message(212, 12, 2, '<bcc@example.com>', '2030-01-04 18:00:00+00:00', 'newer unaddressed')
-    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
-      VALUES(211,'BcC','ALIAS-A@example.com')`)
+    raw.exec(`INSERT INTO message_recipients(message_id,participant_id,recipient_type,email_address)
+      VALUES(211,1001,'BcC','ALIAS-A@example.com')`)
 
     // No addressed account: newest copy wins, then source id is stable.
     message(301, 11, 1, '<newest@example.com>', '2030-01-03 00:00:00+00:00', 'older fallback')
@@ -96,14 +101,14 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     message(501, 11, 1, '<connected@example.com>', '2029-11-01 00:00:00+00:00', 'connected')
     message(502, 13, 3, '<connected@example.com>', '2032-01-01 00:00:00+00:00', 'disconnected addressed')
     message(503, 14, 4, '<unregistered@example.com>', '2032-01-01 00:00:00+00:00', 'unregistered')
-    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
-      VALUES(502,'to','disconnected@example.com')`)
+    raw.exec(`INSERT INTO message_recipients(message_id,participant_id,recipient_type,email_address)
+      VALUES(502,1004,'to','disconnected@example.com')`)
 
     // An email-typed row in a non-email conversation cannot count or win.
     message(550, 11, 1, '<mixed-conversation@example.com>', '2029-10-30 00:00:00+00:00', 'replyable copy')
     message(551, 15, 2, '<mixed-conversation@example.com>', '2034-01-01 00:00:00+00:00', 'calendar copy')
-    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
-      VALUES(551,'to','owner-b@example.com')`)
+    raw.exec(`INSERT INTO message_recipients(message_id,participant_id,recipient_type,email_address)
+      VALUES(551,1003,'to','owner-b@example.com')`)
 
     // Both deletion forms and non-email rows never surface.
     message(801, 11, 1, '<local-delete@example.com>', '2033-01-01 00:00:00+00:00', 'local deleted', 'gone')

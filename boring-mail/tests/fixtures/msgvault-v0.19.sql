@@ -28,7 +28,7 @@ CREATE TABLE messages (
   source_id INTEGER NOT NULL REFERENCES sources(id),
   source_message_id TEXT,
   rfc822_message_id TEXT,
-  message_type TEXT NOT NULL DEFAULT 'email',
+  message_type TEXT NOT NULL,
   sent_at DATETIME,
   received_at DATETIME,
   internal_date DATETIME,
@@ -48,7 +48,7 @@ CREATE INDEX idx_messages_live_sent_at
 CREATE TABLE message_recipients (
   id INTEGER PRIMARY KEY,
   message_id INTEGER NOT NULL REFERENCES messages(id),
-  participant_id INTEGER,
+  participant_id INTEGER NOT NULL REFERENCES participants(id),
   recipient_type TEXT NOT NULL,
   display_name TEXT,
   email_address TEXT
