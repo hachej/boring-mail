@@ -1,11 +1,16 @@
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import {
   accessSync,
   closeSync,
   constants as fsConstants,
+  existsSync,
   fstatSync,
   openSync,
+  readFileSync,
   statSync,
+  unlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 
@@ -17,18 +22,23 @@ const CHILD_DIRECTORY_FD = 3
 const CHILD_DATABASE_FD = 4
 const CHILD_DAEMON_LOCK_FD = 5
 const CHILD_WRITE_LOCK_FD = 6
+const CHILD_CONFIG_FD = 7
 const DAEMON_LOCK_FILE = 'daemon.lock'
 const WRITE_LOCK_FILE = 'db.write.lock'
+const MAX_CONFIG_BYTES = 1024 * 1024
 
 export interface MsgvaultLockedSpawnContext {
   /** Descriptor-backed original home inside the spawned child. */
   readonly home: string
-  /** Locked parent OFDs copied into child fds 3 through 6. */
+  /** Immutable config snapshot inside the spawned child. */
+  readonly configPath: string
+  /** Locked parent OFDs plus config snapshot copied into child fds 3–7. */
   readonly inheritedFds: readonly [
     directoryFd: number,
     databaseFd: number,
     daemonLockFd: number,
     writeLockFd: number,
+    configFd: number,
   ]
 }
 
@@ -64,11 +74,16 @@ function closeAll(fds: number[]): void {
  * parent crash cannot unlock an orphaned writer. Owning daemon.lock also makes
  * ordinary msgvault daemon startup fail rather than overlap this supervisor.
  */
-export async function acquireMsgvaultArchiveLock(dbPath: string): Promise<MsgvaultArchiveLock> {
+export async function acquireMsgvaultArchiveLock(
+  dbPath: string,
+  options: { configPath?: string } = {},
+): Promise<MsgvaultArchiveLock> {
   const home = dirname(dbPath)
   const daemonLockPath = join(home, DAEMON_LOCK_FILE)
   const writeLockPath = join(home, WRITE_LOCK_FILE)
-  const fds = [-1, -1, -1, -1]
+  const requestedConfigPath = options.configPath ?? join(home, 'config.toml')
+  const configSourcePath = existsSync(requestedConfigPath) ? requestedConfigPath : null
+  const fds = [-1, -1, -1, -1, -1]
   let child: ChildProcess | null = null
   let holderClosedCode: Promise<number> | null = null
   try {
@@ -84,7 +99,7 @@ export async function acquireMsgvaultArchiveLock(dbPath: string): Promise<Msgvau
 
     if (!fstatSync(fds[0]!).isDirectory()) throw genericLockError('msgvault home is not a directory')
     const labels = ['database', 'daemon lock', 'write-owner lock']
-    for (let index = 1; index < fds.length; index++) {
+    for (let index = 1; index < 4; index++) {
       const stat = fstatSync(fds[index]!)
       if (!stat.isFile() || stat.nlink !== 1) {
         throw genericLockError(`msgvault ${labels[index - 1]} must be a single-link regular file`)
@@ -138,7 +153,49 @@ export async function acquireMsgvaultArchiveLock(dbPath: string): Promise<Msgvau
       })
     })
 
-    const identities = fds.map((fd) => fstatSync(fd, { bigint: true }))
+    // Snapshot exact config bytes only after all archive/native locks are held.
+    // The anonymous 0600 inode cannot be renamed or changed by later config
+    // edits, and every child reads only its inherited descriptor path.
+    let configBytes = Buffer.alloc(0)
+    if (configSourcePath) {
+      const sourceFd = openSync(configSourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
+      try {
+        const source = fstatSync(sourceFd)
+        if (!source.isFile() || source.nlink !== 1 || source.size > MAX_CONFIG_BYTES) {
+          throw genericLockError('msgvault config must be a single-link regular file no larger than 1 MiB')
+        }
+        configBytes = readFileSync(sourceFd)
+      } finally {
+        closeSync(sourceFd)
+      }
+    }
+    // Conservative fail-closed policy: msgvault 0.19 applies TOML after
+    // --home, so any storage override could redirect the direct worker away
+    // from the four owned archive/native lock OFDs.
+    const normalizedConfig = configBytes.toString('utf8').replace(
+      /\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))/gu,
+      (_match, short: string | undefined, long: string | undefined) =>
+        String.fromCodePoint(Number.parseInt(short ?? long!, 16)),
+    )
+    if (/(?:data_dir|database_url)/u.test(normalizedConfig)) {
+      throw new Error(
+        'REMEDIATION: msgvault config storage overrides are unsupported; remove data_dir/database_url and select the archive with MSGVAULT_HOME',
+      )
+    }
+    const snapshotPath = join(home, `.boring-mail-msgvault-config-${randomBytes(16).toString('hex')}`)
+    fds[4] = openSync(
+      snapshotPath,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+      0o600,
+    )
+    try {
+      writeFileSync(fds[4]!, configBytes)
+    } finally {
+      unlinkSync(snapshotPath)
+      configBytes.fill(0)
+    }
+
+    const identities = fds.slice(0, 4).map((fd) => fstatSync(fd, { bigint: true }))
     const namedPaths = [home, dbPath, daemonLockPath, writeLockPath]
     const assertNamedIdentity = () => {
       try {
@@ -171,7 +228,8 @@ export async function acquireMsgvaultArchiveLock(dbPath: string): Promise<Msgvau
         assertNamedIdentity()
         return {
           home: `/proc/self/fd/${CHILD_DIRECTORY_FD}`,
-          inheritedFds: [fds[0]!, fds[1]!, fds[2]!, fds[3]!],
+          configPath: `/proc/self/fd/${CHILD_CONFIG_FD}`,
+          inheritedFds: [fds[0]!, fds[1]!, fds[2]!, fds[3]!, fds[4]!],
         }
       },
       release() {

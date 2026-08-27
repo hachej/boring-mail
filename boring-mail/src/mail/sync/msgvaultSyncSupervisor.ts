@@ -31,6 +31,12 @@ export interface MsgvaultSyncSupervisorOptions {
   suspendLateAfterMs?: number
 }
 
+export interface MaintenanceSyncHealth {
+  readonly lastError: string | null
+  readonly heartbeatError: string | null
+  readonly discoveryError: string | null
+}
+
 export interface AccountSyncHealth {
   readonly account: string
   readonly lastSuccessAt: number | null
@@ -113,6 +119,7 @@ export class MsgvaultSyncSupervisor {
   #heartbeatDueAt: number | null = null
   #heartbeatRetryQueued = false
   #heartbeatError: string | null = null
+  #discoveryError: string | null = null
 
   constructor(deps: MsgvaultSyncSupervisorDependencies, options: MsgvaultSyncSupervisorOptions = {}) {
     this.#deps = deps
@@ -151,8 +158,21 @@ export class MsgvaultSyncSupervisor {
     return this.#startPromise
   }
 
+  #maintenanceError(): string | null {
+    return this.#heartbeatError ?? this.#discoveryError
+  }
+
+  maintenanceHealth(): MaintenanceSyncHealth {
+    return Object.freeze({
+      lastError: this.#maintenanceError(),
+      heartbeatError: this.#heartbeatError,
+      discoveryError: this.#discoveryError,
+    })
+  }
+
   health(): readonly AccountSyncHealth[] {
     const now = this.#deps.now()
+    const maintenanceError = this.#maintenanceError()
     return Object.freeze([...this.#accounts.values()]
       .filter((state) => !state.removed)
       .sort((a, b) => a.account.localeCompare(b.account))
@@ -163,8 +183,8 @@ export class MsgvaultSyncSupervisor {
         inFlight: state.inFlight !== null,
         consecutiveEmpty: state.consecutiveEmpty,
         nextRunAt: state.nextRunAt,
-        lastError: state.lastError ?? this.#heartbeatError,
-        maintenanceError: this.#heartbeatError,
+        lastError: state.lastError ?? maintenanceError,
+        maintenanceError,
       })))
   }
 
@@ -313,6 +333,7 @@ export class MsgvaultSyncSupervisor {
     if (this.#refreshPromise) return this.#refreshPromise
     const refresh = (async () => {
       const discovered = await this.#deps.discoverAccounts()
+      this.#discoveryError = null
       if (this.#stopping) return []
       const active = new Set(discovered.map(accountKey))
       const added: AccountState[] = []
@@ -388,8 +409,8 @@ export class MsgvaultSyncSupervisor {
           await Promise.all(targets.map((state) => this.#request(state)))
         } catch (error) {
           const message = sanitizedError(error, '')
+          this.#discoveryError = message
           this.#reportError(message)
-          for (const state of this.#accounts.values()) state.lastError = message
           // A mode coalesced while this failed iteration was pending remains in
           // #maintenancePending and is processed by the next loop iteration.
         }

@@ -1,13 +1,15 @@
 // @vitest-environment node
 import { spawnSync } from 'node:child_process'
 import {
-  chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
 import createBoringMailServerPlugin from '../src/boring-ui/server.js'
+import { acquireMsgvaultArchiveLock } from '../src/mail/sync/msgvaultArchiveLock.js'
+import { verifyMsgvaultContract } from '../src/mail/sync/msgvaultContract.js'
 import {
   acquireMsgvaultSyncRuntime,
   resolveMsgvaultArchive,
@@ -23,9 +25,12 @@ function createArchive(root: string, account = 'CaseSensitive@Example.Test'): st
   return dbPath
 }
 
-function createExecutable(root: string, body: string): string {
+function createExecutable(root: string, body: string, version = '0.19.3'): string {
   const executable = join(root, 'fake-msgvault')
-  writeFileSync(executable, `#!/usr/bin/env node\n${body}\n`)
+  writeFileSync(executable, `#!/usr/bin/env node
+if (process.argv.includes('version')) { const i=process.argv.indexOf('--home');console.error('data_dir='+process.argv[i+1]);console.log('msgvault v${version}'); process.exit(0) }
+${body}
+`)
   chmodSync(executable, 0o700)
   return executable
 }
@@ -70,7 +75,8 @@ describe('msgvault sync runtime', () => {
       expect(first.supervisor?.health().map((health) => health.account)).toEqual(['CaseSensitive@Example.Test'])
       await first.supervisor?.syncNow('CaseSensitive@Example.Test')
       expect(JSON.parse(readFileSync(argvPath, 'utf8'))).toEqual([
-        '--home', '/proc/self/fd/3', '--no-log-file', 'sync', '--', 'CaseSensitive@Example.Test',
+        '--home', '/proc/self/fd/3', '--config', '/proc/self/fd/7', '--no-log-file',
+        'sync', '--', 'CaseSensitive@Example.Test',
       ])
       await expect(acquireMsgvaultSyncRuntime({
         enabled: true, dbPath, executable, activeIntervalMs: 121_000,
@@ -87,6 +93,54 @@ describe('msgvault sync runtime', () => {
       if (previousHome === undefined) delete process.env.MSGVAULT_HOME
       else process.env.MSGVAULT_HOME = previousHome
       await releaseAll(leases)
+    }
+  })
+
+  it('pins exact config bytes and rejects storage redirection before spawn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-config-pin-'))
+    const dbPath = createArchive(root, 'config@test')
+    const configPath = join(root, 'config.toml')
+    const observedPath = join(root, 'observed-config')
+    writeFileSync(configPath, '# original config\n')
+    const executable = createExecutable(root, `
+const fs=require('node:fs');const args=process.argv.slice(2);const config=args[args.indexOf('--config')+1];
+fs.writeFileSync(${JSON.stringify(observedPath)},fs.readFileSync(config));console.log('Changes: 0 processed, 0 added')`)
+    const lease = await acquireMsgvaultSyncRuntime({ enabled: true, dbPath, executable, configPath })
+    try {
+      writeFileSync(configPath, '# changed after acquisition\n')
+      await lease.supervisor?.syncNow('config@test')
+      expect(readFileSync(observedPath, 'utf8')).toBe('# original config\n')
+    } finally {
+      await lease.release()
+    }
+
+    const target = mkdtempSync(join(tmpdir(), 'mv-config-target-'))
+    writeFileSync(configPath, `[data]\ndata_dir = ${JSON.stringify(target)}\n`)
+    await expect(acquireMsgvaultSyncRuntime({ enabled: true, dbPath, executable, configPath }))
+      .rejects.toThrow(/storage overrides are unsupported/)
+    expect(existsSync(join(target, 'msgvault.db'))).toBe(false)
+  })
+
+  it('requires the exact pinned msgvault version before scheduling', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-version-pin-'))
+    const dbPath = createArchive(root, 'version@test')
+    const executable = createExecutable(root, `console.log('Changes: 0 processed, 0 added')`, '0.19.4')
+    await expect(acquireMsgvaultSyncRuntime({ enabled: true, dbPath, executable }))
+      .rejects.toThrow(/install exact msgvault v0\.19\.3/)
+    expect(spawnSync('/usr/bin/flock', ['-n', '-E', '73', root, '/bin/true']).status).toBe(0)
+  })
+
+  it('bounds a hung exact-version contract probe', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-version-timeout-'))
+    const dbPath = createArchive(root, 'timeout@test')
+    const executable = join(root, 'hanging-msgvault')
+    writeFileSync(executable, '#!/bin/sh\nexec sleep 10\n'); chmodSync(executable, 0o700)
+    const lock = await acquireMsgvaultArchiveLock(dbPath)
+    try {
+      await expect(verifyMsgvaultContract(executable, lock, { timeoutMs: 20 }))
+        .rejects.toThrow(/version probe timed out/)
+    } finally {
+      await lock.release()
     }
   })
 

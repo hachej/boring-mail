@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 import { discoverMsgvaultGmailAccounts } from '../store/msgvault/gmailAccounts.ts'
 import { acquireMsgvaultArchiveLock, type MsgvaultArchiveLock } from './msgvaultArchiveLock.ts'
+import { SUPPORTED_MSGVAULT_VERSION, verifyMsgvaultContract } from './msgvaultContract.ts'
 import { createMsgvaultSyncRunner } from './msgvaultSyncRunner.ts'
 import {
   ACTIVE_SYNC_INTERVAL_MS,
@@ -97,6 +98,16 @@ function resolveExecutable(input: string | undefined, env: NodeJS.ProcessEnv = p
   throw new Error('REMEDIATION: msgvault executable was not found; install msgvault or configure its executable path')
 }
 
+function executableIdentity(executable: string): string {
+  try {
+    const stat = statSync(executable, { bigint: true })
+    if (!stat.isFile() || stat.nlink !== 1n) throw new Error('unsafe executable')
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`
+  } catch {
+    throw new Error('REMEDIATION: msgvault executable identity changed; restart after restoring exact v0.19.3')
+  }
+}
+
 function archiveIdentity(home: string, dbPath: string): string {
   try {
     const directory = statSync(home, { bigint: true })
@@ -113,10 +124,17 @@ function reportTo(entry: MsgvaultRuntimeEntry, message: string): void {
   }
 }
 
-function normalizedFingerprint(options: MsgvaultSyncRuntimeOptions, executable: string, configPath?: string): string {
+function normalizedFingerprint(
+  options: MsgvaultSyncRuntimeOptions,
+  executable: string,
+  executableId: string,
+  configPath: string | null,
+): string {
   return JSON.stringify({
     executable,
-    configPath: configPath ?? null,
+    executableId,
+    version: SUPPORTED_MSGVAULT_VERSION,
+    configPath,
     activeIntervalMs: options.activeIntervalMs ?? ACTIVE_SYNC_INTERVAL_MS,
     activeJitterFraction: options.activeJitterFraction ?? ACTIVE_SYNC_JITTER_FRACTION,
     idleMinMs: options.idleMinMs ?? IDLE_SYNC_MIN_MS,
@@ -138,10 +156,21 @@ export async function acquireMsgvaultSyncRuntime(
   const dbHint = normalized.dbPath?.trim() || defaultMsgvaultDbPath(homeHint)
   if (normalized.enabled !== true && !existsSync(dbHint)) return { supervisor: null, release: async () => undefined }
   const { home, dbPath } = resolveMsgvaultArchive(normalized)
-  const configPath = normalized.configPath?.trim() ? canonicalExisting(normalized.configPath, 'msgvault config') : undefined
+  const requestedConfig = normalized.configPath?.trim() || join(home, 'config.toml')
+  const configPath = existsSync(requestedConfig)
+    ? canonicalExisting(requestedConfig, 'msgvault config')
+    : normalized.configPath?.trim()
+      ? canonicalExisting(requestedConfig, 'msgvault config')
+      : null
   const executable = resolveExecutable(normalized.executable)
+  const executableId = executableIdentity(executable)
+  const assertExecutableIdentity = () => {
+    if (executableIdentity(executable) !== executableId) {
+      throw new Error('REMEDIATION: msgvault executable changed after verification; restart with exact v0.19.3')
+    }
+  }
   const key = archiveIdentity(home, dbPath)
-  const fingerprint = normalizedFingerprint(normalized, executable, configPath)
+  const fingerprint = normalizedFingerprint(normalized, executable, executableId, configPath)
   // One wrapper per lease lets identical callbacks be independently removed.
   const subscriber = onError ? ((message: string) => onError(message)) : null
 
@@ -168,13 +197,18 @@ export async function acquireMsgvaultSyncRuntime(
       }
       candidate.ready = (async () => {
         try {
-          candidate.ownership = await acquireMsgvaultArchiveLock(dbPath)
+          candidate.ownership = await acquireMsgvaultArchiveLock(
+            dbPath,
+            configPath ? { configPath } : {},
+          )
           const ownership = candidate.ownership
+          await verifyMsgvaultContract(executable, ownership)
+          assertExecutableIdentity()
           const runner = createMsgvaultSyncRunner({
             executable,
             home,
-            ...(configPath ? { configPath } : {}),
             archiveLock: ownership,
+            assertExecutableIdentity,
           })
           candidate.supervisor = new MsgvaultSyncSupervisor({
             discoverAccounts: () => discoverMsgvaultGmailAccounts({ dbPath: ownership.databasePath() }),

@@ -79,7 +79,7 @@ describe('msgvault archive ownership', () => {
     const finishPath = join(root, 'finish')
     writeFileSync(dbPath, '')
     writeFileSync(executable, `#!/usr/bin/env node
-const fs=require('node:fs');for(const fd of [3,4,5,6])fs.fstatSync(fd);if(process.env.MSGVAULT_DAEMON_CLI_PARENT_PID!==String(process.ppid))process.exit(8);fs.writeFileSync(process.env.READY_PATH,'');
+const fs=require('node:fs');for(const fd of [3,4,5,6,7])fs.fstatSync(fd);if(process.env.MSGVAULT_DAEMON_CLI_PARENT_PID!==String(process.ppid))process.exit(8);fs.writeFileSync(process.env.READY_PATH,'');
 const wait=()=>fs.existsSync(process.env.FINISH_PATH)?console.log('Changes: 0 processed, 0 added'):setTimeout(wait,10);wait();
 `)
     chmodSync(executable, 0o700)
@@ -124,6 +124,24 @@ const wait=()=>fs.existsSync(process.env.FINISH_PATH)?console.log('Changes: 0 pr
       }
       const lock = await acquireMsgvaultArchiveLock(dbPath)
       await lock.release()
+    }
+  })
+
+  it('rejects dotted, inline, and quoted config storage overrides', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mv-config-overrides-'))
+    const dbPath = join(root, 'msgvault.db')
+    const configPath = join(root, 'config.toml')
+    writeFileSync(dbPath, '')
+    for (const config of [
+      `data.data_dir = "/elsewhere"\n`,
+      `data = { database_url = "postgres://elsewhere" }\n`,
+      `[data]\n"data_dir" = "/elsewhere"\n`,
+      `[data]\n"data\\u005fdir" = "/elsewhere"\n`,
+    ]) {
+      writeFileSync(configPath, config)
+      await expect(acquireMsgvaultArchiveLock(dbPath, { configPath }))
+        .rejects.toThrow(/storage overrides are unsupported/)
+      expect(ownershipPaths(root).map(probe)).toEqual([0, 0, 0, 0])
     }
   })
 

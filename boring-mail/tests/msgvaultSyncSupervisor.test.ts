@@ -392,6 +392,61 @@ describe('MsgvaultSyncSupervisor', () => {
     await supervisor.stop()
   })
 
+  it('exposes empty-account heartbeat degradation through supervisor health', async () => {
+    const clock = new FakeClock()
+    let heartbeatArms = 0
+    const supervisor = new MsgvaultSyncSupervisor({
+      discoverAccounts: async () => [],
+      syncAccount: async () => ({ changed: true }),
+      now: () => clock.now,
+      random: () => 0.5,
+      setTimeout(callback, delay) {
+        if (delay === 10 && [2, 3].includes(++heartbeatArms)) throw new Error('heartbeat unavailable')
+        return clock.setTimeout(callback, delay)
+      },
+      clearTimeout: clock.clearTimeout,
+    }, { heartbeatMs: 10, suspendLateAfterMs: 1_000 })
+    await supervisor.start()
+    await clock.advance(10); await flush()
+    expect(supervisor.health()).toEqual([])
+    expect(supervisor.maintenanceHealth()).toMatchObject({
+      lastError: expect.stringMatching(/sync maintenance degraded/),
+      heartbeatError: expect.stringMatching(/sync maintenance degraded/),
+      discoveryError: null,
+    })
+    expect(Object.isFrozen(supervisor.maintenanceHealth())).toBe(true)
+    await supervisor.stop()
+  })
+
+  it('retains discovery degradation across account success and clears it only after discovery succeeds', async () => {
+    const clock = new FakeClock()
+    const pending = deferred<{ changed: boolean }>()
+    let discoveries = 0
+    const supervisor = new MsgvaultSyncSupervisor({
+      discoverAccounts: async () => {
+        discoveries++
+        if (discoveries === 2) throw new Error('account discovery unavailable')
+        return ['a@test']
+      },
+      syncAccount: async () => pending.promise,
+      now: () => clock.now,
+      random: () => 0.5,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    }, { activeIntervalMs: 1_000, heartbeatMs: 10, suspendLateAfterMs: 1_000 })
+    await supervisor.start(); await clock.advance(0)
+    await clock.advance(10); await flush()
+    expect(supervisor.maintenanceHealth().discoveryError).toMatch(/account discovery unavailable/)
+    pending.resolve({ changed: true }); await flush()
+    expect(supervisor.health()[0]).toMatchObject({
+      lastError: expect.stringMatching(/account discovery unavailable/),
+      maintenanceError: expect.stringMatching(/account discovery unavailable/),
+    })
+    await clock.advance(10); await flush()
+    expect(supervisor.maintenanceHealth().discoveryError).toBeNull()
+    await supervisor.stop()
+  })
+
   it('uses internal timer identity when external handles are null', async () => {
     const callbacks: Array<() => void> = []
     let clears = 0, discoveries = 0, calls = 0

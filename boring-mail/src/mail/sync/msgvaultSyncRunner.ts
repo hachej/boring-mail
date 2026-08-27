@@ -16,6 +16,7 @@ export interface MsgvaultSyncRunnerOptions {
   configPath?: string
   spawnProcess?: typeof spawn
   archiveLock?: Pick<MsgvaultArchiveLock, 'spawnContext'>
+  assertExecutableIdentity?: () => void
 }
 
 export type MsgvaultOutputClassification = 'changed' | 'empty' | 'unknown' | 'error'
@@ -50,11 +51,13 @@ export function createMsgvaultSyncRunner(options: MsgvaultSyncRunnerOptions = {}
   const executable = options.executable?.trim() || 'msgvault'
   const spawnProcess = options.spawnProcess ?? spawn
   return async (account: string): Promise<{ changed: boolean }> => {
+    options.assertExecutableIdentity?.()
     const locked = options.archiveLock?.spawnContext()
     const home = locked?.home ?? options.home
+    const configPath = locked?.configPath ?? options.configPath
     const args = [
       ...(home ? ['--home', home] : []),
-      ...(options.configPath ? ['--config', options.configPath] : []),
+      ...(configPath ? ['--config', configPath] : []),
       '--no-log-file',
       'sync',
       '--',

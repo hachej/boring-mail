@@ -40,7 +40,7 @@ Prerequisites:
 - Node.js 22+
 - pnpm
 - `/bin/sh` and util-linux `flock` with `-E` support
-- msgvault 0.19.x on `PATH` for real Gmail sync (not needed for mock-only mode)
+- exact msgvault 0.19.3 on `PATH` for real Gmail sync (not needed for mock-only mode)
 - No sibling checkouts required — host packages come from npm at pinned versions
 - Pi/Boring host model provider config already available in your normal environment
 
@@ -109,7 +109,7 @@ The server plugin contributes a single agent tool named `mail`. It deliberately 
 
 When `~/.msgvault/msgvault.db` exists, the server plugin supervises `msgvault sync` for every Gmail source in that archive. Polling starts immediately, runs every 120 seconds with ±20% jitter, and backs off to 5–10 minutes after three empty runs. It continues while the server is running even when no browser is open. Set `MSGVAULT_HOME` for a non-default msgvault home. `MSGVAULT_DB_PATH` is also accepted only when it names the CLI-supported `<home>/msgvault.db` layout; it derives that home, and any conflicting `MSGVAULT_HOME` fails closed. Pass `sync: false` to `createBoringMailServerPlugin` for fixture/mock-only hosts.
 
-The pinned msgvault 0.19 CLI normally auto-starts a daemon for `sync`. Boring Mail instead uses msgvault's parent-bound direct-worker contract so the supervised child is the actual writer; it never leaves a background daemon behind. One runtime owns the canonical home/database inodes plus msgvault's own `daemon.lock` and `db.write.lock`, and every sync child inherits those locked open-file descriptions. A pre-existing msgvault daemon or standard CLI writer therefore fails startup with remediation rather than overlapping. Fastify close drains an in-flight sync before releasing ownership. The locks are cooperative with standard msgvault 0.19 processes; a raw SQLite process that ignores msgvault's locking protocol remains outside this boundary.
+Exact msgvault 0.19.3 normally auto-starts a daemon for `sync`. Boring Mail verifies that exact binary before scheduling, then uses its parent-bound direct-worker contract so the supervised child is the actual writer; it never leaves a background daemon behind. One runtime owns the canonical home/database inodes plus msgvault's own `daemon.lock` and `db.write.lock`, and every sync child inherits those locked open-file descriptions. Config bytes are frozen in a private descriptor for the lease; `data_dir` and `database_url` overrides are rejected because they could redirect writes outside those locks. A pre-existing msgvault daemon or standard CLI writer therefore fails startup with remediation rather than overlapping. Fastify close drains an in-flight sync before releasing ownership. The locks are cooperative with standard msgvault 0.19.3 processes; a raw SQLite process that ignores msgvault's locking protocol remains outside this boundary.
 
 Product storage consumers import the compiled worker-backed entry:
 

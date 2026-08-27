@@ -42,19 +42,24 @@ Key structures relevant to boring-mail:
   adapter pins msgvault releases.
 - `msgvault serve` daemon/OpenAPI/MCP remains available later for remote
   deployments — not needed locally.
-- **Pinned v0.19 process contract:** ordinary archive CLI commands auto-start or
-  reuse a local daemon. The thin supervisor invokes the same parent-bound direct
-  worker branch that v0.19.3's daemon uses (`MSGVAULT_DAEMON_CLI_PARENT_PID`,
-  implemented in `daemon_cli_subprocess.go` / `sync.go`) so the supervised child
-  remains the actual writer. It holds msgvault's `daemon.lock` and
-  `db.write.lock` plus canonical home/database inode locks for the whole runtime;
-  upgrades must re-verify this upstream contract before changing the pin.
+- **Exact v0.19.3 process contract:** ordinary archive CLI commands auto-start
+  or reuse a local daemon. Runtime acquisition verifies that exact version, then
+  invokes the same parent-bound direct worker branch that v0.19.3's daemon uses
+  (`MSGVAULT_DAEMON_CLI_PARENT_PID`, implemented in
+  `daemon_cli_subprocess.go` / `sync.go`) so the supervised child remains the
+  actual writer. It holds msgvault's `daemon.lock` and `db.write.lock` plus
+  canonical home/database inode locks for the whole runtime. Config bytes are
+  snapshotted into an anonymous descriptor; storage redirects are rejected.
+  Upgrades must re-verify this upstream contract before changing the pin. The
+  installed-binary `smoke:msgvault-direct` skips only when msgvault is absent;
+  generic CI without that optional binary is not a process-contract attestation,
+  so release-host proof remains mandatory.
 
 ## 4. Risks & deviations recorded
 
 | Risk | Disposition |
 | --- | --- |
-| Alpha format churn | Pin `v0.19.x`; adapter isolates; re-verify schema on upgrade |
+| Alpha format/process churn | Pin exact `v0.19.3`; adapter isolates schema and runtime verifies the private direct-worker contract before scheduling; re-review before upgrade |
 | `gmail.modify` scope ≠ plan's read+send-only | Accepted for spike. Plan scope rule stands: boring-mail never invokes delete-staged write-back. Revisit scope minimisation with owner before production accounts. |
 | One run reported `Errors: 400` during 2 000-msg full sync | Not reproducible on rerun (0 errors); likely transient fetch/rate-limit retries. Monitor in adapter. |
 | Primary account used (not throwaway) | Owner explicitly designated `julien.hurault@gmail.com`; read-only operations only performed |
