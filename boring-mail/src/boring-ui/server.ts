@@ -2,12 +2,18 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { defineServerPlugin, type WorkspaceServerPlugin } from '@hachej/boring-workspace/server'
 import { createMailAgentTool, serializeMailDraft } from '../mail/server/mailAgentTool.ts'
+import {
+  acquireMsgvaultSyncRuntime,
+  type MsgvaultSyncRuntimeOptions,
+} from '../mail/sync/msgvaultSyncRuntime.ts'
 
 export { createBoringMailServer } from '../server/index.ts'
 export { createMailAgentTool } from '../mail/server/mailAgentTool.ts'
 
 export interface BoringMailServerPluginOptions {
   workspaceRoot?: string
+  /** false disables sync; omission auto-enables when a msgvault database exists. */
+  sync?: MsgvaultSyncRuntimeOptions | false
 }
 
 export default function createBoringMailServerPlugin(
@@ -30,8 +36,10 @@ export default function createBoringMailServerPlugin(
     // Identity pin for the prebuilt-plugin path (required since workspace 0.1.103
     // for any plugin contributing agentTools/systemPrompt). Bump when the
     // executable contribution changes materially.
-    contentDigest: 'boring-mail-server-plugin-v1',
+    contentDigest: 'boring-mail-server-plugin-v2',
     routes: async (app) => {
+      const syncLease = await acquireMsgvaultSyncRuntime(options.sync)
+      app.addHook('onClose', async () => syncLease.release())
       app.post('/api/boring-mail/drafts', async (request, reply) => {
         const body = request.body as { path?: unknown; to?: unknown; cc?: unknown; subject?: unknown; bodyMarkdown?: unknown } | undefined
         const requestedPath = typeof body?.path === 'string' && body.path.trim() ? body.path.trim() : 'drafts/new.mail.md'

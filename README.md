@@ -40,6 +40,7 @@ Prerequisites:
 - Node.js 22+
 - pnpm
 - `/bin/sh` and util-linux `flock` with `-E` support
+- msgvault 0.19.x on `PATH` for real Gmail sync (not needed for mock-only mode)
 - No sibling checkouts required — host packages come from npm at pinned versions
 - Pi/Boring host model provider config already available in your normal environment
 
@@ -105,6 +106,8 @@ import createBoringMailServerPlugin from '@hachej/boring-mail/server'
 ```
 
 The server plugin contributes a single agent tool named `mail`. It deliberately does not register any LLM/model provider. The playground uses the default Pi host configuration supplied by the environment.
+
+When `~/.msgvault/msgvault.db` (or `MSGVAULT_DB_PATH`) exists, the server plugin supervises `msgvault sync` for every Gmail source in that archive. Polling starts immediately, runs every 120 seconds with ±20% jitter, and backs off to 5–10 minutes after three empty runs. It continues while the server is running even when no browser is open. Set `MSGVAULT_HOME` for a non-default msgvault home, or pass `sync: false` to `createBoringMailServerPlugin` for fixture/mock-only hosts. The Fastify close lifecycle drains an in-flight sync before shutdown.
 
 Product storage consumers import the compiled worker-backed entry:
 
