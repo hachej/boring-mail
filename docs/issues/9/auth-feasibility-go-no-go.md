@@ -1,7 +1,9 @@
 # Issue #9 Slice 0 — standalone host-auth feasibility evidence
 
-Date: 2026-08-27  
-Bead: `bm-qz3`  
+Date: 2026-08-27
+
+Bead: `bm-qz3`
+
 Evidence classification: synthetic/redacted; no mailbox database, source, account, message, or credential was read.
 
 ## Candidate verdict
