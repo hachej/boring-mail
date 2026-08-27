@@ -7,9 +7,16 @@
 // msgvault is alpha software: this adapter is the ONLY module allowed to know
 // its schema. Shape-checked on open and tested against 0.19; schema drift fails
 // loudly here. msgvault exposes no runtime release-version metadata to pin.
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { inflateSync } from 'node:zlib'
 import { join } from 'node:path'
+import {
+  ProductStoreError,
+  type UnifiedInboxItem,
+  type UnifiedInboxOptions,
+  type UnifiedInboxPage,
+} from './product/types.js'
 
 /** msgvault release line this adapter was written against (spike: v0.19.3). */
 export const MSGVAULT_TESTED_MAJOR_MINOR = '0.19'
@@ -46,33 +53,82 @@ export interface MessageBody {
   format: string
 }
 
-/**
- * One globally correlated inbox message. Identity fields all belong to the
- * selected primary copy, so callers can use messageId/sourceId/conversationId
- * together as the trusted reply-owner identity.
- */
-export interface UnifiedInboxItem {
-  messageId: number
-  conversationId: number
+/** @internal Product-owned source eligibility supplied to the adapter worker. */
+export interface EligibleInboxSource {
   sourceId: number
-  sourceIdentifier: string
-  rfc822MessageId: string | null
-  subject: string | null
-  snippet: string | null
-  messageAt: string | null
-  unread: boolean
-  hasAttachments: boolean
-  coalesced: boolean
-  copyCount: number
+  identities: string[]
 }
 
-export interface UnifiedInboxOptions {
-  limit?: number
-  offset?: number
+/** @internal Per-storage-process cursor authority; never crosses RPC. */
+export interface UnifiedInboxCursorAuthority {
+  scope: string
+  secret: Buffer
+}
+
+interface MsgvaultIndexCapabilities {
+  rfc822: string
+  liveRecency: string
+  recipientsByMessage: string
+}
+const indexCapabilities = new WeakMap<DatabaseSync, MsgvaultIndexCapabilities>()
+
+function quotedIdentifier(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`
+}
+function indexColumns(db: DatabaseSync, name: string): Array<{ name: string | null }> {
+  return db.prepare(`PRAGMA index_info(${quotedIdentifier(name)})`).all() as Array<{ name: string | null }>
+}
+function inspectIndexCapabilities(db: DatabaseSync): {
+  value: MsgvaultIndexCapabilities | null
+  errors: string[]
+} {
+  type IndexRow = { name: string; unique: number; partial: number }
+  const messageIndexes = db.prepare(`PRAGMA index_list(messages)`).all() as IndexRow[]
+  const recipientIndexes = db.prepare(`PRAGMA index_list(message_recipients)`).all() as IndexRow[]
+  const rfc822 = messageIndexes.find((index) => index.unique === 0 && index.partial === 0 &&
+    indexColumns(db, index.name)[0]?.name === 'rfc822_message_id')
+  const recipientsByMessage = recipientIndexes.find((index) => index.partial === 0 &&
+    indexColumns(db, index.name)[0]?.name === 'message_id')
+  const indexSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name=?`)
+  const liveRecency = messageIndexes.find((index) => {
+    if (index.partial !== 1) return false
+    const columns = indexColumns(db, index.name)
+    if (columns[0]?.name !== null || columns[1]?.name !== 'id') return false
+    const sql = (indexSql.get(index.name) as { sql: string | null } | undefined)?.sql
+      ?.toLowerCase().replace(/["`\[\]]/g, '').replace(/\s+/g, '') ?? ''
+    return sql.includes('coalesce(sent_at,received_at,internal_date)desc,iddesc') &&
+      sql.includes('wheredeleted_atisnullanddeleted_from_source_atisnull')
+  })
+  const errors = [
+    !rfc822 ? 'messages requires a non-unique, non-partial index led by rfc822_message_id' : '',
+    !liveRecency
+      ? 'messages requires a live recency index on COALESCE(sent_at,received_at,internal_date) DESC,id DESC'
+      : '',
+    !recipientsByMessage
+      ? 'message_recipients requires a non-partial index led by message_id'
+      : '',
+  ].filter(Boolean)
+  return {
+    value: rfc822 && liveRecency && recipientsByMessage
+      ? { rfc822: rfc822.name, liveRecency: liveRecency.name, recipientsByMessage: recipientsByMessage.name }
+      : null,
+    errors,
+  }
+}
+
+/** Conservative correlation/reply contract for provider Message-ID values. */
+export function correlatableMessageId(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length < 5 || value.length > 998 ||
+      value[0] !== '<' || value.at(-1) !== '>') return null
+  const inner = value.slice(1, -1)
+  if (!inner || /[<>\x00-\x20\x7f-\xff]/.test(inner)) return null
+  const at = inner.indexOf('@')
+  if (at <= 0 || at !== inner.lastIndexOf('@') || at === inner.length - 1) return null
+  return value
 }
 
 const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
-  sources: ['id', 'source_type', 'identifier'],
+  sources: ['id', 'identifier'],
   messages: [
     'id',
     'conversation_id',
@@ -162,12 +218,8 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
     }
     if (table === 'sources') {
       const identifier = columns.find((column) => column.name === 'identifier')
-      const sourceType = columns.find((column) => column.name === 'source_type')
       if (!identifier || !/(char|clob|text)/i.test(identifier.type) || identifier.notnull !== 1) {
         columnErrors.push('sources.identifier must be NOT NULL with TEXT affinity')
-      }
-      if (!sourceType || !/(char|clob|text)/i.test(sourceType.type) || sourceType.notnull !== 1) {
-        columnErrors.push('sources.source_type must be NOT NULL with TEXT affinity')
       }
     }
     if (table === 'conversations') {
@@ -191,28 +243,18 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
       }
     }
   }
-  const indexes = db.prepare(`PRAGMA index_list(messages)`).all() as Array<{
-    name: string; partial: number
-  }>
-  const globalRfc822Index = indexes.find((index) => index.name === 'idx_messages_rfc822_message_id')
-  const globalRfc822Columns = globalRfc822Index
-    ? db.prepare(`PRAGMA index_info(idx_messages_rfc822_message_id)`).all() as Array<{ name: string }>
-    : []
-  const invalidGlobalRfc822Index = !globalRfc822Index || globalRfc822Index.partial !== 0 ||
-    globalRfc822Columns.length !== 1 || globalRfc822Columns[0]?.name !== 'rfc822_message_id'
+  const capabilities = inspectIndexCapabilities(db)
   const ftsRow = db.prepare(`SELECT sql FROM sqlite_master WHERE name='messages_fts'`).get() as
     | { sql: string | null }
     | undefined
   const invalidFts =
     have.has('messages_fts') && !/CREATE\s+VIRTUAL\s+TABLE[\s\S]*USING\s+fts5/i.test(ftsRow?.sql ?? '')
-  if (missingTables.length > 0 || columnErrors.length > 0 || invalidFts || invalidGlobalRfc822Index) {
+  if (missingTables.length > 0 || columnErrors.length > 0 || invalidFts || capabilities.errors.length > 0) {
     const details = [
       missingTables.length > 0 ? `missing table(s): ${missingTables.join(', ')}` : '',
       ...columnErrors,
       invalidFts ? 'messages_fts is not an FTS5 virtual table' : '',
-      invalidGlobalRfc822Index
-        ? 'messages requires global index idx_messages_rfc822_message_id(rfc822_message_id)'
-        : '',
+      ...capabilities.errors,
     ]
       .filter(Boolean)
       .join('; ')
@@ -225,6 +267,8 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
     }
     console.warn(`[boring-mail] ${msg}`)
   }
+  if (capabilities.value) indexCapabilities.set(db, capabilities.value)
+  db.function('boring_mail_message_id', { deterministic: true, directOnly: true }, correlatableMessageId)
   return { db }
 }
 
@@ -305,125 +349,307 @@ export function listThreads(
 }
 
 const UNIFIED_INBOX_MAX_LIMIT = 200
-const UNIFIED_INBOX_MAX_OFFSET = 1_000_000
+const MAX_CURSOR_LENGTH = 2_048
 
-function boundedPageValue(
-  value: number | undefined,
-  fallback: number,
-  minimum: number,
-  maximum: number,
-  name: string,
-): number {
-  const selected = value ?? fallback
-  if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
-    throw new Error(`${name} must be a safe integer between ${minimum} and ${maximum}`)
+interface UnifiedCursorPayload {
+  v: 1
+  s: string
+  d: number
+  e: string
+  t: string | null
+  i: number
+}
+
+function boundedLimit(value: number | undefined): number {
+  const selected = value ?? 50
+  if (!Number.isSafeInteger(selected) || selected < 1 || selected > UNIFIED_INBOX_MAX_LIMIT) {
+    throw new ProductStoreError(
+      'invalid_input',
+      `limit must be a safe integer between 1 and ${UNIFIED_INBOX_MAX_LIMIT}`,
+    )
   }
   return selected
 }
+function positiveInteger(value: unknown, name: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+    throw new ProductStoreError('corrupt_data', `${name} must be a positive safe integer`)
+  }
+  return value as number
+}
+function nullableText(value: unknown, name: string): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string') throw new ProductStoreError('corrupt_data', `${name} must be text or null`)
+  return value
+}
+function booleanInteger(value: unknown, name: string): boolean {
+  if (value !== 0 && value !== 1) throw new ProductStoreError('corrupt_data', `${name} must be 0 or 1`)
+  return value === 1
+}
+function dataVersion(db: DatabaseSync): number {
+  const row = db.prepare('PRAGMA data_version').get() as { data_version?: unknown }
+  return positiveInteger(row.data_version, 'msgvault data_version')
+}
+function sourceInput(sources: EligibleInboxSource[]): { json: string; digest: string } {
+  if (!Array.isArray(sources)) throw new ProductStoreError('invalid_input', 'eligible inbox sources are required')
+  const seen = new Set<number>()
+  const normalized = sources.map((source) => {
+    if (!source || !Number.isSafeInteger(source.sourceId) || source.sourceId <= 0 || seen.has(source.sourceId)) {
+      throw new ProductStoreError('invalid_input', 'eligible source ids must be unique positive safe integers')
+    }
+    seen.add(source.sourceId)
+    if (!Array.isArray(source.identities) || source.identities.length === 0) {
+      throw new ProductStoreError('invalid_input', 'each eligible source requires at least one authorized identity')
+    }
+    const identities = [...new Set(source.identities.map((identity) => {
+      if (typeof identity !== 'string' || !identity.trim()) {
+        throw new ProductStoreError('invalid_input', 'authorized identities must be non-empty text')
+      }
+      return identity.trim().toLowerCase()
+    }))].sort()
+    return { sourceId: source.sourceId, identities }
+  }).sort((left, right) => left.sourceId - right.sourceId)
+  const json = JSON.stringify(normalized)
+  return { json, digest: createHash('sha256').update(json).digest('base64url') }
+}
+function signCursor(payload: UnifiedCursorPayload, authority: UnifiedInboxCursorAuthority): string {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url')
+  const signature = createHmac('sha256', authority.secret).update(encoded).digest('base64url')
+  return `${encoded}.${signature}`
+}
+function readCursor(
+  cursor: string,
+  authority: UnifiedInboxCursorAuthority,
+  expectedDataVersion: number,
+  expectedSourceDigest: string,
+): UnifiedCursorPayload {
+  if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > MAX_CURSOR_LENGTH) {
+    throw new ProductStoreError('invalid_input', 'unified inbox cursor is malformed')
+  }
+  const parts = cursor.split('.')
+  if (parts.length !== 2) throw new ProductStoreError('invalid_input', 'unified inbox cursor is malformed')
+  const expectedSignature = createHmac('sha256', authority.secret).update(parts[0]!).digest()
+  let suppliedSignature: Buffer
+  try { suppliedSignature = Buffer.from(parts[1]!, 'base64url') }
+  catch { throw new ProductStoreError('invalid_input', 'unified inbox cursor is malformed') }
+  if (suppliedSignature.length !== expectedSignature.length ||
+      !timingSafeEqual(suppliedSignature, expectedSignature)) {
+    throw new ProductStoreError('invalid_input', 'unified inbox cursor signature is invalid')
+  }
+  let value: unknown
+  try { value = JSON.parse(Buffer.from(parts[0]!, 'base64url').toString('utf8')) }
+  catch { throw new ProductStoreError('invalid_input', 'unified inbox cursor is malformed') }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ProductStoreError('invalid_input', 'unified inbox cursor is malformed')
+  }
+  const payload = value as Record<string, unknown>
+  if (payload.v !== 1 || typeof payload.s !== 'string' ||
+      !Number.isSafeInteger(payload.d) || typeof payload.e !== 'string' ||
+      (payload.t !== null && typeof payload.t !== 'string') ||
+      !Number.isSafeInteger(payload.i) || Number(payload.i) <= 0) {
+    throw new ProductStoreError('invalid_input', 'unified inbox cursor has an invalid payload')
+  }
+  if (payload.s !== authority.scope || payload.d !== expectedDataVersion ||
+      payload.e !== expectedSourceDigest) {
+    throw new ProductStoreError('stale_cursor', 'unified inbox cursor expired after storage state changed')
+  }
+  return payload as unknown as UnifiedCursorPayload
+}
+function liveEmail(alias: string): string {
+  return `${alias}.message_type='email' AND ${alias}.deleted_at IS NULL AND ${alias}.deleted_from_source_at IS NULL`
+}
+function requireUnifiedCapabilities(db: DatabaseSync): MsgvaultIndexCapabilities {
+  const capabilities = indexCapabilities.get(db)
+  if (!capabilities) {
+    throw new ProductStoreError('unsupported_schema', 'msgvault unified-inbox index capabilities are unavailable')
+  }
+  return capabilities
+}
+function decodeUnifiedInboxItem(row: Record<string, unknown>): UnifiedInboxItem {
+  const rfc822 = nullableText(row.valid_rfc822_message_id, 'rfc822_message_id')
+  if (rfc822 !== null && correlatableMessageId(rfc822) === null) {
+    throw new ProductStoreError('corrupt_data', 'rfc822_message_id violated the correlation contract')
+  }
+  if (typeof row.source_identifier !== 'string' || !row.source_identifier.trim()) {
+    throw new ProductStoreError('corrupt_data', 'source_identifier must be non-empty text')
+  }
+  const copyCount = positiveInteger(row.copy_count, 'copy_count')
+  const attachmentCount = row.attachment_count
+  if (!Number.isSafeInteger(attachmentCount) || Number(attachmentCount) < 0) {
+    throw new ProductStoreError('corrupt_data', 'attachment_count must be a non-negative safe integer')
+  }
+  return {
+    messageId: positiveInteger(row.message_id, 'message_id'),
+    conversationId: positiveInteger(row.conversation_id, 'conversation_id'),
+    sourceId: positiveInteger(row.source_id, 'source_id'),
+    sourceIdentifier: row.source_identifier,
+    rfc822MessageId: rfc822,
+    subject: nullableText(row.subject, 'subject'),
+    snippet: nullableText(row.snippet, 'snippet'),
+    messageAt: nullableText(row.message_at, 'message_at'),
+    unread: !booleanInteger(row.is_read, 'is_read'),
+    hasAttachments: Number(attachmentCount) > 0,
+    coalesced: copyCount > 1,
+    copyCount,
+  }
+}
 
 /**
- * Project all live email copies into one deterministic, global inbox. A
- * syntactically unusable Message-ID receives a row-unique key and therefore can
- * never collapse unrelated mail. msgvault remains authoritative and read-only.
+ * Project connected product accounts into one deterministic inbox page. The
+ * outer scan is forced through msgvault's live-recency index and stops after
+ * one page; duplicate winner/count probes use the global Message-ID index.
  */
+type UnifiedKeysetMode = 'all' | 'before-timestamp' | 'all-null' | 'before-null'
+function unifiedInboxSql(capabilities: MsgvaultIndexCapabilities, mode: UnifiedKeysetMode = 'all'): string {
+  const liveIndex = quotedIdentifier(capabilities.liveRecency)
+  const rfc822Index = quotedIdentifier(capabilities.rfc822)
+  const recipientIndex = quotedIdentifier(capabilities.recipientsByMessage)
+  const addressed = (message: string, source: string): string => `EXISTS (
+    SELECT 1 FROM message_recipients recipient INDEXED BY ${recipientIndex}
+    JOIN json_each(${source}.identities_json) identity
+      ON lower(trim(recipient.email_address))=identity.value
+    WHERE recipient.message_id=${message}.id
+      AND lower(recipient.recipient_type) IN ('to','cc')
+  )`
+  const timestamp = 'COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date)'
+  const keyset = mode === 'before-timestamp'
+    ? `AND ${timestamp} IS NOT NULL
+       AND ${timestamp}<=?
+       AND (${timestamp}<? OR candidate.id<?)`
+    : mode === 'all-null'
+      ? `AND ${timestamp} IS NULL`
+      : mode === 'before-null'
+        ? `AND ${timestamp} IS NULL AND candidate.id<?`
+        : ''
+  return `
+    WITH eligible_sources AS NOT MATERIALIZED (
+      SELECT CAST(json_extract(value,'$.sourceId') AS INTEGER) AS source_id,
+             json_extract(value,'$.identities') AS identities_json
+        FROM json_each(?)
+    )
+    SELECT candidate.id AS message_id,
+           candidate.conversation_id,
+           candidate.source_id,
+           source.identifier AS source_identifier,
+           boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
+           candidate.subject,
+           candidate.snippet,
+           COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) AS message_at,
+           candidate.is_read,
+           candidate.attachment_count,
+           CASE WHEN boring_mail_message_id(candidate.rfc822_message_id) IS NULL THEN 1 ELSE (
+             SELECT count(*)
+               FROM messages copy INDEXED BY ${rfc822Index}
+               JOIN eligible_sources copy_source ON copy_source.source_id=copy.source_id
+               JOIN conversations copy_conversation
+                 ON copy_conversation.id=copy.conversation_id
+                AND copy_conversation.source_id=copy.source_id
+              WHERE copy.rfc822_message_id=candidate.rfc822_message_id
+                AND ${liveEmail('copy')}
+           ) END AS copy_count
+      FROM messages candidate INDEXED BY ${liveIndex}
+      JOIN eligible_sources candidate_source ON candidate_source.source_id=candidate.source_id
+      JOIN sources source ON source.id=candidate.source_id
+      JOIN conversations conversation
+        ON conversation.id=candidate.conversation_id
+       AND conversation.source_id=candidate.source_id
+     WHERE ${liveEmail('candidate')}
+       ${keyset}
+       AND (
+         boring_mail_message_id(candidate.rfc822_message_id) IS NULL OR
+         candidate.id=(
+           SELECT primary_copy.id
+             FROM messages primary_copy INDEXED BY ${rfc822Index}
+             JOIN eligible_sources primary_source ON primary_source.source_id=primary_copy.source_id
+             JOIN conversations primary_conversation
+               ON primary_conversation.id=primary_copy.conversation_id
+              AND primary_conversation.source_id=primary_copy.source_id
+            WHERE primary_copy.rfc822_message_id=candidate.rfc822_message_id
+              AND ${liveEmail('primary_copy')}
+            ORDER BY ${addressed('primary_copy', 'primary_source')} DESC,
+                     COALESCE(primary_copy.sent_at,primary_copy.received_at,primary_copy.internal_date) DESC NULLS LAST,
+                     primary_copy.source_id ASC,
+                     primary_copy.id ASC
+            LIMIT 1
+         )
+       )
+     ORDER BY COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) DESC NULLS LAST,
+              candidate.id DESC
+     LIMIT ?
+  `
+}
+
+/** @internal Deterministic proof seam for the exact production query. */
+export function explainUnifiedInboxQueryPlan(
+  db: DatabaseSync,
+  eligibleSources: EligibleInboxSource[],
+  after?: { messageAt: string | null; messageId: number },
+): string[] {
+  const capabilities = requireUnifiedCapabilities(db)
+  const eligible = sourceInput(eligibleSources)
+  const mode: UnifiedKeysetMode = !after ? 'all' : after.messageAt === null ? 'before-null' : 'before-timestamp'
+  const args = !after ? [] : after.messageAt === null
+    ? [after.messageId]
+    : [after.messageAt, after.messageAt, after.messageId]
+  return (db.prepare(`EXPLAIN QUERY PLAN ${unifiedInboxSql(capabilities, mode)}`).all(
+    eligible.json, ...args, 51,
+  ) as Array<{ detail: unknown }>).map((row) => {
+    if (typeof row.detail !== 'string') {
+      throw new ProductStoreError('corrupt_data', 'msgvault query plan detail must be text')
+    }
+    return row.detail
+  })
+}
+
 export function listUnifiedInbox(
   db: DatabaseSync,
+  eligibleSources: EligibleInboxSource[],
+  authority: UnifiedInboxCursorAuthority,
   opts: UnifiedInboxOptions = {},
-): UnifiedInboxItem[] {
-  const limit = boundedPageValue(opts.limit, 50, 1, UNIFIED_INBOX_MAX_LIMIT, 'limit')
-  const offset = boundedPageValue(opts.offset, 0, 0, UNIFIED_INBOX_MAX_OFFSET, 'offset')
-  const rows = db.prepare(`
-    WITH candidates AS NOT MATERIALIZED (
-      SELECT m.id AS message_id,
-             m.conversation_id,
-             m.source_id,
-             s.identifier AS source_identifier,
-             CASE
-               WHEN m.rfc822_message_id = trim(m.rfc822_message_id)
-                AND length(m.rfc822_message_id) >= 5
-                AND substr(m.rfc822_message_id, 1, 1) = '<'
-                AND substr(m.rfc822_message_id, -1, 1) = '>'
-                AND instr(substr(m.rfc822_message_id, 2, length(m.rfc822_message_id) - 2), '@') > 1
-                AND instr(m.rfc822_message_id, ' ') = 0
-                AND instr(m.rfc822_message_id, char(9)) = 0
-                AND instr(m.rfc822_message_id, char(10)) = 0
-                AND instr(m.rfc822_message_id, char(13)) = 0
-               THEN m.rfc822_message_id
-               ELSE NULL
-             END AS valid_rfc822_message_id,
-             m.subject,
-             m.snippet,
-             COALESCE(m.sent_at, m.received_at, m.internal_date) AS message_at,
-             m.is_read,
-             m.attachment_count
-        FROM messages m
-        JOIN sources s ON s.id = m.source_id
-        JOIN conversations c ON c.id = m.conversation_id AND c.source_id = m.source_id
-       WHERE m.message_type = 'email'
-         AND m.deleted_at IS NULL
-         AND m.deleted_from_source_at IS NULL
-    )
-    SELECT candidate.*,
-           CASE WHEN candidate.valid_rfc822_message_id IS NULL THEN 1 ELSE (
-             SELECT count(*)
-               FROM messages copy
-               JOIN sources copy_source ON copy_source.id = copy.source_id
-               JOIN conversations copy_conversation
-                 ON copy_conversation.id = copy.conversation_id
-                AND copy_conversation.source_id = copy.source_id
-              WHERE copy.rfc822_message_id = candidate.valid_rfc822_message_id
-                AND copy.message_type = 'email'
-                AND copy.deleted_at IS NULL
-                AND copy.deleted_from_source_at IS NULL
-           ) END AS copy_count
-      FROM candidates candidate
-     WHERE candidate.valid_rfc822_message_id IS NULL
-        OR candidate.message_id = (
-          SELECT primary_copy.id
-            FROM messages primary_copy
-            JOIN sources primary_source ON primary_source.id = primary_copy.source_id
-            JOIN conversations primary_conversation
-              ON primary_conversation.id = primary_copy.conversation_id
-             AND primary_conversation.source_id = primary_copy.source_id
-           WHERE primary_copy.rfc822_message_id = candidate.valid_rfc822_message_id
-             AND primary_copy.message_type = 'email'
-             AND primary_copy.deleted_at IS NULL
-             AND primary_copy.deleted_from_source_at IS NULL
-           ORDER BY EXISTS (
-                      SELECT 1
-                        FROM message_recipients primary_recipient
-                       WHERE primary_recipient.message_id = primary_copy.id
-                         AND lower(primary_recipient.recipient_type) IN ('to', 'cc')
-                         AND lower(trim(primary_recipient.email_address)) =
-                           lower(trim(primary_source.identifier))
-                    ) DESC,
-                    julianday(COALESCE(
-                      primary_copy.sent_at,
-                      primary_copy.received_at,
-                      primary_copy.internal_date
-                    )) DESC NULLS LAST,
-                    primary_copy.source_id ASC,
-                    primary_copy.id ASC
-           LIMIT 1
-        )
-     ORDER BY julianday(candidate.message_at) DESC NULLS LAST,
-              candidate.message_id DESC
-     LIMIT ? OFFSET ?
-  `).all(limit, offset) as Array<Record<string, unknown>>
-  return rows.map((row) => ({
-    messageId: row.message_id as number,
-    conversationId: row.conversation_id as number,
-    sourceId: row.source_id as number,
-    sourceIdentifier: row.source_identifier as string,
-    rfc822MessageId: (row.valid_rfc822_message_id as string) ?? null,
-    subject: (row.subject as string) ?? null,
-    snippet: (row.snippet as string) ?? null,
-    messageAt: (row.message_at as string) ?? null,
-    unread: Number(row.is_read) === 0,
-    hasAttachments: Number(row.attachment_count) > 0,
-    coalesced: Number(row.copy_count) > 1,
-    copyCount: Number(row.copy_count),
-  }))
+): UnifiedInboxPage {
+  if (!authority || typeof authority.scope !== 'string' || !authority.scope ||
+      !Buffer.isBuffer(authority.secret) || authority.secret.length < 32) {
+    throw new ProductStoreError('invalid_input', 'unified inbox cursor authority is required')
+  }
+  const limit = boundedLimit(opts.limit)
+  const capabilities = requireUnifiedCapabilities(db)
+  const eligible = sourceInput(eligibleSources)
+  const version = dataVersion(db)
+  const cursor = opts.cursor
+    ? readCursor(opts.cursor, authority, version, eligible.digest)
+    : null
+  if (eligibleSources.length === 0) return { items: [], nextCursor: null }
+
+  const run = (mode: UnifiedKeysetMode, args: Array<string | number | null>, wanted: number) =>
+    db.prepare(unifiedInboxSql(capabilities, mode)).all(
+      eligible.json, ...args, wanted,
+    ) as Array<Record<string, unknown>>
+  let rows: Array<Record<string, unknown>>
+  if (!cursor) {
+    rows = run('all', [], limit + 1)
+  } else if (cursor.t === null) {
+    rows = run('before-null', [cursor.i], limit + 1)
+  } else {
+    rows = run('before-timestamp', [cursor.t, cursor.t, cursor.i], limit + 1)
+    if (rows.length < limit + 1) {
+      rows.push(...run('all-null', [], limit + 1 - rows.length))
+    }
+  }
+  const hasMore = rows.length > limit
+  const items = rows.slice(0, limit).map(decodeUnifiedInboxItem)
+  const last = items.at(-1)
+  return {
+    items,
+    nextCursor: hasMore && last
+      ? signCursor({
+          v: 1,
+          s: authority.scope,
+          d: version,
+          e: eligible.digest,
+          t: last.messageAt,
+          i: last.messageId,
+        }, authority)
+      : null,
+  }
 }
 
 export function getThreadMessages(db: DatabaseSync, conversationId: number): MessageSummary[] {
@@ -448,17 +674,19 @@ export function resolveReplyTarget(db: DatabaseSync, messageId: number): Resolve
     .prepare(`SELECT rfc822_message_id,source_id FROM messages
       WHERE id=? AND deleted_at IS NULL AND deleted_from_source_at IS NULL`)
     .get(messageId) as Record<string, unknown> | undefined
-  if (!row || row.rfc822_message_id === null) return null
-  if (typeof row.rfc822_message_id !== 'string' || !row.rfc822_message_id.trim() ||
-      row.rfc822_message_id !== row.rfc822_message_id.trim() ||
-      !Number.isSafeInteger(row.source_id) || Number(row.source_id) <= 0) {
-    throw new Error('msgvault reply identity row has invalid RFC822/source values')
+  if (!row) return null
+  const rfc822MessageId = correlatableMessageId(row.rfc822_message_id)
+  if (rfc822MessageId === null) return null
+  if (!Number.isSafeInteger(row.source_id) || Number(row.source_id) <= 0) {
+    throw new ProductStoreError('corrupt_data', 'msgvault reply identity row has an invalid source id')
   }
-  return { rfc822MessageId: row.rfc822_message_id, sourceId: row.source_id as number }
+  return { rfc822MessageId, sourceId: row.source_id as number }
 }
 
 /** Trusted ownership check retained for read-side callers. */
 export function hasMessageAtSource(db: DatabaseSync, rfc822MessageId: string, sourceId: number): boolean {
+  const correlated = correlatableMessageId(rfc822MessageId)
+  if (correlated === null || !Number.isSafeInteger(sourceId) || sourceId <= 0) return false
   return (
     db
       .prepare(
@@ -468,7 +696,7 @@ export function hasMessageAtSource(db: DatabaseSync, rfc822MessageId: string, so
       AND deleted_at IS NULL AND deleted_from_source_at IS NULL LIMIT 1
   `,
       )
-      .get(rfc822MessageId, sourceId) != null
+      .get(correlated, sourceId) != null
   )
 }
 

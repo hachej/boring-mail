@@ -1,4 +1,5 @@
 /** Dedicated DatabaseSync owner, run as an emitted child process in production. */
+import { randomBytes, randomUUID } from 'node:crypto'
 import {
   fstatSync,
   lstatSync,
@@ -9,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
-import { openMsgvaultStore, resolveReplyTarget } from '../msgvaultAdapter.js'
+import { listUnifiedInbox, openMsgvaultStore, resolveReplyTarget } from '../msgvaultAdapter.js'
 import { ProductStore } from './ProductStore.js'
 import type {
   MailStoreWorkerConfig,
@@ -148,10 +149,25 @@ async function start(): Promise<void> {
     }
     vault = config.msgvaultDbPath ? openMsgvaultStore(config.msgvaultDbPath) : null
     const productStore = store
+    const cursorAuthority = { scope: randomUUID(), secret: randomBytes(32) }
     const handlers: RpcHandlers = {
       upsertAccount: (input) => productStore.upsertAccount(input),
       saveDraft: (input, id) => productStore.saveDraft(input, id),
       getDraft: (id) => productStore.getDraft(id),
+      listUnifiedInbox: (options) => {
+        if (!vault) {
+          throw new ProductStoreError(
+            'msgvault_unavailable',
+            'REMEDIATION: configure msgvaultDbPath before listing the unified inbox',
+          )
+        }
+        return listUnifiedInbox(
+          vault.db,
+          productStore.connectedInboxSources(),
+          cursorAuthority,
+          options,
+        )
+      },
       getOutbox: (id) => productStore.outbox.get(id),
       listAttention: (openOnly) => productStore.outbox.listAttention(openOnly),
       enqueue: (draftId, key) => productStore.outbox.enqueue(draftId, key),

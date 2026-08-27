@@ -155,12 +155,42 @@ export interface AttentionItem {
   readonly createdAt: number
   readonly resolvedAt: number | null
 }
+/** One globally correlated inbox message from its selected connected copy. */
+export interface UnifiedInboxItem {
+  messageId: number
+  conversationId: number
+  sourceId: number
+  sourceIdentifier: string
+  rfc822MessageId: string | null
+  subject: string | null
+  snippet: string | null
+  messageAt: string | null
+  unread: boolean
+  hasAttachments: boolean
+  coalesced: boolean
+  copyCount: number
+}
+export interface UnifiedInboxOptions {
+  limit?: number
+  /** Opaque, signed cursor returned by the preceding page. */
+  cursor?: string
+}
+export interface UnifiedInboxPage {
+  items: UnifiedInboxItem[]
+  nextCursor: string | null
+}
+
 export interface AccountInput {
   accountId: string
   providerSourceId: number
   primaryAddress: string
   sendAs: string[]
   connected?: boolean
+}
+/** @internal Strictly decoded product-account eligibility for unified reads. */
+export interface ConnectedInboxSource {
+  sourceId: number
+  identities: string[]
 }
 export interface ProductStoreDependencies {
   now: () => number
@@ -181,6 +211,8 @@ export type ProductStoreErrorCode =
   | 'corrupt_data'
   | 'idempotency_conflict'
   | 'mail_store_already_active'
+  | 'msgvault_unavailable'
+  | 'stale_cursor'
   | 'rpc_timeout'
   | 'rpc_overloaded'
 export class ProductStoreError extends Error {

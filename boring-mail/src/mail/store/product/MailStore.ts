@@ -26,6 +26,8 @@ import type {
   OutboxRecord,
   RejectedOutbox,
   SentOutbox,
+  UnifiedInboxOptions,
+  UnifiedInboxPage,
   UnknownOutbox,
 } from './types.js'
 import { ProductStoreError, type ProductStoreErrorCode } from './types.js'
@@ -88,6 +90,7 @@ export interface MailStore {
   upsertAccount(input: AccountInput): Promise<void>
   saveDraft(input: DraftInput, requestedId?: string): Promise<DraftRecord>
   getDraft(id: string): Promise<DraftRecord | null>
+  listUnifiedInbox(options?: UnifiedInboxOptions): Promise<UnifiedInboxPage>
   close(): Promise<void>
 }
 
@@ -533,6 +536,9 @@ class MailStoreFacade implements MailStore {
     return this.call('saveDraft', input, requestedId)
   }
   getDraft(id: string): Promise<DraftRecord | null> { return this.call('getDraft', id) }
+  listUnifiedInbox(options?: UnifiedInboxOptions): Promise<UnifiedInboxPage> {
+    return this.call('listUnifiedInbox', options)
+  }
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closed = true

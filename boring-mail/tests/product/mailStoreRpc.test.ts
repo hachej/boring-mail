@@ -33,6 +33,7 @@ describe('async MailStore worker RPC facade', () => {
   it('does not expose the synchronous worker implementation publicly', () => {
     expect(publicStoreApi).not.toHaveProperty('ProductStore')
     expect(publicStoreApi).not.toHaveProperty('openProductStore')
+    expect(publicStoreApi).not.toHaveProperty('listUnifiedInbox')
   })
   it('shares one concurrent start by canonical DB path and closes on last reference', async () => {
     const created: Worker[] = [], db = path(), make = factory(created, { startupDelayMs: 20 })
@@ -43,6 +44,7 @@ describe('async MailStore worker RPC facade', () => {
     expect(created).toHaveLength(1)
     const result: DraftRecord | null = await first.getDraft('missing')
     expect(result).toBeNull()
+    await expect(first.listUnifiedInbox({ limit: 10 })).resolves.toEqual({ items: [], nextCursor: null })
     await first.close()
     await expect(first.getDraft('closed-reference')).rejects.toThrow(/reference is closed/)
     expect(await second.getDraft('still-alive')).toBeNull()

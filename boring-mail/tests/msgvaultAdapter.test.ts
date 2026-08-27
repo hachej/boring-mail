@@ -1,6 +1,7 @@
 // bm-zf6 — adapter tests run against a SYNTHETIC msgvault fixture (schema-faithful
 // subset, zlib raw MIME). No personal data is ever committed.
 // @vitest-environment node
+import { randomBytes } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,6 +10,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
 import {
   attachmentAbsolutePath,
+  correlatableMessageId,
+  explainUnifiedInboxQueryPlan,
   getThreadMessages,
   hasMessageAtSource,
   listAttachments,
@@ -64,6 +67,9 @@ CREATE TABLE messages (
   deleted_from_source_at DATETIME
 );
 CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);
+CREATE INDEX idx_messages_live_sent_at
+  ON messages(COALESCE(sent_at, received_at, internal_date) DESC, id DESC)
+  WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
 CREATE TABLE message_recipients (
   id INTEGER PRIMARY KEY,
   message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -72,6 +78,7 @@ CREATE TABLE message_recipients (
   display_name TEXT,
   email_address TEXT
 );
+CREATE INDEX idx_message_recipients_message ON message_recipients(message_id);
 CREATE TABLE labels (
   id INTEGER PRIMARY KEY,
   source_id INTEGER REFERENCES sources(id),
@@ -262,7 +269,46 @@ describe('msgvaultAdapter', () => {
     ))
     scopedIndex.close()
     expect(() => openMsgvaultStore(scopedIndexPath)).toThrow(
-      /global index idx_messages_rfc822_message_id\(rfc822_message_id\)/,
+      /non-unique, non-partial index led by rfc822_message_id/,
+    )
+
+    const uniqueIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-unique-index-')), 'drift.db')
+    const uniqueIndex = new DatabaseSync(uniqueIndexPath)
+    uniqueIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+      'CREATE UNIQUE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+    ))
+    uniqueIndex.close()
+    expect(() => openMsgvaultStore(uniqueIndexPath)).toThrow(/non-unique, non-partial index/)
+
+    const equivalentIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-equivalent-index-')), 'ok.db')
+    const equivalentIndex = new DatabaseSync(equivalentIndexPath)
+    equivalentIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+      'CREATE INDEX renamed_global_correlation ON messages(rfc822_message_id,source_id);',
+    ))
+    equivalentIndex.close()
+    const equivalentStore = openMsgvaultStore(equivalentIndexPath)
+    equivalentStore.db.close()
+
+    const missingLiveIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-live-index-')), 'drift.db')
+    const missingLiveIndex = new DatabaseSync(missingLiveIndexPath)
+    missingLiveIndex.exec(SCHEMA.replace(
+      /CREATE INDEX idx_messages_live_sent_at[\s\S]*?deleted_from_source_at IS NULL;/,
+      '',
+    ))
+    missingLiveIndex.close()
+    expect(() => openMsgvaultStore(missingLiveIndexPath)).toThrow(/live recency index/)
+
+    const missingRecipientIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-index-')), 'drift.db')
+    const missingRecipientIndex = new DatabaseSync(missingRecipientIndexPath)
+    missingRecipientIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_message_recipients_message ON message_recipients(message_id);',
+      '',
+    ))
+    missingRecipientIndex.close()
+    expect(() => openMsgvaultStore(missingRecipientIndexPath)).toThrow(
+      /message_recipients requires a non-partial index led by message_id/,
     )
 
     const missingRecipientsPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-drift-')), 'drift.db')
@@ -286,6 +332,14 @@ describe('msgvaultAdapter', () => {
     expect(listThreads(store.db, { unreadOnly: true })).toHaveLength(1)
     expect(listThreads(store.db, { label: 'SENT' })).toHaveLength(0)
     expect(listThreads(store.db, { label: 'INBOX' })).toHaveLength(1)
+  })
+
+  it('uses one conservative Message-ID contract for correlation and replies', () => {
+    expect(correlatableMessageId('<local@example.com>')).toBe('<local@example.com>')
+    for (const invalid of [
+      null, '', 'bare@example.com', '<@example.com>', '<local@>', '<a@b@c>',
+      '<<a@b>>', '<a b@c>', '<a\tb@c>', '<a\u0001b@c>', `<${'x'.repeat(997)}@x>`,
+    ]) expect(correlatableMessageId(invalid)).toBeNull()
   })
 
   it('resolves immutable message row ownership and verifies exact pairs', () => {
@@ -331,6 +385,11 @@ describe('msgvaultAdapter', () => {
 describe('msgvaultAdapter — unified inbox projection', () => {
   let raw: DatabaseSync
   let store: { db: DatabaseSync }
+  const eligible = [
+    { sourceId: 1, identities: ['owner-a@example.com', 'alias-a@example.com'] },
+    { sourceId: 2, identities: ['owner-b@example.com'] },
+  ]
+  const authority = { scope: 'fixture-process', secret: randomBytes(32) }
 
   beforeAll(() => {
     const path = join(mkdtempSync(join(tmpdir(), 'msgvault-unified-')), 'fixture.db')
@@ -338,121 +397,159 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     raw.exec(SCHEMA)
     raw.exec(`
       INSERT INTO sources(id,source_type,identifier) VALUES
-        (1,'gmail','owner-a@example.com'),
-        (2,'gmail','owner-b@example.com'),
-        (3,'gmail','owner-c@example.com');
+        (1,'gmail','owner-a@example.com'), (2,'gmail','owner-b@example.com'),
+        (3,'gmail','disconnected@example.com'), (4,'gmail','unregistered@example.com');
       INSERT INTO conversations(id,source_id,source_conversation_id,conversation_type) VALUES
         (11,1,'a-1','email_thread'), (12,2,'b-1','email_thread'),
-        (13,3,'c-1','email_thread'), (14,1,'a-2','email_thread'),
-        (15,2,'b-2','email_thread'), (16,3,'c-2','email_thread');
+        (13,3,'c-1','email_thread'), (14,4,'d-1','email_thread');
     `)
     const insert = raw.prepare(`INSERT INTO messages(
       id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,
       is_read,attachment_count,deleted_at,deleted_from_source_at
     ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
     const message = (
-      id: number,
-      conversationId: number,
-      sourceId: number,
-      rfc822: string | null,
-      sentAt: string,
-      subject: string,
-      deletedAt: string | null = null,
-      deletedFromSourceAt: string | null = null,
-      messageType = 'email',
+      id: number, conversationId: number, sourceId: number, rfc822: string | null,
+      sentAt: string | null, subject: string, deletedAt: string | null = null,
+      deletedFromSourceAt: string | null = null, messageType = 'email',
     ) => insert.run(
       id, conversationId, sourceId, rfc822, messageType, sentAt, subject,
-      id === 102 ? 0 : 1, id === 401 ? 1 : 0, deletedAt, deletedFromSourceAt,
+      id === 101 ? 0 : 1, id === 601 ? 1 : 0, deletedAt, deletedFromSourceAt,
     )
 
-    // Addressed source 2 wins even though source 1 has the newer copy.
-    message(101, 11, 1, '<addressed@example.com>', '2030-01-08 00:00:00', 'newer copy')
-    message(102, 12, 2, '<addressed@example.com>', '2030-01-07 00:00:00', 'addressed copy')
+    // Alias-addressed source 1 wins over a newer non-addressed source 2 copy.
+    message(101, 11, 1, '<alias@example.com>', '2030-01-07 00:00:00', 'alias owner')
+    message(102, 12, 2, '<alias@example.com>', '2030-01-08 00:00:00', 'newer other')
     raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
-      VALUES(102,'To','OWNER-B@example.com'),(101,'bcc','owner-a@example.com')`)
+      VALUES(101,'To','ALIAS-A@example.com')`)
 
-    // No addressed account: newest copy wins, then source id is the stable tie-break.
-    message(201, 12, 2, '<newest@example.com>', '2030-01-05 00:00:00', 'older fallback')
-    message(202, 13, 3, '<newest@example.com>', '2030-01-06 00:00:00', 'newest fallback')
-    message(301, 12, 2, '<stable@example.com>', '2030-01-04 00:00:00', 'source two')
-    message(302, 11, 1, '<stable@example.com>', '2030-01-04 00:00:00', 'source one')
+    // Cc is addressed; when both copies are addressed, newest addressed wins.
+    message(201, 11, 1, '<cc@example.com>', '2030-01-05 00:00:00', 'older cc')
+    message(202, 12, 2, '<cc@example.com>', '2030-01-06 00:00:00', 'newer to')
+    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address) VALUES
+      (201,'cc','alias-a@example.com'),(202,'TO','owner-b@example.com')`)
 
-    message(401, 14, 1, '<single@example.com>', '2030-01-03 00:00:00', 'singleton')
-    message(402, 14, 1, null, '2030-01-02 00:00:00', 'null one')
-    message(403, 15, 2, null, '2030-01-01 00:00:00', 'null two')
-    message(404, 14, 1, 'not-a-message-id', '2029-12-31 00:00:00', 'invalid one')
-    message(405, 15, 2, 'not-a-message-id', '2029-12-30 00:00:00', 'invalid two')
+    // No addressed account: newest copy wins, then source id is stable.
+    message(301, 11, 1, '<newest@example.com>', '2030-01-03 00:00:00', 'older fallback')
+    message(302, 12, 2, '<newest@example.com>', '2030-01-04 00:00:00', 'newest fallback')
+    message(401, 12, 2, '<stable@example.com>', '2030-01-02 00:00:00', 'source two')
+    message(402, 11, 1, '<stable@example.com>', '2030-01-02 00:00:00', 'source one')
 
-    // Deleted copies neither win nor contribute to coalesced/copyCount.
-    message(501, 11, 1, '<local-delete@example.com>', '2031-01-01 00:00:00', 'deleted local', 'gone')
-    message(502, 12, 2, '<local-delete@example.com>', '2029-12-29 00:00:00', 'live local peer')
-    message(503, 13, 3, '<provider-delete@example.com>', '2031-01-01 00:00:00', 'deleted provider', null, 'gone')
-    message(504, 16, 3, '<provider-delete@example.com>', '2029-12-28 00:00:00', 'live provider peer')
-    message(505, 11, 1, '<gone@example.com>', '2032-01-01 00:00:00', 'gone entirely', null, 'gone')
-    message(506, 11, 1, '<calendar@example.com>', '2032-01-01 00:00:00', 'not email', null, null, 'calendar')
+    message(601, 11, 1, '<single@example.com>', '2030-01-01 00:00:00', 'singleton')
+    message(602, 11, 1, null, '2029-12-31 00:00:00', 'null one')
+    message(603, 12, 2, null, '2029-12-30 00:00:00', 'null two')
+
+    // Every unsupported shape remains row-distinct and cannot be a reply target.
+    const malformed = [
+      'not-an-id', '<@domain>', '<local@>', '<a@b@c>', '<<a@b>>', '<a b@c>', '<a\tb@c>', '<a\u0001b@c>',
+    ]
+    malformed.forEach((id, index) => {
+      message(700 + index * 2, 11, 1, id, `2029-12-${String(20 - index).padStart(2, '0')} 00:00:00`, 'bad a')
+      message(701 + index * 2, 12, 2, id, `2029-12-${String(19 - index).padStart(2, '0')} 00:00:00`, 'bad b')
+    })
+
+    // Ineligible copies neither win nor count.
+    message(501, 11, 1, '<connected@example.com>', '2029-11-01 00:00:00', 'connected')
+    message(502, 13, 3, '<connected@example.com>', '2032-01-01 00:00:00', 'disconnected addressed')
+    message(503, 14, 4, '<unregistered@example.com>', '2032-01-01 00:00:00', 'unregistered')
+    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
+      VALUES(502,'to','disconnected@example.com')`)
+
+    // Both deletion forms and non-email rows never surface.
+    message(801, 11, 1, '<local-delete@example.com>', '2033-01-01 00:00:00', 'local deleted', 'gone')
+    message(802, 12, 2, '<provider-delete@example.com>', '2033-01-01 00:00:00', 'provider deleted', null, 'gone')
+    message(803, 11, 1, '<calendar@example.com>', '2033-01-01 00:00:00', 'calendar', null, null, 'calendar')
     store = openMsgvaultStore(path)
   })
 
   afterAll(() => raw.close())
 
-  it('coalesces live copies globally and selects addressed reply ownership', () => {
-    const items = listUnifiedInbox(store.db, { limit: 20 })
-    const addressed = items.find((item) => item.rfc822MessageId === '<addressed@example.com>')
-    expect(addressed).toMatchObject({
-      messageId: 102,
-      conversationId: 12,
-      sourceId: 2,
-      sourceIdentifier: 'owner-b@example.com',
-      subject: 'addressed copy',
-      unread: true,
-      coalesced: true,
-      copyCount: 2,
+  it('uses all authorized identities and keeps winner identity fields coherent', () => {
+    const items = listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).items
+    expect(items.find((item) => item.rfc822MessageId === '<alias@example.com>')).toMatchObject({
+      messageId: 101, conversationId: 11, sourceId: 1,
+      sourceIdentifier: 'owner-a@example.com', subject: 'alias owner', unread: true,
+      coalesced: true, copyCount: 2,
     })
-    expect(items.filter((item) => item.rfc822MessageId === '<addressed@example.com>')).toHaveLength(1)
-  })
-
-  it('uses newest-copy and stable source-id fallbacks', () => {
-    const items = listUnifiedInbox(store.db, { limit: 20 })
+    expect(items.find((item) => item.rfc822MessageId === '<cc@example.com>')).toMatchObject({
+      messageId: 202, conversationId: 12, sourceId: 2, coalesced: true, copyCount: 2,
+    })
     expect(items.find((item) => item.rfc822MessageId === '<newest@example.com>')).toMatchObject({
-      messageId: 202,
-      conversationId: 13,
-      sourceId: 3,
-      coalesced: true,
+      messageId: 302, sourceId: 2, coalesced: true,
     })
     expect(items.find((item) => item.rfc822MessageId === '<stable@example.com>')).toMatchObject({
-      messageId: 302,
-      conversationId: 11,
-      sourceId: 1,
-      coalesced: true,
+      messageId: 402, sourceId: 1, coalesced: true,
     })
   })
 
-  it('keeps singleton, null and invalid identities distinct', () => {
-    const items = listUnifiedInbox(store.db, { limit: 20 })
-    expect(items.find((item) => item.messageId === 401)).toMatchObject({
-      rfc822MessageId: '<single@example.com>', coalesced: false, copyCount: 1, hasAttachments: true,
+  it('excludes disconnected/unregistered/deleted copies before selection and counting', () => {
+    const items = listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).items
+    expect(items.find((item) => item.rfc822MessageId === '<connected@example.com>')).toMatchObject({
+      messageId: 501, sourceId: 1, coalesced: false, copyCount: 1,
     })
-    expect(items.filter((item) => item.messageId === 402 || item.messageId === 403)).toHaveLength(2)
-    expect(items.filter((item) => item.messageId === 404 || item.messageId === 405)).toHaveLength(2)
-    for (const id of [402, 403, 404, 405]) {
+    expect(items.some((item) => [502, 503, 801, 802, 803].includes(item.messageId))).toBe(false)
+  })
+
+  it('keeps null/malformed identities distinct and rejects them as reply targets', () => {
+    const items = listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).items
+    const ids = [
+      602, 603, 700, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713, 714, 715,
+    ]
+    for (const id of ids) {
       expect(items.find((item) => item.messageId === id)).toMatchObject({
         rfc822MessageId: null, coalesced: false, copyCount: 1,
       })
+      expect(resolveReplyTarget(store.db, id)).toBeNull()
     }
+    expect(hasMessageAtSource(store.db, 'not-an-id', 1)).toBe(false)
+    expect(resolveReplyTarget(store.db, 101)).toEqual({ rfc822MessageId: '<alias@example.com>', sourceId: 1 })
   })
 
-  it('excludes both deletion forms and paginates in deterministic order', () => {
-    const all = listUnifiedInbox(store.db, { limit: 20 })
-    expect(all.map((item) => item.messageId)).toEqual([
-      102, 202, 302, 401, 402, 403, 404, 405, 502, 504,
-    ])
-    expect(all.find((item) => item.messageId === 502)).toMatchObject({ coalesced: false, copyCount: 1 })
-    expect(all.find((item) => item.messageId === 504)).toMatchObject({ coalesced: false, copyCount: 1 })
-    expect(listUnifiedInbox(store.db, { limit: 3, offset: 2 })).toEqual(all.slice(2, 5))
-    expect(() => listUnifiedInbox(store.db, { limit: 0 })).toThrow(/limit must be a safe integer/)
-    expect(() => listUnifiedInbox(store.db, { limit: 201 })).toThrow(/limit must be a safe integer/)
-    expect(() => listUnifiedInbox(store.db, { offset: -1 })).toThrow(/offset must be a safe integer/)
-    expect(() => listUnifiedInbox(store.db, { offset: 1_000_001 })).toThrow(/offset must be a safe integer/)
+  it('uses signed keyset cursors and invalidates mutation, eligibility and process changes', () => {
+    const first = listUnifiedInbox(store.db, eligible, authority, { limit: 2 })
+    expect(first.items).toHaveLength(2)
+    expect(first.nextCursor).toEqual(expect.any(String))
+    const second = listUnifiedInbox(store.db, eligible, authority, { limit: 2, cursor: first.nextCursor! })
+    expect(second.items).toHaveLength(2)
+    expect(second.items.map((item) => item.messageId)).not.toEqual(first.items.map((item) => item.messageId))
+    expect(() => listUnifiedInbox(
+      store.db, eligible, authority, { cursor: `${first.nextCursor}x` },
+    )).toThrow(/signature is invalid/)
+    expect(() => listUnifiedInbox(
+      store.db, eligible.slice(0, 1), authority, { cursor: first.nextCursor! },
+    )).toThrow(/cursor expired/)
+    expect(() => listUnifiedInbox(
+      store.db, eligible, { scope: 'replacement-process', secret: authority.secret },
+      { cursor: first.nextCursor! },
+    )).toThrow(/cursor expired/)
+
+    raw.exec(`INSERT INTO messages(
+      id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count
+    ) VALUES(900,11,1,'<sync@example.com>','email','2035-01-01','sync',1,0)`)
+    expect(() => listUnifiedInbox(
+      store.db, eligible, authority, { cursor: first.nextCursor! },
+    )).toThrow(/cursor expired/)
+  })
+
+  it('uses the live-recency index for the production outer page scan', () => {
+    const plan = explainUnifiedInboxQueryPlan(store.db, eligible)
+    expect(plan.some((detail) => /candidate USING INDEX idx_messages_live_sent_at/.test(detail))).toBe(true)
+    expect(plan.some((detail) => /candidate USING (?:COVERING )?INDEX idx_messages_rfc822/.test(detail))).toBe(false)
+    const deepPlan = explainUnifiedInboxQueryPlan(store.db, eligible, {
+      messageAt: '2029-12-31 00:00:00', messageId: 602,
+    })
+    expect(deepPlan.some((detail) => /SEARCH candidate USING INDEX idx_messages_live_sent_at/.test(detail))).toBe(true)
+  })
+
+  it('fails loudly on malformed storage classes and invalid page input', () => {
+    raw.prepare(`INSERT INTO sources(id,source_type,identifier) VALUES(5,'gmail',?)`).run(Buffer.from('bad'))
+    raw.exec(`INSERT INTO conversations(id,source_id,conversation_type) VALUES(15,5,'email_thread');
+      INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,is_read,attachment_count)
+      VALUES(950,15,5,'<bad-storage@example.com>','email','2036-01-01',1,0)`)
+    expect(() => listUnifiedInbox(
+      store.db, [{ sourceId: 5, identities: ['bad@example.com'] }], authority,
+    )).toThrow(/source_identifier must be non-empty text/)
+    expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 0 })).toThrow(/limit must/)
+    expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 201 })).toThrow(/limit must/)
   })
 })
 

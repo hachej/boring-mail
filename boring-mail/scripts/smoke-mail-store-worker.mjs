@@ -12,10 +12,38 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn, spawnSync } from 'node:child_process'
+import { DatabaseSync } from 'node:sqlite'
 import { openMailStore } from '@hachej/boring-mail/mail-store'
 
 const directory = mkdtempSync(join(tmpdir(), 'boring-mail-worker-smoke-'))
 const productDbPath = join(directory, 'boring-mail.db')
+const msgvaultDbPath = join(directory, 'msgvault.db')
+const msgvaultSchema = `
+CREATE TABLE sources(id INTEGER PRIMARY KEY,identifier TEXT NOT NULL);
+CREATE TABLE conversations(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL,conversation_type TEXT,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);
+CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);
+CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER NOT NULL,source_id INTEGER NOT NULL,rfc822_message_id TEXT,message_type TEXT NOT NULL,subject TEXT,snippet TEXT,sent_at TEXT,received_at TEXT,internal_date TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT,deleted_from_source_at TEXT);
+CREATE INDEX correlation_by_message_id ON messages(rfc822_message_id,source_id);
+CREATE INDEX live_message_recency ON messages(COALESCE(sent_at,received_at,internal_date) DESC,id DESC) WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
+CREATE TABLE message_recipients(message_id INTEGER NOT NULL,recipient_type TEXT NOT NULL,email_address TEXT);
+CREATE INDEX recipients_by_message ON message_recipients(message_id,recipient_type);
+CREATE TABLE message_labels(message_id INTEGER,label_id INTEGER);
+CREATE TABLE labels(id INTEGER,name TEXT);
+CREATE TABLE message_raw(message_id INTEGER,raw_data BLOB,raw_format TEXT,compression TEXT);
+CREATE TABLE attachments(id INTEGER,message_id INTEGER,filename TEXT,mime_type TEXT,size INTEGER,content_hash TEXT,storage_path TEXT);
+CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED,subject);
+`
+{
+  const fixture = new DatabaseSync(msgvaultDbPath)
+  fixture.exec(msgvaultSchema)
+  fixture.exec(`INSERT INTO sources VALUES(1,'smoke@example.test');
+    INSERT INTO conversations VALUES(1,1,'email_thread',NULL,3,0,NULL,NULL);
+    INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,subject,sent_at,is_read,attachment_count)
+    VALUES(1,1,1,'<one@example.test>','email','one','2030-01-03',1,0),
+          (2,1,1,'<two@example.test>','email','two','2030-01-02',1,0),
+          (3,1,1,'<three@example.test>','email','three','2030-01-01',1,0)`)
+  fixture.close()
+}
 const moduleUrl = new URL('../dist/mail/store/productDb.js', import.meta.url).href
 const childSource = `void (async () => {
   const { openMailStore } = await import(process.argv[1]);
@@ -77,6 +105,14 @@ try {
   writeFileSync(victim, 'do-not-truncate')
   symlinkSync(victim, ownerPath)
   const symlinkOwnerStore = await openMailStore({ productDbPath })
+  await symlinkOwnerStore.listUnifiedInbox().then(
+    () => { throw new Error('unconfigured msgvault unexpectedly listed inbox') },
+    (error) => {
+      if (error?.code !== 'msgvault_unavailable' || !String(error.message).includes('REMEDIATION')) {
+        throw error
+      }
+    },
+  )
   await symlinkOwnerStore.close()
   if (readFileSync(victim, 'utf8') !== 'do-not-truncate') throw new Error('owner symlink target was modified')
   rmSync(ownerPath)
@@ -100,7 +136,7 @@ try {
   )
   process.env.PATH = originalPath
 
-  const store = await openMailStore({ productDbPath }, {
+  const store = await openMailStore({ productDbPath, msgvaultDbPath }, {
     startupTimeoutMs: 3_000,
     requestTimeoutMs: 3_000,
   })
@@ -108,6 +144,20 @@ try {
     accountId: 'smoke', providerSourceId: 1,
     primaryAddress: 'smoke@example.test', sendAs: ['smoke@example.test'],
   })
+  const firstInboxPage = await store.listUnifiedInbox({ limit: 1 })
+  if (firstInboxPage.items.length !== 1 || !firstInboxPage.nextCursor) {
+    throw new Error('public async unified inbox did not return a cursor page')
+  }
+  const msgvaultWriter = new DatabaseSync(msgvaultDbPath)
+  msgvaultWriter.exec(`INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,subject,sent_at,is_read,attachment_count)
+    VALUES(4,1,1,'<four@example.test>','email','four','2030-01-04',1,0)`)
+  msgvaultWriter.close()
+  await store.listUnifiedInbox({ cursor: firstInboxPage.nextCursor }).then(
+    () => { throw new Error('sync mutation did not invalidate unified inbox cursor') },
+    (error) => { if (error?.code !== 'stale_cursor') throw error },
+  )
+  const restartCursor = (await store.listUnifiedInbox({ limit: 1 })).nextCursor
+  if (!restartCursor) throw new Error('restart cursor fixture did not produce a next page')
   const draft = await store.saveDraft({
     kind: 'compose', path: 'smoke.mail.md', accountId: 'smoke',
     sendAsAddress: 'smoke@example.test', to: ['recipient@example.test'],
@@ -161,6 +211,14 @@ try {
   }
 
   await store.close()
+  const restartedStore = await openMailStore({ productDbPath, msgvaultDbPath })
+  await restartedStore.listUnifiedInbox({ cursor: restartCursor }).then(
+    () => { throw new Error('storage-process restart did not invalidate unified inbox cursor') },
+    (error) => {
+      if (error?.code !== 'invalid_input' && error?.code !== 'stale_cursor') throw error
+    },
+  )
+  await restartedStore.close()
   const reopened = childOpen()
   if (!reopened.stdout.includes('OPENED')) {
     throw new Error(`lock was not released for second process: ${reopened.stdout}${reopened.stderr}`)
@@ -208,10 +266,11 @@ try {
   const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)))
   symlinkSync(packageRoot, join(scope, 'boring-mail'), 'dir')
   writeFileSync(join(consumer, 'index.ts'), `
-    import { openMailStore, ProductStoreError, type DraftInput, type MailStore } from '@hachej/boring-mail/mail-store'
+    import { openMailStore, ProductStoreError, type DraftInput, type MailStore, type UnifiedInboxPage } from '@hachej/boring-mail/mail-store'
     const draft: DraftInput = { kind: 'compose', path: 'x.mail.md', accountId: 'a', sendAsAddress: 'a@x', to: ['b@x'], subject: '', bodyMarkdown: '' }
     const opened: Promise<MailStore> = openMailStore({ productDbPath: '/tmp/example.db' })
-    void draft; void opened; void ProductStoreError
+    const page: Promise<UnifiedInboxPage> = opened.then((store) => store.listUnifiedInbox({ limit: 25 }))
+    void draft; void opened; void page; void ProductStoreError
   `)
   writeFileSync(join(consumer, 'tsconfig.json'), JSON.stringify({ compilerOptions: {
     strict: true, noEmit: true, target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', skipLibCheck: false,
