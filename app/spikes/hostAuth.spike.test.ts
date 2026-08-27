@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { createServer as createHttpServer, type IncomingHttpHeaders } from 'node:http'
+import { execFileSync } from 'node:child_process'
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -32,7 +33,7 @@ function topology(tokenFile: string, port = 5190): HostAuthSpikeOptions {
     bindHost: '127.0.0.1',
     hmrHost: '127.0.0.1',
     allowedOrigin: `http://127.0.0.1:${port}`,
-    backendHost: '127.0.0.1',
+    backendOrigin: 'http://127.0.0.1:5290',
     trustTailnetHttp: true,
     readTailscaleStatus: () => JSON.stringify({
       BackendState: 'Running',
@@ -136,6 +137,19 @@ describe('verified owner token descriptor', () => {
     linkSync(target, hardlink)
     expect(() => readVerifiedTokenFile(target)).toThrow(/one hard link/)
   })
+
+  it('rejects special mode bits and a FIFO without blocking', () => {
+    const root = temporaryRoot()
+    const special = makeTokenFile(root).path
+    chmodSync(special, 0o4600)
+    expect(() => readVerifiedTokenFile(special)).toThrow(/special bits/)
+
+    const fifo = join(root, 'owner.fifo')
+    execFileSync('mkfifo', ['-m', '600', fifo])
+    const started = Date.now()
+    expect(() => readVerifiedTokenFile(fifo)).toThrow(/not a regular file/)
+    expect(Date.now() - started).toBeLessThan(500)
+  })
 })
 
 describe('standalone topology validation', () => {
@@ -149,7 +163,7 @@ describe('standalone topology validation', () => {
     ['wildcard bind', { bindHost: '0.0.0.0', hmrHost: '0.0.0.0', allowedOrigin: 'http://0.0.0.0:5190' }],
     ['mismatched HMR host', { hmrHost: '127.0.0.2' }],
     ['untrusted HTTP', { trustTailnetHttp: false }],
-    ['non-loopback backend', { backendHost: '100.64.0.2' }],
+    ['non-loopback backend', { backendOrigin: 'http://100.64.0.2:5290' }],
     ['origin path', { allowedOrigin: 'http://127.0.0.1:5190/path' }],
     ['origin host mismatch', { allowedOrigin: 'http://127.0.0.2:5190' }],
   ])('rejects %s', (_label, override) => {
@@ -161,12 +175,38 @@ describe('standalone topology validation', () => {
     const { path } = makeTokenFile()
     const base = topology(path)
     for (const status of [
-      JSON.stringify({ BackendState: 'Stopped', Self: { TailscaleIPs: ['127.0.0.1'] } }),
-      JSON.stringify({ BackendState: 'Running', Self: { TailscaleIPs: ['100.64.0.8'] } }),
+      JSON.stringify({ BackendState: 'Stopped', Self: { Online: true, TailscaleIPs: ['127.0.0.1'] } }),
+      JSON.stringify({ BackendState: 'Running', Self: { TailscaleIPs: ['127.0.0.1'] } }),
+      JSON.stringify({ BackendState: 'Running', Self: { Online: 'yes', TailscaleIPs: ['127.0.0.1'] } }),
+      JSON.stringify({ BackendState: 'Running', Self: { Online: true, TailscaleIPs: ['not-an-ip'] } }),
+      JSON.stringify({ BackendState: 'Running', Self: { Online: true, TailscaleIPs: ['100.64.0.8'] } }),
       '{',
       ' '.repeat(65 * 1024),
     ]) {
       expect(() => createHostAuthSpike({ ...base, readTailscaleStatus: () => status })).toThrow(/refused configuration/)
+    }
+  })
+
+  it('refuses resolved Vite config that diverges from the validated authoritative server object', async () => {
+    const root = temporaryRoot()
+    writeFileSync(join(root, 'index.html'), '<title>synthetic</title>', 'utf8')
+    const { path } = makeTokenFile(root)
+    const mismatches = [
+      { cors: true },
+      { host: '0.0.0.0' },
+      { hmr: { host: '127.0.0.2', clientPort: 5190 } },
+      { proxy: { '/api/v1': 'http://127.0.0.1:5290', '/api/boring-mail': 'http://127.0.0.1:5291' } },
+    ]
+    for (const mismatch of mismatches) {
+      const spike = createHostAuthSpike(topology(path))
+      await expect(createViteServer({
+        configFile: false,
+        root,
+        logLevel: 'silent',
+        plugins: [spike.plugin],
+        server: { ...spike.viteServer, ...mismatch },
+      })).rejects.toThrow(/resolved Vite .* topology|resolved Vite proxy target/)
+      spike.dispose()
     }
   })
 })
@@ -185,24 +225,23 @@ describe('real Vite server auth spike', () => {
     })
     const backendPort = await listen(backend)
     const vitePort = await reservePort()
-    const spike = createHostAuthSpike(topology(tokenFile, vitePort))
+    const spike = createHostAuthSpike({
+      ...topology(tokenFile, vitePort),
+      backendOrigin: `http://127.0.0.1:${backendPort}`,
+    })
     const vite = await createViteServer({
       configFile: false,
       root: join(root, 'site'),
       logLevel: 'silent',
       plugins: [spike.plugin],
-      server: {
-        host: '127.0.0.1',
-        port: vitePort,
-        strictPort: true,
-        hmr: { host: '127.0.0.1', clientPort: vitePort },
-        proxy: { '/api/v1': `http://127.0.0.1:${backendPort}` },
-      },
+      server: spike.viteServer,
     })
     viteServers.push(vite)
     await vite.listen()
 
     const origin = `http://127.0.0.1:${vitePort}`
+    const unauthenticatedPreflight = await fetch(`${origin}/`, { method: 'OPTIONS' })
+    expect(unauthenticatedPreflight.status).toBe(401)
     const unauthenticatedAsset = await fetch(`${origin}/`)
     expect(unauthenticatedAsset.status).toBe(401)
     expect(unauthenticatedAsset.headers.get('www-authenticate')).toMatch(/^Basic /)
@@ -211,6 +250,8 @@ describe('real Vite server auth spike', () => {
     expect(authenticatedAsset.status).toBe(200)
     expect(await authenticatedAsset.text()).toContain('synthetic auth spike')
 
+    const rejectedProxyPreflight = await fetch(`${origin}/api/v1/probe`, { method: 'OPTIONS' })
+    expect(rejectedProxyPreflight.status).toBe(401)
     const rejectedProxy = await fetch(`${origin}/api/v1/probe`)
     expect(rejectedProxy.status).toBe(401)
     expect(backendRequests).toHaveLength(0)
@@ -236,6 +277,9 @@ describe('real Vite server auth spike', () => {
 
     expect(await websocketStatus(vitePort)).toMatch(/^HTTP\/1\.1 401 /)
     expect(await websocketStatus(vitePort, basic(token))).toMatch(/^HTTP\/1\.1 101 /)
+
     spike.dispose()
+    expect((await fetch(`${origin}/`, { headers: { authorization: basic(token) } })).status).toBe(401)
+    expect(await websocketStatus(vitePort, basic(token))).toMatch(/^HTTP\/1\.1 401 /)
   }, 15_000)
 })

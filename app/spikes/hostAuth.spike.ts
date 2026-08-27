@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { TextDecoder } from 'node:util'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { Plugin, ViteDevServer } from 'vite'
+import type { Plugin, ServerOptions, ViteDevServer } from 'vite'
 
 const MAX_TOKEN_FILE_BYTES = 256
 const MAX_TAILSCALE_STATUS_BYTES = 64 * 1024
@@ -21,7 +21,7 @@ export interface HostAuthSpikeOptions {
   bindHost: string
   hmrHost: string
   allowedOrigin: string
-  backendHost: string
+  backendOrigin: string
   trustTailnetHttp: boolean
   readTailscaleStatus?: () => string
   trustedProof?: Buffer
@@ -31,6 +31,7 @@ export interface ValidatedHostAuthSpike {
   plugin: Plugin
   proofHeader: typeof PROOF_HEADER
   principalHeader: typeof PRINCIPAL_HEADER
+  viteServer: ServerOptions
   dispose(): void
 }
 
@@ -55,7 +56,8 @@ export function readVerifiedTokenFile(tokenFile: string): Buffer {
   const canonicalParent = realpathSync(dirname(requested))
   const canonicalPath = join(canonicalParent, basename(requested))
   const before = lstatSync(canonicalPath, { bigint: true })
-  const fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW)
+  if (!before.isFile()) fail('token path is not a regular file')
+  const fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try {
     const opened = fstatSync(fd, { bigint: true })
     if (before.dev !== opened.dev || before.ino !== opened.ino) fail('token path changed while opening')
@@ -63,7 +65,7 @@ export function readVerifiedTokenFile(tokenFile: string): Buffer {
     if (opened.nlink !== 1n) fail('token file must have exactly one hard link')
     if (typeof process.geteuid !== 'function') fail('effective uid is unavailable on this platform')
     if (opened.uid !== BigInt(process.geteuid())) fail('token file must belong to the current effective uid')
-    if ((opened.mode & 0o777n) !== 0o600n) fail('token file mode must be exactly 0600')
+    if ((opened.mode & 0o7777n) !== 0o600n) fail('token file mode must be exactly 0600 with no special bits')
     if (opened.size < 1n || opened.size > BigInt(MAX_TOKEN_FILE_BYTES)) fail('token file must contain 1..256 bytes')
 
     const size = Number(opened.size)
@@ -113,35 +115,82 @@ function validateTailscaleSelf(statusText: string, bindHost: string): void {
     fail('tailscale status was not valid JSON')
   }
   const ips = status.Self?.TailscaleIPs
-  if (status.BackendState !== 'Running' || status.Self?.Online === false ||
-      !Array.isArray(ips) || !ips.every((value) => typeof value === 'string')) {
+  if (status.BackendState !== 'Running' || status.Self?.Online !== true ||
+      !Array.isArray(ips) || !ips.every((value) => typeof value === 'string' && isIP(value) !== 0)) {
     fail('tailscale self status was not current and usable')
   }
   if (!ips.includes(bindHost)) fail('bind host is not an exact current local Tailscale IP')
 }
 
-function validateTopology(options: HostAuthSpikeOptions): void {
+function validateTopology(options: HostAuthSpikeOptions): ServerOptions {
   if (isIP(options.bindHost) === 0 || options.bindHost === '0.0.0.0' || options.bindHost === '::') {
     fail('bind host must be one explicit IP address')
   }
   if (options.hmrHost !== options.bindHost) fail('HMR host must exactly match the explicit bind host')
-  if (options.backendHost !== '127.0.0.1' && options.backendHost !== '::1') fail('backend must bind to an explicit loopback IP')
 
   let origin: URL
+  let backend: URL
   try {
     origin = new URL(options.allowedOrigin)
+    backend = new URL(options.backendOrigin)
   } catch {
-    fail('allowed origin must be an absolute URL')
+    fail('allowed and backend origins must be absolute URLs')
   }
+  const originPort = Number(origin.port)
+  if (!Number.isSafeInteger(originPort) || originPort < 1 || originPort > 65_535) fail('allowed origin must have an explicit valid port')
   if (origin.origin !== options.allowedOrigin || origin.username || origin.password || origin.pathname !== '/' ||
       origin.search || origin.hash || origin.hostname !== options.bindHost) {
     fail('allowed origin must be one exact origin on the bind host')
+  }
+  if (backend.origin !== options.backendOrigin || backend.protocol !== 'http:' || backend.username || backend.password ||
+      backend.pathname !== '/' || backend.search || backend.hash ||
+      (backend.hostname !== '127.0.0.1' && backend.hostname !== '[::1]') || !backend.port) {
+    fail('backend must be one exact HTTP origin on an explicit loopback IP and port')
   }
   if (origin.protocol === 'http:') {
     if (!options.trustTailnetHttp) fail('tailnet HTTP requires explicit trust')
     validateTailscaleSelf((options.readTailscaleStatus ?? readBoundedTailscaleStatus)(), options.bindHost)
   } else if (origin.protocol !== 'https:') {
     fail('allowed origin must use HTTP over trusted tailnet or HTTPS')
+  }
+
+  return {
+    host: options.bindHost,
+    port: originPort,
+    strictPort: true,
+    cors: false,
+    origin: options.allowedOrigin,
+    hmr: { host: options.hmrHost, clientPort: originPort },
+    proxy: {
+      '/api/v1': options.backendOrigin,
+      '/api/boring-mail': options.backendOrigin,
+    },
+  }
+}
+
+function assertResolvedViteTopology(server: ServerOptions, expected: ServerOptions): void {
+  if (server.host !== expected.host || server.port !== expected.port || server.strictPort !== true ||
+      server.cors !== false || server.origin !== expected.origin) {
+    fail('resolved Vite HTTP topology differs from the validated server object')
+  }
+  const hmr = server.hmr
+  const expectedHmr = expected.hmr
+  if (!hmr || typeof hmr !== 'object' || !expectedHmr || typeof expectedHmr !== 'object' ||
+      hmr.host !== expectedHmr.host || hmr.clientPort !== expectedHmr.clientPort ||
+      hmr.server !== undefined || (hmr.port !== undefined && hmr.port !== expected.port)) {
+    fail('resolved Vite HMR topology differs from the validated server object')
+  }
+  const proxy = server.proxy ?? {}
+  const expectedProxy = expected.proxy ?? {}
+  const actualKeys = Object.keys(proxy).sort()
+  const expectedKeys = Object.keys(expectedProxy).sort()
+  if (actualKeys.join('\n') !== expectedKeys.join('\n')) fail('resolved Vite proxy routes differ from the validated server object')
+  for (const path of expectedKeys) {
+    const actualEntry = proxy[path]
+    const expectedEntry = expectedProxy[path]
+    const actualTarget = typeof actualEntry === 'string' ? actualEntry : actualEntry?.target
+    const expectedTarget = typeof expectedEntry === 'string' ? expectedEntry : expectedEntry?.target
+    if (actualTarget !== expectedTarget) fail(`resolved Vite proxy target differs for ${path}`)
   }
 }
 
@@ -209,13 +258,18 @@ function rejectHttp(response: ServerResponse): void {
   response.end('Unauthorized\n')
 }
 
-function installUpgradeGate(server: ViteDevServer, expectedToken: Buffer, trustedProof: Buffer): () => void {
+function installUpgradeGate(
+  server: ViteDevServer,
+  expectedToken: Buffer,
+  trustedProof: Buffer,
+  isDisposed: () => boolean,
+): () => void {
   const httpServer = server.httpServer
   if (!httpServer) fail('Vite HTTP server is required to gate HMR upgrades')
   const delegated = httpServer.rawListeners('upgrade')
   httpServer.removeAllListeners('upgrade')
   const gate = (request: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer): void => {
-    if (!authorize(request, expectedToken, trustedProof)) {
+    if (isDisposed() || !authorize(request, expectedToken, trustedProof)) {
       socket.end('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="Boring Mail"\r\nConnection: close\r\n\r\n')
       return
     }
@@ -237,7 +291,7 @@ function installUpgradeGate(server: ViteDevServer, expectedToken: Buffer, truste
 }
 
 export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHostAuthSpike {
-  validateTopology(options)
+  const viteServer = validateTopology(options)
   const expectedToken = readVerifiedTokenFile(options.tokenFile)
   const trustedProof = options.trustedProof ? Buffer.from(options.trustedProof) : randomBytes(32)
   if (trustedProof.byteLength < 32) {
@@ -245,13 +299,24 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
     trustedProof.fill(0)
     fail('trusted backend proof must contain at least 32 random bytes')
   }
-  let removeUpgradeGate: (() => void) | undefined
+  let disposed = false
+  let secretsCleared = false
+  const clearSecrets = (): void => {
+    if (secretsCleared) return
+    secretsCleared = true
+    expectedToken.fill(0)
+    trustedProof.fill(0)
+  }
   const plugin: Plugin = {
     name: 'boring-mail-host-auth-spike',
     enforce: 'pre',
+    configResolved(config) {
+      assertResolvedViteTopology(config.server, viteServer)
+    },
     configureServer(server) {
+      server.httpServer?.once('close', clearSecrets)
       server.middlewares.use((request, response, next) => {
-        if (!authorize(request, expectedToken, trustedProof)) {
+        if (disposed || !authorize(request, expectedToken, trustedProof)) {
           rejectHttp(response)
           return
         }
@@ -261,7 +326,7 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
       // Install after every plugin has registered its upgrade listener, then
       // delegate to those listeners only after the Basic credential is consumed.
       return () => {
-        removeUpgradeGate = installUpgradeGate(server, expectedToken, trustedProof)
+        installUpgradeGate(server, expectedToken, trustedProof, () => disposed)
       }
     },
   }
@@ -269,10 +334,12 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
     plugin,
     proofHeader: PROOF_HEADER,
     principalHeader: PRINCIPAL_HEADER,
+    viteServer,
     dispose() {
-      removeUpgradeGate?.()
-      expectedToken.fill(0)
-      trustedProof.fill(0)
+      disposed = true
+      clearSecrets()
+      // The fail-closed HTTP and upgrade wrappers remain installed until the
+      // server close hook runs; disposal can never restore an open bypass.
     },
   }
 }

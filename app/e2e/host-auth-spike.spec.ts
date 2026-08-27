@@ -60,7 +60,7 @@ test.beforeAll(async () => {
     bindHost: '127.0.0.1',
     hmrHost: '127.0.0.1',
     allowedOrigin: origin,
-    backendHost: '127.0.0.1',
+    backendOrigin: `http://127.0.0.1:${backendPort}`,
     trustTailnetHttp: true,
     readTailscaleStatus: () => JSON.stringify({
       BackendState: 'Running',
@@ -73,13 +73,7 @@ test.beforeAll(async () => {
     root: site,
     logLevel: 'silent',
     plugins: [spike.plugin],
-    server: {
-      host: '127.0.0.1',
-      port: vitePort,
-      strictPort: true,
-      hmr: { host: '127.0.0.1', clientPort: vitePort },
-      proxy: { '/api/v1': `http://127.0.0.1:${backendPort}` },
-    },
+    server: spike.viteServer,
   })
   await vite.listen()
 })

@@ -15,13 +15,14 @@ A production mode was intentionally not enabled. `app/vite.config.ts`, the stand
 The synthetic tests start an actual loopback Vite server and a separate loopback backend. The pre-plugin:
 
 1. validates an explicit bind IP, matching HMR host and exact origin;
-2. requires explicit trust for tailnet HTTP and an exact current `Self.TailscaleIPs` match from bounded status JSON;
-3. descriptor-opens a canonical, current-euid, one-link, regular `0600` token file of at most 256 bytes;
+2. requires explicit trust for tailnet HTTP and an exact online current `Self.TailscaleIPs` match from bounded status JSON;
+3. rejects non-regular paths before open, then descriptor-opens with `O_NOFOLLOW|O_NONBLOCK` and requires a canonical, current-euid, one-link, regular exact-`0600` token file with no special bits and at most 256 bytes;
 4. requires one whitespace-free canonical base64url token decoding to at least 32 bytes;
 5. compares decoded credentials with `timingSafeEqual`;
 6. consumes `Authorization`/`Proxy-Authorization`, removes spoofable Boring Mail proof/principal headers, and injects a fresh trusted proof only after successful authentication;
-7. rejects unauthenticated assets and proxy requests with 401 before they reach Vite/backend; and
-8. captures Vite's registered upgrade listeners and delegates to them only after authentication.
+7. supplies one authoritative Vite server object and rejects resolved host/port/origin/CORS/HMR/proxy drift, including disabling Vite's pre-auth CORS responder;
+8. rejects unauthenticated `OPTIONS`, assets, and proxy requests with 401 before they reach Vite/backend; and
+9. captures Vite's registered upgrade listeners and delegates to them only after authentication, while early disposal remains fail-closed.
 
 The Playwright scenario independently proves browser HTTP credentials can load the page and proxied API while establishing an authenticated Vite HMR client. Its unauthenticated browser reaches neither the proxy backend nor HMR.
 
@@ -29,14 +30,19 @@ The Playwright scenario independently proves browser HTTP credentials can load t
 
 | Command | Result | Redacted result |
 |---|---|---|
-| `pnpm --filter @hachej/boring-mail-playground test` | PASS | 1 file, 11 tests; actual Vite asset/proxy/raw-HMR matrix plus descriptor/topology refusals |
+| `pnpm --filter @hachej/boring-mail-playground test` | PASS | 1 file, 13 tests; actual Vite OPTIONS/asset/proxy/raw-HMR matrix, disposal denial, descriptor/special-file and resolved-topology refusals |
 | `pnpm --filter @hachej/boring-mail-playground test:e2e` | PASS | 2 Playwright browser scenarios; authenticated page/proxy/HMR and unauthenticated rejection |
-| `pnpm test` | PASS | plugin 13 files / 118 tests; app 1 file / 11 tests |
+| `pnpm test` | PASS | plugin 14 files / 120 tests; app 1 file / 13 tests |
 | `pnpm typecheck` | PASS | plugin and app TypeScript projects |
 | `pnpm check-env` | PASS | supported Node/SQLite/flock and pinned host checks |
 | `pnpm build` | PASS | emitted worker smoke and production playground build; existing chunk-size warning only |
 | `pnpm smoke:msgvault-required` | PASS | exact installed v0.19.3 synthetic direct-worker outcomes; no daemon survived and redirect was refused |
-| `MSGVAULT_EXECUTABLE=/definitely/missing/msgvault pnpm smoke:msgvault-required` | EXPECTED FAIL | exit 1 with bounded missing-executable remediation, proving the required wrapper does not skip |
+| required-smoke Vitest disappearance/missing cases | PASS | required mode fails if absent or removed immediately after its single version attestation; optional mode alone may skip |
+| `pnpm install --frozen-lockfile` | PASS | intended dependency graph only; unrelated provider snapshot edges preserved |
+
+## Review disposition
+
+The first independent Sol xhigh review found six material gaps: early-disposal fail-open, caller/actual-Vite config drift, blocking special-file open/special bits, pre-auth Vite CORS, weak Tailscale `Online` typing, and an optional race in the required msgvault wrapper plus unrelated lockfile peer churn. All were fixed and covered by new negative tests before the final gates. No finding was waived.
 
 ## Artifact policy
 
