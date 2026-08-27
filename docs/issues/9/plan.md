@@ -1,7 +1,7 @@
 ---
 github: https://github.com/hachej/boring-mail/issues/9
 issue: 9
-state: blocked-owner
+state: ready-for-agent
 updated: 2026-08-27
 flag: not-flaggable
 track: owner
@@ -89,7 +89,9 @@ flowchart LR
 
 A standalone deployment guard authenticates the whole Vite origin before assets or any `/api/v1/**` proxy are reachable. The bridge separately enforces exact origin, CSRF proof, caller class, owner workspace, and mail-read capability. One server lifecycle owns both sync and store leases.
 
-## Owner decisions requested
+## Owner decisions ratified
+
+Owner approved all six recommendations with the instruction **“merge”** on 2026-08-27. This approval covers the exact revision reviewed at the owner gate; changing any item requires renewed owner review.
 
 | Decision | Recommendation | Why |
 |---|---|---|
@@ -100,7 +102,7 @@ A standalone deployment guard authenticates the whole Vite origin before assets 
 | Browser target | Process-generation HMAC target minted only by successful list results | Prevents sequential msgvault ID enumeration; handler still rechecks current eligibility |
 | Live visual artifact | Retain exactly two masked screenshots: loaded inbox list and clicked thread detail; static host title, whole provider containers masked, all automatic failure/report artifacts disabled | Satisfies exact-path screenshot proof without persisting live provider metadata |
 
-No implementation bead is dispatch-ready until the owner approves these six decisions and this plan.
+These six decisions are owner-ratified. Only Slice 0 may become dispatch-ready; every later implementation Bead remains deferred behind its dependency and the committed Slice 0 GO verdict.
 
 ## Decisions and contracts
 
@@ -571,8 +573,8 @@ The planner closed the delivered cross-account gate and owner-rejected quota gat
 
 ## Open questions after owner decision
 
-None for implementation. Approval of this plan records the six recommendations above as ratified; any change to them returns to owner review.
+None for implementation. The six recommendations above are ratified; any change to them returns to owner review.
 
-## Next action after approval
+## Next action
 
-Record the six decisions as owner-ratified, change plan state to `ready-for-agent`, and update only `bm-qz3` from deferred to open for `/exec`. After its committed reviewed GO verdict, release `bm-h5y` and `bm-hc9` in parallel-capable non-overlapping file scopes.
+Update only `bm-qz3` from deferred to open for `/exec`. After its committed reviewed GO verdict, release `bm-h5y` and `bm-hc9` in parallel-capable non-overlapping file scopes.
