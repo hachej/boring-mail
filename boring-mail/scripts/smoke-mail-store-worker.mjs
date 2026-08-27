@@ -18,27 +18,16 @@ import { openMailStore } from '@hachej/boring-mail/mail-store'
 const directory = mkdtempSync(join(tmpdir(), 'boring-mail-worker-smoke-'))
 const productDbPath = join(directory, 'boring-mail.db')
 const msgvaultDbPath = join(directory, 'msgvault.db')
-const msgvaultSchema = `
-CREATE TABLE sources(id INTEGER PRIMARY KEY,identifier TEXT NOT NULL);
-CREATE TABLE conversations(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL,conversation_type TEXT,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);
-CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);
-CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER NOT NULL,source_id INTEGER NOT NULL,rfc822_message_id TEXT,message_type TEXT NOT NULL,subject TEXT,snippet TEXT,sent_at TEXT,received_at TEXT,internal_date TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT,deleted_from_source_at TEXT);
-CREATE INDEX correlation_by_message_id ON messages(rfc822_message_id,source_id);
-CREATE INDEX messages_by_source ON messages(source_id);
-CREATE INDEX live_message_recency ON messages(COALESCE(sent_at,received_at,internal_date) DESC,id DESC) WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
-CREATE TABLE message_recipients(message_id INTEGER NOT NULL,recipient_type TEXT NOT NULL,email_address TEXT);
-CREATE INDEX recipients_by_message ON message_recipients(message_id,recipient_type);
-CREATE TABLE message_labels(message_id INTEGER,label_id INTEGER);
-CREATE TABLE labels(id INTEGER,name TEXT);
-CREATE TABLE message_raw(message_id INTEGER,raw_data BLOB,raw_format TEXT,compression TEXT);
-CREATE TABLE attachments(id INTEGER,message_id INTEGER,filename TEXT,mime_type TEXT,size INTEGER,content_hash TEXT,storage_path TEXT);
-CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED,subject);
-`
+const msgvaultSchema = readFileSync(
+  new URL('../tests/fixtures/msgvault-v0.19.sql', import.meta.url),
+  'utf8',
+)
 {
   const fixture = new DatabaseSync(msgvaultDbPath)
   fixture.exec(msgvaultSchema)
-  fixture.exec(`INSERT INTO sources VALUES(1,'smoke@example.test');
-    INSERT INTO conversations VALUES(1,1,'email_thread',NULL,3,0,NULL,NULL);
+  fixture.exec(`INSERT INTO sources(id,source_type,identifier) VALUES(1,'gmail','smoke@example.test');
+    INSERT INTO conversations(id,source_id,conversation_type,message_count,unread_count)
+      VALUES(1,1,'email_thread',3,0);
     INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,subject,sent_at,is_read,attachment_count)
     VALUES(1,1,1,'<one@example.test>','email','one','2030-01-03 00:00:00+00:00',1,0),
           (2,1,1,'<two@example.test>','email','two','2030-01-02 00:00:00+00:00',1,0),

@@ -306,7 +306,7 @@ function unifiedInboxSql(
     JOIN json_each(${source}.identities_json) identity
       ON lower(trim(recipient.email_address))=identity.value
     WHERE recipient.message_id=${message}.id
-      AND lower(recipient.recipient_type) IN ('to','cc')
+      AND lower(recipient.recipient_type) IN ('to','cc','bcc')
   )`
   const timestamp = 'COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date)'
   const keysetFor = (time: string, id: string): string => mode === 'before-timestamp'

@@ -1,27 +1,12 @@
 // @vitest-environment node
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
 import { openMsgvaultStore, resolveReplyTarget } from '../../src/mail/store/msgvaultAdapter.js'
 import { openProductStore } from '../../src/mail/store/internalProductStore.js'
-const schema = `
-CREATE TABLE sources(id INTEGER PRIMARY KEY,source_type TEXT NOT NULL,identifier TEXT NOT NULL);
-CREATE TABLE conversations(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL,conversation_type TEXT,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);
-CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);
-CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER,source_id INTEGER NOT NULL,rfc822_message_id TEXT,message_type TEXT NOT NULL DEFAULT 'email',subject TEXT,snippet TEXT,sent_at TEXT,received_at TEXT,internal_date TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT,deleted_from_source_at TEXT);
-CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);
-CREATE INDEX idx_messages_source ON messages(source_id);
-CREATE INDEX idx_messages_live_sent_at ON messages(COALESCE(sent_at,received_at,internal_date) DESC,id DESC) WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
-CREATE TABLE message_recipients(message_id INTEGER NOT NULL,recipient_type TEXT NOT NULL,email_address TEXT);
-CREATE INDEX idx_message_recipients_message ON message_recipients(message_id);
-CREATE TABLE message_labels(message_id INTEGER,label_id INTEGER);
-CREATE TABLE labels(id INTEGER,name TEXT);
-CREATE TABLE message_raw(message_id INTEGER,raw_data BLOB,raw_format TEXT,compression TEXT);
-CREATE TABLE attachments(id INTEGER,message_id INTEGER,filename TEXT,mime_type TEXT,size INTEGER,content_hash TEXT,storage_path TEXT);
-CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED,subject);
-`
+const schema = readFileSync(new URL('../fixtures/msgvault-v0.19.sql', import.meta.url), 'utf8')
 describe('trusted msgvault integration', () => {
   it('fails closed when connected-account identity storage is semantically corrupt', () => {
     const root = mkdtempSync(join(tmpdir(), 'account-corrupt-')),
@@ -44,6 +29,9 @@ describe('trusted msgvault integration', () => {
     const root = mkdtempSync(join(tmpdir(), 'mv-')),
       path = join(root, 'mv.db'),
       raw = new DatabaseSync(path)
+    // This fixture deliberately includes one incoherent ownership row to prove
+    // the adapter rejects it rather than relying on provider FK enforcement.
+    raw.exec('PRAGMA foreign_keys=OFF')
     raw.exec(schema)
     raw.exec(`
       INSERT INTO sources(id,source_type,identifier) VALUES(42,'gmail','a@x'),(43,'gmail','b@x');

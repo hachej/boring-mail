@@ -1,5 +1,5 @@
 // Reproducible bm-eii scale proof. Uses synthetic metadata only; no personal mail.
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
@@ -10,22 +10,10 @@ import {
   openMsgvaultStore,
 } from '../dist/mail/store/msgvaultAdapter.js'
 
-const SCHEMA = `
-CREATE TABLE sources(id INTEGER PRIMARY KEY,identifier TEXT NOT NULL);
-CREATE TABLE conversations(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL,conversation_type TEXT NOT NULL,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);
-CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);
-CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER NOT NULL,source_id INTEGER NOT NULL,rfc822_message_id TEXT,message_type TEXT NOT NULL,subject TEXT,snippet TEXT,sent_at TEXT,received_at TEXT,internal_date TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT,deleted_from_source_at TEXT);
-CREATE INDEX correlation_by_message_id ON messages(rfc822_message_id,source_id);
-CREATE INDEX messages_by_source ON messages(source_id);
-CREATE INDEX live_message_recency ON messages(COALESCE(sent_at,received_at,internal_date) DESC,id DESC) WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
-CREATE TABLE message_recipients(message_id INTEGER NOT NULL,recipient_type TEXT NOT NULL,email_address TEXT);
-CREATE INDEX recipients_by_message ON message_recipients(message_id,recipient_type);
-CREATE TABLE message_labels(message_id INTEGER,label_id INTEGER);
-CREATE TABLE labels(id INTEGER,name TEXT);
-CREATE TABLE message_raw(message_id INTEGER,raw_data BLOB,raw_format TEXT,compression TEXT);
-CREATE TABLE attachments(id INTEGER,message_id INTEGER,filename TEXT,mime_type TEXT,size INTEGER,content_hash TEXT,storage_path TEXT);
-CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED,subject);
-`
+const SCHEMA = readFileSync(
+  new URL('../tests/fixtures/msgvault-v0.19.sql', import.meta.url),
+  'utf8',
+)
 
 function timedPage(db, eligible, authority, options) {
   const started = performance.now()
@@ -44,12 +32,13 @@ function runScenario(name, options) {
   try {
     writer.exec(SCHEMA)
     writer.exec(`
-      INSERT INTO sources VALUES(1,'archived@example.test'),(2,'connected@example.test'),(3,'alias@example.test');
-      INSERT INTO conversations VALUES
-        (1,1,'email_thread',NULL,0,0,NULL,NULL),
-        (2,2,'email_thread',NULL,0,0,NULL,NULL),
-        (3,3,'email_thread',NULL,0,0,NULL,NULL),
-        (4,2,'calendar',NULL,0,0,NULL,NULL);
+      INSERT INTO sources(id,source_type,identifier) VALUES
+        (1,'gmail','archived@example.test'),
+        (2,'gmail','connected@example.test'),
+        (3,'gmail','alias@example.test');
+      INSERT INTO conversations(id,source_id,conversation_type) VALUES
+        (1,1,'email_thread'), (2,2,'email_thread'),
+        (3,3,'email_thread'), (4,2,'calendar');
     `)
     if (ineligiblePrefix > 0) {
       writer.exec(`WITH RECURSIVE n(x) AS (
@@ -126,11 +115,11 @@ function runScenario(name, options) {
     const fallbackPlan = explainUnifiedInboxQueryPlan(store.db, eligible, after, 'source-fallback')
     const recentEvidence = recentPlan.filter((detail) => /(?:SCAN|SEARCH) candidate USING INDEX/.test(detail))
     const fallbackEvidence = fallbackPlan.filter((detail) => /(?:SCAN|SEARCH) candidate USING INDEX/.test(detail))
-    if (!recentEvidence.some((detail) => /live_message_recency/.test(detail))) {
-      throw new Error(`${name} recent plan does not use live_message_recency`)
+    if (!recentEvidence.some((detail) => /idx_messages_live_sent_at/.test(detail))) {
+      throw new Error(`${name} recent plan does not use idx_messages_live_sent_at`)
     }
-    if (!fallbackEvidence.some((detail) => /SEARCH candidate USING INDEX messages_by_source/.test(detail))) {
-      throw new Error(`${name} fallback plan does not search messages_by_source`)
+    if (!fallbackEvidence.some((detail) => /SEARCH candidate USING INDEX idx_messages_source/.test(detail))) {
+      throw new Error(`${name} fallback plan does not search idx_messages_source`)
     }
     return {
       name,
