@@ -190,7 +190,7 @@ function validateTopology(options: HostAuthSpikeOptions): {
 
 function assertResolvedViteTopology(server: ServerOptions, expected: Readonly<ExpectedViteTopology>): void {
   if (server.host !== expected.host || server.port !== expected.port || server.strictPort !== true ||
-      server.cors !== false || server.origin !== expected.origin) {
+      server.cors !== false || server.origin !== expected.origin || server.https !== undefined) {
     fail('resolved Vite HTTP topology differs from the validated server object')
   }
   const ws = server.ws
@@ -359,14 +359,16 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
       assertFinalizerIsLastConfigureHook(config.plugins, finalizerPlugin)
     },
     configureServer(server) {
-      // configResolved hooks may run concurrently. Reassert after Vite has
-      // created the server so a later resolver cannot win a mutation race.
+      // configResolved hooks may run concurrently. Reassert both topology and
+      // the current mutable plugin list after Vite has created the server.
       assertResolvedViteTopology(server.config.server, expected)
+      assertFinalizerIsLastConfigureHook(server.config.plugins, finalizerPlugin)
       // Vite treats this return value as a post-configure hook. Because this
       // finalizer is verified as the last configureServer plugin, its returned
       // callback runs after every earlier plugin's returned callback.
       return () => {
         assertResolvedViteTopology(server.config.server, expected)
+        assertFinalizerIsLastConfigureHook(server.config.plugins, finalizerPlugin)
         installUpgradeGate(server, expectedToken, trustedProof, () => disposed)
       }
     },

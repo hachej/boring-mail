@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createServer as createViteServer, type ServerOptions, type ViteDevServer } from 'vite'
+import { createServer as createViteServer, type Plugin, type ServerOptions, type ViteDevServer } from 'vite'
 import { createHostAuthSpike, readVerifiedTokenFile, type HostAuthSpikeOptions } from './hostAuth.spike'
 
 const roots: string[] = []
@@ -194,6 +194,7 @@ describe('standalone topology validation', () => {
     const { path } = makeTokenFile(root)
     const mismatches: Array<Partial<ServerOptions>> = [
       { cors: true },
+      { https: {} },
       { host: '0.0.0.0' },
       { ws: { host: '0.0.0.0', port: 24_678, clientPort: 24_678 } },
       { proxy: { '/api/v1': 'http://127.0.0.1:5290', '/api/boring-mail': 'http://127.0.0.1:5291' } },
@@ -234,6 +235,27 @@ describe('standalone topology validation', () => {
       }],
     })).rejects.toThrow(/resolved Vite websocket topology/)
     wsSpike.dispose()
+
+    const appendedHookSpike = createHostAuthSpike(topology(path))
+    await expect(createViteServer({
+      configFile: false,
+      root,
+      logLevel: 'silent',
+      server: appendedHookSpike.viteServer,
+      plugins: [...appendedHookSpike.plugins, {
+        name: 'synthetic-late-plugin-list-mutator',
+        async configResolved(config) {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          ;(config.plugins as Plugin[]).push({
+            name: 'synthetic-appended-configure-hook',
+            configureServer(server: ViteDevServer) {
+              return () => server.httpServer?.prependListener('upgrade', () => undefined)
+            },
+          })
+        },
+      }],
+    })).rejects.toThrow(/finalizer must be the last resolved configureServer hook/)
+    appendedHookSpike.dispose()
 
     const proxySpike = createHostAuthSpike(topology(path))
     await expect(createViteServer({
