@@ -254,8 +254,25 @@ describe('standalone topology validation', () => {
           })
         },
       }],
-    })).rejects.toThrow(/finalizer must be the last resolved configureServer hook/)
+    })).rejects.toThrow(/not extensible|finalizer must be the last resolved configureServer hook/)
     appendedHookSpike.dispose()
+
+    const removedFinalizerSpike = createHostAuthSpike(topology(path))
+    await expect(createViteServer({
+      configFile: false,
+      root,
+      logLevel: 'silent',
+      server: removedFinalizerSpike.viteServer,
+      plugins: [...removedFinalizerSpike.plugins, {
+        name: 'synthetic-late-finalizer-remover',
+        async configResolved(config) {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          const index = config.plugins.findIndex((plugin) => plugin.name === 'boring-mail-host-auth-spike:finalizer')
+          ;(config.plugins as Plugin[]).splice(index, 1)
+        },
+      }],
+    })).rejects.toThrow(/read only|not extensible|Cannot delete/)
+    removedFinalizerSpike.dispose()
 
     const proxySpike = createHostAuthSpike(topology(path))
     await expect(createViteServer({
@@ -293,6 +310,19 @@ describe('standalone topology validation', () => {
       }],
     })).rejects.toThrow(/resolved Vite proxy target/)
     returnedPostSpike.dispose()
+
+    const objectPreHookSpike = createHostAuthSpike(topology(path))
+    await expect(createViteServer({
+      configFile: false,
+      root,
+      logLevel: 'silent',
+      server: objectPreHookSpike.viteServer,
+      plugins: [...objectPreHookSpike.plugins, {
+        name: 'synthetic-object-pre-hook',
+        configureServer: { order: 'pre', handler() {} },
+      }],
+    })).rejects.toThrow(/pre-auth plugin must be the first resolved configureServer hook/)
+    objectPreHookSpike.dispose()
 
     const objectHookSpike = createHostAuthSpike(topology(path))
     await expect(createViteServer({

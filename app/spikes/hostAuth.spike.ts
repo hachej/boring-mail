@@ -211,13 +211,31 @@ function assertResolvedViteTopology(server: ServerOptions, expected: Readonly<Ex
   }
 }
 
+function hookOrder(plugin: Plugin): 'pre' | 'post' | undefined {
+  const hook = plugin.configureServer
+  return typeof hook === 'object' && hook !== null && (hook.order === 'pre' || hook.order === 'post')
+    ? hook.order
+    : undefined
+}
+
+function assertAuthIsFirstConfigureHook(plugins: readonly Plugin[], auth: Plugin): void {
+  const self = plugins.indexOf(auth)
+  if (self < 0) fail('host-auth pre-auth plugin is missing from resolved plugins')
+  for (const [index, plugin] of plugins.entries()) {
+    if (plugin === auth || plugin.configureServer === undefined) continue
+    const order = hookOrder(plugin)
+    if (order === 'pre' || (order !== 'post' && index < self)) {
+      fail('host-auth pre-auth plugin must be the first resolved configureServer hook')
+    }
+  }
+}
+
 function assertFinalizerIsLastConfigureHook(plugins: readonly Plugin[], finalizer: Plugin): void {
   const self = plugins.indexOf(finalizer)
   if (self < 0) fail('host-auth finalizer is missing from resolved plugins')
   for (const [index, plugin] of plugins.entries()) {
     if (plugin === finalizer || plugin.configureServer === undefined) continue
-    const hook = plugin.configureServer
-    const order = typeof hook === 'object' && hook !== null ? hook.order : undefined
+    const order = hookOrder(plugin)
     if (order === 'post' || (order !== 'pre' && index > self)) {
       fail('host-auth finalizer must be the last resolved configureServer hook')
     }
@@ -356,18 +374,25 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
     enforce: 'post',
     configResolved(config) {
       assertResolvedViteTopology(config.server, expected)
+      assertAuthIsFirstConfigureHook(config.plugins, authPlugin)
       assertFinalizerIsLastConfigureHook(config.plugins, finalizerPlugin)
+      // The exact standalone plugin graph is trusted configuration. Freeze the
+      // array after validating hook order so a concurrent resolver cannot add,
+      // remove, or reorder a middleware/upgrade hook after these assertions.
+      Object.freeze(config.plugins)
     },
     configureServer(server) {
       // configResolved hooks may run concurrently. Reassert both topology and
       // the current mutable plugin list after Vite has created the server.
       assertResolvedViteTopology(server.config.server, expected)
+      assertAuthIsFirstConfigureHook(server.config.plugins, authPlugin)
       assertFinalizerIsLastConfigureHook(server.config.plugins, finalizerPlugin)
       // Vite treats this return value as a post-configure hook. Because this
       // finalizer is verified as the last configureServer plugin, its returned
       // callback runs after every earlier plugin's returned callback.
       return () => {
         assertResolvedViteTopology(server.config.server, expected)
+        assertAuthIsFirstConfigureHook(server.config.plugins, authPlugin)
         assertFinalizerIsLastConfigureHook(server.config.plugins, finalizerPlugin)
         installUpgradeGate(server, expectedToken, trustedProof, () => disposed)
       }
