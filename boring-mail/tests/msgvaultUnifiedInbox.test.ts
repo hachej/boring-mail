@@ -280,4 +280,3 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     )).toThrowError(expect.objectContaining({ code: 'invalid_input' }))
   })
 })
-
