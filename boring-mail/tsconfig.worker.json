@@ -9,5 +9,6 @@
     "outDir": "dist",
     "types": ["node"]
   },
-  "include": ["src/mail/store/**/*.ts"]
+  "include": ["src/mail/store/**/*.ts"],
+  "exclude": ["src/mail/store/msgvault/gmailAccounts.ts"]
 }

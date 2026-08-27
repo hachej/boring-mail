@@ -5,13 +5,19 @@
 // product data happen by rfc822_message_id (+ source_id) at the product layer.
 //
 // msgvault is alpha software: this adapter and its focused internal projection
-// module are the ONLY modules allowed to know its schema. Shape-checked on open
-// and tested against 0.19; schema drift fails loudly here. msgvault exposes no
-// runtime release-version metadata to pin.
+// consume the shared strict schema seam. Shape-checked on open and tested
+// against 0.19; schema drift fails loudly here. msgvault exposes no runtime
+// release-version metadata to pin.
 import { DatabaseSync } from 'node:sqlite'
 import { inflateSync } from 'node:zlib'
 import { join } from 'node:path'
 import { ProductStoreError } from './product/types.js'
+import {
+  openMsgvaultReadOnly,
+  readMsgvaultTableColumns,
+  validateMsgvaultSourcesSchema,
+  type MsgvaultSchemaColumn,
+} from './msgvault/schema.js'
 
 /** msgvault release line this adapter was written against (spike: v0.19.3). */
 export const MSGVAULT_TESTED_MAJOR_MINOR = '0.19'
@@ -63,7 +69,7 @@ import {
   rememberIndexCapabilities,
 } from './msgvault/unifiedInboxProjection.js'
 
-type SchemaColumn = { name: string; type: string; notnull: number; pk: number }
+type SchemaColumn = MsgvaultSchemaColumn
 function validateIntegerPrimaryKey(columns: SchemaColumn[], table: string, errors: string[]): void {
   const id = columns.find((column) => column.name === 'id')
   const primaryKeys = columns.filter((column) => column.pk > 0)
@@ -73,7 +79,7 @@ function validateIntegerPrimaryKey(columns: SchemaColumn[], table: string, error
 }
 
 const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
-  sources: ['id', 'identifier'],
+  sources: ['id', 'source_type', 'identifier'],
   messages: [
     'id',
     'conversation_id',
@@ -121,7 +127,7 @@ const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
 export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {}): { db: DatabaseSync } {
   let db: DatabaseSync
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true })
+    db = openMsgvaultReadOnly(dbPath)
   } catch (e) {
     throw new Error(
       `REMEDIATION: cannot open msgvault archive at ${dbPath} (${(e as Error).message}). ` +
@@ -136,13 +142,14 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
   const columnErrors: string[] = []
   for (const [table, required] of Object.entries(REQUIRED_SCHEMA)) {
     if (!have.has(table)) continue
-    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as SchemaColumn[]
+    const columns = readMsgvaultTableColumns(db, table)
     const names = new Set(columns.map((column) => column.name))
     const missing = required.filter((column) => !names.has(column))
     if (missing.length) columnErrors.push(`${table} missing column(s): ${missing.join(', ')}`)
-    if (table === 'messages' || table === 'sources' || table === 'conversations') {
+    if (table === 'messages' || table === 'conversations') {
       validateIntegerPrimaryKey(columns, table, columnErrors)
     }
+    if (table === 'sources') columnErrors.push(...validateMsgvaultSourcesSchema(columns))
     if (table === 'messages') {
       const source = columns.find((column) => column.name === 'source_id')
       const rfc822 = columns.find((column) => column.name === 'rfc822_message_id')
@@ -155,12 +162,6 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
       }
       if (!messageType || !/(char|clob|text)/i.test(messageType.type) || messageType.notnull !== 1) {
         columnErrors.push('messages.message_type must be NOT NULL with TEXT affinity')
-      }
-    }
-    if (table === 'sources') {
-      const identifier = columns.find((column) => column.name === 'identifier')
-      if (!identifier || !/(char|clob|text)/i.test(identifier.type) || identifier.notnull !== 1) {
-        columnErrors.push('sources.identifier must be NOT NULL with TEXT affinity')
       }
     }
     if (table === 'conversations') {
