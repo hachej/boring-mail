@@ -20,7 +20,7 @@ The synthetic tests start an actual loopback Vite server and a separate loopback
 4. requires one whitespace-free canonical base64url token decoding to at least 32 bytes;
 5. compares decoded credentials with `timingSafeEqual`;
 6. consumes `Authorization`/`Proxy-Authorization`, removes spoofable Boring Mail proof/principal headers, and injects a fresh trusted proof only after successful authentication;
-7. supplies one authoritative Vite server object and rejects resolved host/port/origin/CORS/HMR/proxy drift, including disabling Vite's pre-auth CORS responder;
+7. supplies one authoritative Vite server object plus a detached immutable topology snapshot and rejects resolved host/port/origin/CORS/canonical-`server.ws`/proxy drift, including a separate HMR server and Vite's pre-auth CORS responder;
 8. rejects unauthenticated `OPTIONS`, assets, and proxy requests with 401 before they reach Vite/backend; and
 9. captures Vite's registered upgrade listeners and delegates to them only after authentication, while early disposal remains fail-closed.
 
@@ -42,7 +42,7 @@ The Playwright scenario independently proves browser HTTP credentials can load t
 
 ## Review disposition
 
-The first independent Sol xhigh review found six material gaps: early-disposal fail-open, caller/actual-Vite config drift, blocking special-file open/special bits, pre-auth Vite CORS, weak Tailscale `Online` typing, and an optional race in the required msgvault wrapper plus unrelated lockfile peer churn. All were fixed and covered by new negative tests before the final gates. No finding was waived.
+The first independent Sol xhigh review found six material gaps: early-disposal fail-open, caller/actual-Vite config drift, blocking special-file open/special bits, pre-auth Vite CORS, weak Tailscale `Online` typing, and an optional race in the required msgvault wrapper plus unrelated lockfile peer churn. The next final pass found a shared-object/canonical-`server.ws` drift bypass and a canonical proof-script naming mismatch. All were fixed and covered by negative tests or an exact script alias before the final gates. No finding was waived.
 
 ## Artifact policy
 

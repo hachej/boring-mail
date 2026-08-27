@@ -40,6 +40,14 @@ interface TailscaleStatus {
   Self?: { Online?: unknown; TailscaleIPs?: unknown }
 }
 
+interface ExpectedViteTopology {
+  host: string
+  port: number
+  origin: string
+  backendOrigin: string
+  proxyPaths: readonly string[]
+}
+
 function fail(message: string): never {
   throw new Error(`host-auth spike refused configuration: ${message}`)
 }
@@ -122,7 +130,10 @@ function validateTailscaleSelf(statusText: string, bindHost: string): void {
   if (!ips.includes(bindHost)) fail('bind host is not an exact current local Tailscale IP')
 }
 
-function validateTopology(options: HostAuthSpikeOptions): ServerOptions {
+function validateTopology(options: HostAuthSpikeOptions): {
+  viteServer: ServerOptions
+  expected: Readonly<ExpectedViteTopology>
+} {
   if (isIP(options.bindHost) === 0 || options.bindHost === '0.0.0.0' || options.bindHost === '::') {
     fail('bind host must be one explicit IP address')
   }
@@ -154,43 +165,47 @@ function validateTopology(options: HostAuthSpikeOptions): ServerOptions {
     fail('allowed origin must use HTTP over trusted tailnet or HTTPS')
   }
 
-  return {
+  const proxyPaths = Object.freeze(['/api/boring-mail', '/api/v1'] as const)
+  const expected = Object.freeze<ExpectedViteTopology>({
     host: options.bindHost,
     port: originPort,
+    origin: options.allowedOrigin,
+    backendOrigin: options.backendOrigin,
+    proxyPaths,
+  })
+  const viteServer: ServerOptions = {
+    host: expected.host,
+    port: expected.port,
     strictPort: true,
     cors: false,
-    origin: options.allowedOrigin,
-    hmr: { host: options.hmrHost, clientPort: originPort },
-    proxy: {
-      '/api/v1': options.backendOrigin,
-      '/api/boring-mail': options.backendOrigin,
-    },
+    origin: expected.origin,
+    hmr: { overlay: true },
+    ws: { host: expected.host, port: expected.port, clientPort: expected.port },
+    proxy: Object.fromEntries(expected.proxyPaths.map((path) => [path, expected.backendOrigin])),
   }
+  return { viteServer, expected }
 }
 
-function assertResolvedViteTopology(server: ServerOptions, expected: ServerOptions): void {
+function assertResolvedViteTopology(server: ServerOptions, expected: Readonly<ExpectedViteTopology>): void {
   if (server.host !== expected.host || server.port !== expected.port || server.strictPort !== true ||
       server.cors !== false || server.origin !== expected.origin) {
     fail('resolved Vite HTTP topology differs from the validated server object')
   }
-  const hmr = server.hmr
-  const expectedHmr = expected.hmr
-  if (!hmr || typeof hmr !== 'object' || !expectedHmr || typeof expectedHmr !== 'object' ||
-      hmr.host !== expectedHmr.host || hmr.clientPort !== expectedHmr.clientPort ||
-      hmr.server !== undefined || (hmr.port !== undefined && hmr.port !== expected.port)) {
-    fail('resolved Vite HMR topology differs from the validated server object')
+  const ws = server.ws
+  if (!ws || typeof ws !== 'object' || ws.host !== expected.host || ws.port !== expected.port ||
+      ws.clientPort !== expected.port || ws.server !== undefined) {
+    fail('resolved Vite websocket topology differs from the validated server object')
   }
   const proxy = server.proxy ?? {}
-  const expectedProxy = expected.proxy ?? {}
   const actualKeys = Object.keys(proxy).sort()
-  const expectedKeys = Object.keys(expectedProxy).sort()
-  if (actualKeys.join('\n') !== expectedKeys.join('\n')) fail('resolved Vite proxy routes differ from the validated server object')
-  for (const path of expectedKeys) {
+  if (actualKeys.join('\n') !== expected.proxyPaths.join('\n')) {
+    fail('resolved Vite proxy routes differ from the validated server object')
+  }
+  for (const path of expected.proxyPaths) {
     const actualEntry = proxy[path]
-    const expectedEntry = expectedProxy[path]
-    const actualTarget = typeof actualEntry === 'string' ? actualEntry : actualEntry?.target
-    const expectedTarget = typeof expectedEntry === 'string' ? expectedEntry : expectedEntry?.target
-    if (actualTarget !== expectedTarget) fail(`resolved Vite proxy target differs for ${path}`)
+    if (typeof actualEntry !== 'string' || actualEntry !== expected.backendOrigin) {
+      fail(`resolved Vite proxy target differs for ${path}`)
+    }
   }
 }
 
@@ -291,7 +306,7 @@ function installUpgradeGate(
 }
 
 export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHostAuthSpike {
-  const viteServer = validateTopology(options)
+  const { viteServer, expected } = validateTopology(options)
   const expectedToken = readVerifiedTokenFile(options.tokenFile)
   const trustedProof = options.trustedProof ? Buffer.from(options.trustedProof) : randomBytes(32)
   if (trustedProof.byteLength < 32) {
@@ -311,7 +326,7 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
     name: 'boring-mail-host-auth-spike',
     enforce: 'pre',
     configResolved(config) {
-      assertResolvedViteTopology(config.server, viteServer)
+      assertResolvedViteTopology(config.server, expected)
     },
     configureServer(server) {
       server.httpServer?.once('close', clearSecrets)

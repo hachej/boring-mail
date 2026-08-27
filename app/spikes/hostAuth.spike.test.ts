@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createServer as createViteServer, type ViteDevServer } from 'vite'
+import { createServer as createViteServer, type ServerOptions, type ViteDevServer } from 'vite'
 import { createHostAuthSpike, readVerifiedTokenFile, type HostAuthSpikeOptions } from './hostAuth.spike'
 
 const roots: string[] = []
@@ -191,11 +191,15 @@ describe('standalone topology validation', () => {
     const root = temporaryRoot()
     writeFileSync(join(root, 'index.html'), '<title>synthetic</title>', 'utf8')
     const { path } = makeTokenFile(root)
-    const mismatches = [
+    const mismatches: Array<Partial<ServerOptions>> = [
       { cors: true },
       { host: '0.0.0.0' },
-      { hmr: { host: '127.0.0.2', clientPort: 5190 } },
+      { ws: { host: '0.0.0.0', port: 24_678, clientPort: 24_678 } },
       { proxy: { '/api/v1': 'http://127.0.0.1:5290', '/api/boring-mail': 'http://127.0.0.1:5291' } },
+      { proxy: {
+        '/api/v1': { target: 'http://127.0.0.1:5290' },
+        '/api/boring-mail': { target: 'http://127.0.0.1:5290' },
+      } },
     ]
     for (const mismatch of mismatches) {
       const spike = createHostAuthSpike(topology(path))
