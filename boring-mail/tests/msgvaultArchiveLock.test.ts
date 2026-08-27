@@ -127,7 +127,7 @@ const wait=()=>fs.existsSync(process.env.FINISH_PATH)?console.log('Changes: 0 pr
     }
   })
 
-  it('rejects dotted, inline, and quoted config storage overrides', async () => {
+  it('rejects dotted, inline, quoted, escaped, and case-insensitive config storage overrides', async () => {
     const root = mkdtempSync(join(tmpdir(), 'mv-config-overrides-'))
     const dbPath = join(root, 'msgvault.db')
     const configPath = join(root, 'config.toml')
@@ -137,6 +137,10 @@ const wait=()=>fs.existsSync(process.env.FINISH_PATH)?console.log('Changes: 0 pr
       `data = { database_url = "postgres://elsewhere" }\n`,
       `[data]\n"data_dir" = "/elsewhere"\n`,
       `[data]\n"data\\u005fdir" = "/elsewhere"\n`,
+      `data.DATA_DIR = "/elsewhere"\n`,
+      `data = { DaTaBaSe_Url = "postgres://elsewhere" }\n`,
+      `[data]\n"DATABASE_URL" = "postgres://elsewhere"\n`,
+      `[data]\n"DaTa\\u005fDiR" = "/elsewhere"\n`,
     ]) {
       writeFileSync(configPath, config)
       await expect(acquireMsgvaultArchiveLock(dbPath, { configPath }))

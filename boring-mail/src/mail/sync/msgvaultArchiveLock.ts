@@ -113,7 +113,10 @@ function rejectStorageOverrides(configBytes: Buffer): void {
     (_match, short: string | undefined, long: string | undefined) =>
       String.fromCodePoint(Number.parseInt(short ?? long!, 16)),
   )
-  if (/(?:data_dir|database_url)/u.test(normalized)) {
+  // BurntSushi/toml, used by pinned msgvault v0.19.3, matches decoded
+  // struct field names case-insensitively. Mirror that behavior so spelling
+  // variations cannot bypass the storage boundary.
+  if (/(?:data_dir|database_url)/iu.test(normalized)) {
     throw new Error(
       'REMEDIATION: msgvault config storage overrides are unsupported; remove data_dir/database_url and select the archive with MSGVAULT_HOME',
     )

@@ -93,18 +93,19 @@ try {
     throw new Error('msgvault direct-worker smoke left an archive or daemon owner behind')
   }
 
-  // First attest the pinned binary's redirect semantics in isolation. Then
-  // reset the target, hold its native writer lock, and prove Boring Mail rejects
-  // those exact config bytes before the redirected database can be created.
+  // First attest the pinned binary's case-insensitive redirect semantics in
+  // isolation. Then reset the target, hold its native writer lock, and prove
+  // Boring Mail rejects those exact mixed-case config bytes before the
+  // redirected database can be created.
   const redirectConfig = join(root, 'config.toml')
-  writeFileSync(redirectConfig, `[data]\ndata_dir = ${JSON.stringify(target)}\n`, { mode: 0o600 })
+  writeFileSync(redirectConfig, `[data]\nDaTa_DiR = ${JSON.stringify(target)}\n`, { mode: 0o600 })
   const upstreamRedirect = spawnSync(executable, [
     '--home', root, '--config', redirectConfig, '--no-log-file', 'sync',
   ], {
     encoding: 'utf8', timeout: 30_000, maxBuffer: 128 * 1024, env: directEnv(),
   })
   if (upstreamRedirect.status !== 1 || !existsSync(join(target, 'msgvault.db'))) {
-    throw new Error('installed msgvault did not demonstrate the pinned config redirect semantics')
+    throw new Error('installed msgvault did not demonstrate case-insensitive config redirect semantics')
   }
   rmSync(target, { recursive: true, force: true })
   mkdirSync(target, { mode: 0o700 })
