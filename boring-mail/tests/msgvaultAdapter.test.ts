@@ -13,6 +13,7 @@ import {
   hasMessageAtSource,
   listAttachments,
   listThreads,
+  listUnifiedInbox,
   openMsgvaultStore,
   readRawMessage,
   resolveReplyTarget,
@@ -20,7 +21,11 @@ import {
 } from '../src/mail/store/msgvaultAdapter.js'
 
 const SCHEMA = `
-CREATE TABLE sources (id INTEGER PRIMARY KEY, kind TEXT, email TEXT);
+CREATE TABLE sources (
+  id INTEGER PRIMARY KEY,
+  source_type TEXT NOT NULL,
+  identifier TEXT NOT NULL
+);
 CREATE TABLE participants (
   id INTEGER PRIMARY KEY,
   email_address TEXT,
@@ -48,13 +53,24 @@ CREATE TABLE messages (
   rfc822_message_id TEXT,
   message_type TEXT NOT NULL DEFAULT 'email',
   sent_at DATETIME,
+  received_at DATETIME,
   internal_date DATETIME,
   sender_id INTEGER REFERENCES participants(id),
   subject TEXT,
   snippet TEXT,
   is_read BOOLEAN DEFAULT TRUE,
   attachment_count INTEGER DEFAULT 0,
-  deleted_at DATETIME
+  deleted_at DATETIME,
+  deleted_from_source_at DATETIME
+);
+CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);
+CREATE TABLE message_recipients (
+  id INTEGER PRIMARY KEY,
+  message_id INTEGER NOT NULL REFERENCES messages(id),
+  participant_id INTEGER,
+  recipient_type TEXT NOT NULL,
+  display_name TEXT,
+  email_address TEXT
 );
 CREATE TABLE labels (
   id INTEGER PRIMARY KEY,
@@ -120,7 +136,7 @@ describe('msgvaultAdapter', () => {
     db = new DatabaseSync(dbPath)
     db.exec(SCHEMA)
 
-    db.exec(`INSERT INTO sources (id, kind, email) VALUES (1, 'gmail', 'fixture@example.com')`)
+    db.exec(`INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'fixture@example.com')`)
     db.exec(
       `INSERT INTO participants (id, email_address, display_name, domain) VALUES
        (1, 'alice@example.com', 'Alice', 'example.com'),
@@ -190,7 +206,7 @@ describe('msgvaultAdapter', () => {
       SCHEMA.replace('id INTEGER PRIMARY KEY,\n  conversation_id', 'id TEXT,\n  conversation_id')
         .replace(/ REFERENCES messages\(id\)( ON DELETE CASCADE)?/g, ''),
     )
-    bad.exec(`INSERT INTO sources(id,kind,email) VALUES(1,'gmail','fixture@example.com');
+    bad.exec(`INSERT INTO sources(id,source_type,identifier) VALUES(1,'gmail','fixture@example.com');
       INSERT INTO conversations(id,source_id,conversation_type) VALUES(1,1,'email_thread');
       INSERT INTO messages(id,conversation_id,source_id) VALUES('duplicate',1,1),('duplicate',1,1)`)
     bad.close()
@@ -237,6 +253,25 @@ describe('msgvaultAdapter', () => {
     )
     fakeDb.close()
     expect(() => openMsgvaultStore(fakeFts)).toThrow(/not an FTS5 virtual table/)
+
+    const scopedIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-index-drift-')), 'drift.db')
+    const scopedIndex = new DatabaseSync(scopedIndexPath)
+    scopedIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(source_id,rfc822_message_id);',
+    ))
+    scopedIndex.close()
+    expect(() => openMsgvaultStore(scopedIndexPath)).toThrow(
+      /global index idx_messages_rfc822_message_id\(rfc822_message_id\)/,
+    )
+
+    const missingRecipientsPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-drift-')), 'drift.db')
+    const missingRecipients = new DatabaseSync(missingRecipientsPath)
+    missingRecipients.exec(SCHEMA.replace('recipient_type TEXT NOT NULL,', 'recipient_kind TEXT NOT NULL,'))
+    missingRecipients.close()
+    expect(() => openMsgvaultStore(missingRecipientsPath)).toThrow(
+      /message_recipients missing column\(s\): recipient_type/,
+    )
     expect(() => openMsgvaultStore(join(tmpdir(), 'does-not-exist.db'))).toThrow(/REMEDIATION/)
   })
 
@@ -293,6 +328,134 @@ describe('msgvaultAdapter', () => {
   })
 })
 
+describe('msgvaultAdapter — unified inbox projection', () => {
+  let raw: DatabaseSync
+  let store: { db: DatabaseSync }
+
+  beforeAll(() => {
+    const path = join(mkdtempSync(join(tmpdir(), 'msgvault-unified-')), 'fixture.db')
+    raw = new DatabaseSync(path)
+    raw.exec(SCHEMA)
+    raw.exec(`
+      INSERT INTO sources(id,source_type,identifier) VALUES
+        (1,'gmail','owner-a@example.com'),
+        (2,'gmail','owner-b@example.com'),
+        (3,'gmail','owner-c@example.com');
+      INSERT INTO conversations(id,source_id,source_conversation_id,conversation_type) VALUES
+        (11,1,'a-1','email_thread'), (12,2,'b-1','email_thread'),
+        (13,3,'c-1','email_thread'), (14,1,'a-2','email_thread'),
+        (15,2,'b-2','email_thread'), (16,3,'c-2','email_thread');
+    `)
+    const insert = raw.prepare(`INSERT INTO messages(
+      id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,
+      is_read,attachment_count,deleted_at,deleted_from_source_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+    const message = (
+      id: number,
+      conversationId: number,
+      sourceId: number,
+      rfc822: string | null,
+      sentAt: string,
+      subject: string,
+      deletedAt: string | null = null,
+      deletedFromSourceAt: string | null = null,
+      messageType = 'email',
+    ) => insert.run(
+      id, conversationId, sourceId, rfc822, messageType, sentAt, subject,
+      id === 102 ? 0 : 1, id === 401 ? 1 : 0, deletedAt, deletedFromSourceAt,
+    )
+
+    // Addressed source 2 wins even though source 1 has the newer copy.
+    message(101, 11, 1, '<addressed@example.com>', '2030-01-08 00:00:00', 'newer copy')
+    message(102, 12, 2, '<addressed@example.com>', '2030-01-07 00:00:00', 'addressed copy')
+    raw.exec(`INSERT INTO message_recipients(message_id,recipient_type,email_address)
+      VALUES(102,'To','OWNER-B@example.com'),(101,'bcc','owner-a@example.com')`)
+
+    // No addressed account: newest copy wins, then source id is the stable tie-break.
+    message(201, 12, 2, '<newest@example.com>', '2030-01-05 00:00:00', 'older fallback')
+    message(202, 13, 3, '<newest@example.com>', '2030-01-06 00:00:00', 'newest fallback')
+    message(301, 12, 2, '<stable@example.com>', '2030-01-04 00:00:00', 'source two')
+    message(302, 11, 1, '<stable@example.com>', '2030-01-04 00:00:00', 'source one')
+
+    message(401, 14, 1, '<single@example.com>', '2030-01-03 00:00:00', 'singleton')
+    message(402, 14, 1, null, '2030-01-02 00:00:00', 'null one')
+    message(403, 15, 2, null, '2030-01-01 00:00:00', 'null two')
+    message(404, 14, 1, 'not-a-message-id', '2029-12-31 00:00:00', 'invalid one')
+    message(405, 15, 2, 'not-a-message-id', '2029-12-30 00:00:00', 'invalid two')
+
+    // Deleted copies neither win nor contribute to coalesced/copyCount.
+    message(501, 11, 1, '<local-delete@example.com>', '2031-01-01 00:00:00', 'deleted local', 'gone')
+    message(502, 12, 2, '<local-delete@example.com>', '2029-12-29 00:00:00', 'live local peer')
+    message(503, 13, 3, '<provider-delete@example.com>', '2031-01-01 00:00:00', 'deleted provider', null, 'gone')
+    message(504, 16, 3, '<provider-delete@example.com>', '2029-12-28 00:00:00', 'live provider peer')
+    message(505, 11, 1, '<gone@example.com>', '2032-01-01 00:00:00', 'gone entirely', null, 'gone')
+    message(506, 11, 1, '<calendar@example.com>', '2032-01-01 00:00:00', 'not email', null, null, 'calendar')
+    store = openMsgvaultStore(path)
+  })
+
+  afterAll(() => raw.close())
+
+  it('coalesces live copies globally and selects addressed reply ownership', () => {
+    const items = listUnifiedInbox(store.db, { limit: 20 })
+    const addressed = items.find((item) => item.rfc822MessageId === '<addressed@example.com>')
+    expect(addressed).toMatchObject({
+      messageId: 102,
+      conversationId: 12,
+      sourceId: 2,
+      sourceIdentifier: 'owner-b@example.com',
+      subject: 'addressed copy',
+      unread: true,
+      coalesced: true,
+      copyCount: 2,
+    })
+    expect(items.filter((item) => item.rfc822MessageId === '<addressed@example.com>')).toHaveLength(1)
+  })
+
+  it('uses newest-copy and stable source-id fallbacks', () => {
+    const items = listUnifiedInbox(store.db, { limit: 20 })
+    expect(items.find((item) => item.rfc822MessageId === '<newest@example.com>')).toMatchObject({
+      messageId: 202,
+      conversationId: 13,
+      sourceId: 3,
+      coalesced: true,
+    })
+    expect(items.find((item) => item.rfc822MessageId === '<stable@example.com>')).toMatchObject({
+      messageId: 302,
+      conversationId: 11,
+      sourceId: 1,
+      coalesced: true,
+    })
+  })
+
+  it('keeps singleton, null and invalid identities distinct', () => {
+    const items = listUnifiedInbox(store.db, { limit: 20 })
+    expect(items.find((item) => item.messageId === 401)).toMatchObject({
+      rfc822MessageId: '<single@example.com>', coalesced: false, copyCount: 1, hasAttachments: true,
+    })
+    expect(items.filter((item) => item.messageId === 402 || item.messageId === 403)).toHaveLength(2)
+    expect(items.filter((item) => item.messageId === 404 || item.messageId === 405)).toHaveLength(2)
+    for (const id of [402, 403, 404, 405]) {
+      expect(items.find((item) => item.messageId === id)).toMatchObject({
+        rfc822MessageId: null, coalesced: false, copyCount: 1,
+      })
+    }
+  })
+
+  it('excludes both deletion forms and paginates in deterministic order', () => {
+    const all = listUnifiedInbox(store.db, { limit: 20 })
+    expect(all.map((item) => item.messageId)).toEqual([
+      102, 202, 302, 401, 402, 403, 404, 405, 502, 504,
+    ])
+    expect(all.find((item) => item.messageId === 502)).toMatchObject({ coalesced: false, copyCount: 1 })
+    expect(all.find((item) => item.messageId === 504)).toMatchObject({ coalesced: false, copyCount: 1 })
+    expect(listUnifiedInbox(store.db, { limit: 3, offset: 2 })).toEqual(all.slice(2, 5))
+    expect(() => listUnifiedInbox(store.db, { limit: 0 })).toThrow(/limit must be a safe integer/)
+    expect(() => listUnifiedInbox(store.db, { limit: 201 })).toThrow(/limit must be a safe integer/)
+    expect(() => listUnifiedInbox(store.db, { offset: -1 })).toThrow(/offset must be a safe integer/)
+    expect(() => listUnifiedInbox(store.db, { offset: 1_000_001 })).toThrow(/offset must be a safe integer/)
+  })
+})
+
 describe('msgvaultAdapter — review-finding edges', () => {
   let dbPath: string
   let store: { db: DatabaseSync }
@@ -302,7 +465,7 @@ describe('msgvaultAdapter — review-finding edges', () => {
     dbPath = join(mkdtempSync(join(tmpdir(), 'msgvault-edge-')), 'fixture.db')
     raw = new DatabaseSync(dbPath)
     raw.exec(SCHEMA)
-    raw.exec(`INSERT INTO sources (id, kind, email) VALUES (1, 'gmail', 'edge@example.com')`)
+    raw.exec(`INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'edge@example.com')`)
     raw.exec(`INSERT INTO participants (id, email_address, display_name) VALUES (1, 'x@example.com', 'X')`)
     raw.exec(
       `INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type, title)
