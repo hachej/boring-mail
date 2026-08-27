@@ -1,7 +1,7 @@
 // bm-zf6 — adapter tests run against a SYNTHETIC msgvault fixture (schema-faithful
 // subset, zlib raw MIME). No personal data is ever committed.
 // @vitest-environment node
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { deflateSync } from 'node:zlib'
@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
 import {
   attachmentAbsolutePath,
+  correlatableMessageId,
   getThreadMessages,
   hasMessageAtSource,
   listAttachments,
@@ -19,76 +20,7 @@ import {
   searchMessages,
 } from '../src/mail/store/msgvaultAdapter.js'
 
-const SCHEMA = `
-CREATE TABLE sources (id INTEGER PRIMARY KEY, kind TEXT, email TEXT);
-CREATE TABLE participants (
-  id INTEGER PRIMARY KEY,
-  email_address TEXT,
-  display_name TEXT,
-  domain TEXT
-);
-CREATE TABLE conversations (
-  id INTEGER PRIMARY KEY,
-  source_id INTEGER NOT NULL REFERENCES sources(id),
-  source_conversation_id TEXT,
-  conversation_type TEXT NOT NULL,
-  title TEXT,
-  participant_count INTEGER DEFAULT 0,
-  message_count INTEGER DEFAULT 0,
-  unread_count INTEGER DEFAULT 0,
-  last_message_at DATETIME,
-  last_message_preview TEXT,
-  UNIQUE(source_id, source_conversation_id)
-);
-CREATE TABLE messages (
-  id INTEGER PRIMARY KEY,
-  conversation_id INTEGER NOT NULL REFERENCES conversations(id),
-  source_id INTEGER NOT NULL REFERENCES sources(id),
-  source_message_id TEXT,
-  rfc822_message_id TEXT,
-  message_type TEXT NOT NULL DEFAULT 'email',
-  sent_at DATETIME,
-  internal_date DATETIME,
-  sender_id INTEGER REFERENCES participants(id),
-  subject TEXT,
-  snippet TEXT,
-  is_read BOOLEAN DEFAULT TRUE,
-  attachment_count INTEGER DEFAULT 0,
-  deleted_at DATETIME
-);
-CREATE TABLE labels (
-  id INTEGER PRIMARY KEY,
-  source_id INTEGER REFERENCES sources(id),
-  source_label_id TEXT,
-  name TEXT NOT NULL,
-  label_type TEXT,
-  system_role TEXT
-);
-CREATE TABLE message_labels (
-  message_id INTEGER NOT NULL REFERENCES messages(id),
-  label_id INTEGER NOT NULL REFERENCES labels(id),
-  PRIMARY KEY (message_id, label_id)
-);
-CREATE TABLE message_raw (
-  message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
-  raw_data BLOB NOT NULL,
-  raw_format TEXT NOT NULL,
-  compression TEXT DEFAULT 'zlib',
-  encryption_version INTEGER DEFAULT 0
-);
-CREATE TABLE attachments (
-  id INTEGER PRIMARY KEY,
-  message_id INTEGER NOT NULL REFERENCES messages(id),
-  filename TEXT,
-  mime_type TEXT,
-  size INTEGER,
-  content_hash TEXT,
-  storage_path TEXT NOT NULL
-);
-CREATE VIRTUAL TABLE messages_fts USING fts5(
-  message_id UNINDEXED, subject, body, from_addr
-);
-`
+const SCHEMA = readFileSync(new URL('./fixtures/msgvault-v0.19.sql', import.meta.url), 'utf8')
 
 function mimeMessage(opts: {
   from: string
@@ -120,7 +52,7 @@ describe('msgvaultAdapter', () => {
     db = new DatabaseSync(dbPath)
     db.exec(SCHEMA)
 
-    db.exec(`INSERT INTO sources (id, kind, email) VALUES (1, 'gmail', 'fixture@example.com')`)
+    db.exec(`INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'fixture@example.com')`)
     db.exec(
       `INSERT INTO participants (id, email_address, display_name, domain) VALUES
        (1, 'alice@example.com', 'Alice', 'example.com'),
@@ -131,14 +63,14 @@ describe('msgvaultAdapter', () => {
       `INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type,
         title, message_count, unread_count, last_message_at, last_message_preview)
        VALUES (1, 1, 'thr_1', 'email_thread', 'Quarterly report',
-         2, 1, '2026-08-20 12:00:00', 'see attached numbers')`,
+         2, 1, '2026-08-20 12:00:00+00:00', 'see attached numbers')`,
     )
     db.exec(
       `INSERT INTO messages (id, conversation_id, source_id, source_message_id, rfc822_message_id,
-        sent_at, sender_id, subject, snippet, is_read)
+        message_type, sent_at, sender_id, subject, snippet, is_read)
        VALUES
-        (1, 1, 1, 'gmsg_1', '<q1@example.com>', '2026-08-19 09:00:00', 2, 'Quarterly report', 'here are the numbers', 1),
-        (2, 1, 1, 'gmsg_2', '<q2@example.com>', '2026-08-20 12:00:00', 1, 'Re: Quarterly report', 'see attached numbers', 0)`,
+        (1, 1, 1, 'gmsg_1', '<q1@example.com>', 'email', '2026-08-19 09:00:00+00:00', 2, 'Quarterly report', 'here are the numbers', 1),
+        (2, 1, 1, 'gmsg_2', '<q2@example.com>', 'email', '2026-08-20 12:00:00+00:00', 1, 'Re: Quarterly report', 'see attached numbers', 0)`,
     )
     const raw = deflateSync(
       mimeMessage({
@@ -172,8 +104,8 @@ describe('msgvaultAdapter', () => {
        VALUES (2, 1, 'thr_2', 'email_thread', 'Deleted thing', 1)`,
     )
     db.exec(
-      `INSERT INTO messages (id, conversation_id, source_id, source_message_id, rfc822_message_id, subject, deleted_at)
-       VALUES (3, 2, 1, 'gmsg_3', '<d@example.com>', 'Deleted thing', CURRENT_TIMESTAMP)`,
+      `INSERT INTO messages (id, conversation_id, source_id, source_message_id, rfc822_message_id, message_type, subject, deleted_at)
+       VALUES (3, 2, 1, 'gmsg_3', '<d@example.com>', 'email', 'Deleted thing', CURRENT_TIMESTAMP)`,
     )
 
     store = { db }
@@ -190,9 +122,9 @@ describe('msgvaultAdapter', () => {
       SCHEMA.replace('id INTEGER PRIMARY KEY,\n  conversation_id', 'id TEXT,\n  conversation_id')
         .replace(/ REFERENCES messages\(id\)( ON DELETE CASCADE)?/g, ''),
     )
-    bad.exec(`INSERT INTO sources(id,kind,email) VALUES(1,'gmail','fixture@example.com');
+    bad.exec(`INSERT INTO sources(id,source_type,identifier) VALUES(1,'gmail','fixture@example.com');
       INSERT INTO conversations(id,source_id,conversation_type) VALUES(1,1,'email_thread');
-      INSERT INTO messages(id,conversation_id,source_id) VALUES('duplicate',1,1),('duplicate',1,1)`)
+      INSERT INTO messages(id,conversation_id,source_id,message_type) VALUES('duplicate',1,1,'email'),('duplicate',1,1,'email')`)
     bad.close()
     expect(() => openMsgvaultStore(path)).toThrow(/messages\.id must have INTEGER affinity and be the single primary key/)
   })
@@ -237,6 +169,92 @@ describe('msgvaultAdapter', () => {
     )
     fakeDb.close()
     expect(() => openMsgvaultStore(fakeFts)).toThrow(/not an FTS5 virtual table/)
+
+    const scopedIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-index-drift-')), 'drift.db')
+    const scopedIndex = new DatabaseSync(scopedIndexPath)
+    scopedIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(source_id,rfc822_message_id);',
+    ))
+    scopedIndex.close()
+    expect(() => openMsgvaultStore(scopedIndexPath)).toThrow(
+      /non-unique, non-partial index led by rfc822_message_id/,
+    )
+
+    const uniqueIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-unique-index-')), 'drift.db')
+    const uniqueIndex = new DatabaseSync(uniqueIndexPath)
+    uniqueIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+      'CREATE UNIQUE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+    ))
+    uniqueIndex.close()
+    expect(() => openMsgvaultStore(uniqueIndexPath)).toThrow(/non-unique, non-partial index/)
+
+    const equivalentIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-equivalent-index-')), 'ok.db')
+    const equivalentIndex = new DatabaseSync(equivalentIndexPath)
+    equivalentIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+      'CREATE INDEX renamed_global_correlation ON messages(rfc822_message_id,source_id);',
+    ))
+    equivalentIndex.close()
+    const equivalentStore = openMsgvaultStore(equivalentIndexPath)
+    equivalentStore.db.close()
+
+    const missingLiveIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-live-index-')), 'drift.db')
+    const missingLiveIndex = new DatabaseSync(missingLiveIndexPath)
+    missingLiveIndex.exec(SCHEMA.replace(
+      /CREATE INDEX idx_messages_live_sent_at[\s\S]*?deleted_from_source_at IS NULL;/,
+      '',
+    ))
+    missingLiveIndex.close()
+    expect(() => openMsgvaultStore(missingLiveIndexPath)).toThrowError(
+      expect.objectContaining({ code: 'unsupported_schema', message: expect.stringMatching(/REMEDIATION:.*live recency index/) }),
+    )
+
+    const scopedLiveIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-scoped-live-index-')), 'drift.db')
+    const scopedLiveIndex = new DatabaseSync(scopedLiveIndexPath)
+    scopedLiveIndex.exec(SCHEMA.replace(
+      'WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;',
+      'WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL AND source_id=1;',
+    ))
+    scopedLiveIndex.close()
+    expect(() => openMsgvaultStore(scopedLiveIndexPath)).toThrow(/live recency index/)
+
+    for (const table of ['sources', 'conversations'] as const) {
+      const duplicateKeyPath = join(mkdtempSync(join(tmpdir(), `msgvault-${table}-identity-`)), 'drift.db')
+      const duplicateKey = new DatabaseSync(duplicateKeyPath)
+      const tableStart = `CREATE TABLE ${table} (\n  id INTEGER PRIMARY KEY,`
+      duplicateKey.exec(SCHEMA.replace(tableStart, `CREATE TABLE ${table} (\n  id INTEGER,`))
+      duplicateKey.close()
+      expect(() => openMsgvaultStore(duplicateKeyPath)).toThrow(
+        new RegExp(`${table}\\.id must have INTEGER affinity and be the single primary key`),
+      )
+    }
+
+    const missingSourceIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-source-index-')), 'drift.db')
+    const missingSourceIndex = new DatabaseSync(missingSourceIndexPath)
+    missingSourceIndex.exec(SCHEMA.replace('CREATE INDEX idx_messages_source ON messages(source_id);', ''))
+    missingSourceIndex.close()
+    expect(() => openMsgvaultStore(missingSourceIndexPath)).toThrow(/non-partial index led by source_id/)
+
+    const missingRecipientIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-index-')), 'drift.db')
+    const missingRecipientIndex = new DatabaseSync(missingRecipientIndexPath)
+    missingRecipientIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_message_recipients_message ON message_recipients(message_id);',
+      '',
+    ))
+    missingRecipientIndex.close()
+    expect(() => openMsgvaultStore(missingRecipientIndexPath)).toThrow(
+      /message_recipients requires a non-partial index led by message_id/,
+    )
+
+    const missingRecipientsPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-drift-')), 'drift.db')
+    const missingRecipients = new DatabaseSync(missingRecipientsPath)
+    missingRecipients.exec(SCHEMA.replace('recipient_type TEXT NOT NULL,', 'recipient_kind TEXT NOT NULL,'))
+    missingRecipients.close()
+    expect(() => openMsgvaultStore(missingRecipientsPath)).toThrow(
+      /message_recipients missing column\(s\): recipient_type/,
+    )
     expect(() => openMsgvaultStore(join(tmpdir(), 'does-not-exist.db'))).toThrow(/REMEDIATION/)
   })
 
@@ -251,6 +269,16 @@ describe('msgvaultAdapter', () => {
     expect(listThreads(store.db, { unreadOnly: true })).toHaveLength(1)
     expect(listThreads(store.db, { label: 'SENT' })).toHaveLength(0)
     expect(listThreads(store.db, { label: 'INBOX' })).toHaveLength(1)
+  })
+
+  it('uses one conservative Message-ID contract for correlation and replies', () => {
+    expect(correlatableMessageId('<local@example.com>')).toBe('<local@example.com>')
+    for (const invalid of [
+      null, '', 'bare@example.com', '<@example.com>', '<local@>', '<a@b@c>',
+      '<<a@b>>', '<a b@c>', '<a\tb@c>', '<a\u0001b@c>', '<a,b@c>',
+      '<a..b@c>', '<a.@c>', '<a@-c>', '<a@c->', '<a@c..d>', '<é@x>', '<漢@x>', '<😀@x>',
+      `<${'x'.repeat(997)}@x>`,
+    ]) expect(correlatableMessageId(invalid)).toBeNull()
   })
 
   it('resolves immutable message row ownership and verifies exact pairs', () => {
@@ -302,15 +330,15 @@ describe('msgvaultAdapter — review-finding edges', () => {
     dbPath = join(mkdtempSync(join(tmpdir(), 'msgvault-edge-')), 'fixture.db')
     raw = new DatabaseSync(dbPath)
     raw.exec(SCHEMA)
-    raw.exec(`INSERT INTO sources (id, kind, email) VALUES (1, 'gmail', 'edge@example.com')`)
+    raw.exec(`INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'edge@example.com')`)
     raw.exec(`INSERT INTO participants (id, email_address, display_name) VALUES (1, 'x@example.com', 'X')`)
     raw.exec(
       `INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type, title)
        VALUES (1, 1, 't1', 'email_thread', 'Edge')`,
     )
     raw.exec(
-      `INSERT INTO messages (id, conversation_id, source_id, rfc822_message_id, subject, snippet, deleted_at)
-       VALUES (10, 1, 1, '<e1@example.com>', 'Deleted edge', 'gone', CURRENT_TIMESTAMP)`,
+      `INSERT INTO messages (id, conversation_id, source_id, rfc822_message_id, message_type, subject, snippet, deleted_at)
+       VALUES (10, 1, 1, '<e1@example.com>', 'email', 'Deleted edge', 'gone', CURRENT_TIMESTAMP)`,
     )
     raw
       .prepare(

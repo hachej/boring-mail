@@ -8,6 +8,7 @@ import { assertValidSendContent, draftContentDigest, normalizeDraftFields, resol
 import {
   ProductStoreError,
   type AccountInput,
+  type ConnectedInboxSource,
   type DraftInput,
   type DraftRecord,
   type ProductStoreDependencies,
@@ -36,6 +37,38 @@ export class ProductStore {
   }
   close(): void {
     this.#c.db.close()
+  }
+  connectedInboxSources(): ConnectedInboxSource[] {
+    const rows = this.#c.db.prepare(
+      `SELECT provider_source_id,primary_address,send_as_json
+         FROM mail_accounts WHERE connected=1 ORDER BY provider_source_id`,
+    ).all() as Array<Record<string, unknown>>
+    return rows.map((row) => {
+      if (!Number.isSafeInteger(row.provider_source_id) || Number(row.provider_source_id) <= 0) {
+        throw new ProductStoreError('corrupt_data', 'connected account provider source must be a positive integer')
+      }
+      const primaryAddress = row.primary_address
+      if (typeof primaryAddress !== 'string' || !primaryAddress.trim() ||
+          primaryAddress !== primaryAddress.trim().toLowerCase()) {
+        throw new ProductStoreError('corrupt_data', 'connected account primary address must be normalized text')
+      }
+      if (typeof row.send_as_json !== 'string') {
+        throw new ProductStoreError('corrupt_data', 'connected account send-as identities must be JSON text')
+      }
+      let parsed: unknown
+      try { parsed = JSON.parse(row.send_as_json) }
+      catch { throw new ProductStoreError('corrupt_data', 'connected account send-as identities contain malformed JSON') }
+      if (!Array.isArray(parsed) || parsed.length === 0 ||
+          !parsed.every((identity) => typeof identity === 'string' && identity.trim() &&
+            identity === identity.trim().toLowerCase())) {
+        throw new ProductStoreError('corrupt_data', 'connected account send-as identities are invalid')
+      }
+      const identities = [...new Set(parsed as string[])]
+      if (identities.length !== parsed.length || !identities.includes(primaryAddress)) {
+        throw new ProductStoreError('corrupt_data', 'connected account identities violate primary/send-as invariants')
+      }
+      return { sourceId: row.provider_source_id as number, identities }
+    })
   }
   upsertAccount(input: AccountInput): void {
     const id = input.accountId.trim(),

@@ -12,6 +12,8 @@ import type {
   OutboxRecord,
   RejectedOutbox,
   SentOutbox,
+  UnifiedInboxOptions,
+  UnifiedInboxPage,
   UnknownOutbox,
 } from './types.js'
 
@@ -24,6 +26,7 @@ export interface MailStoreMethods {
   upsertAccount: (input: AccountInput) => void
   saveDraft: (input: DraftInput, requestedId?: string) => DraftRecord
   getDraft: (id: string) => DraftRecord | null
+  listUnifiedInbox: (options?: UnifiedInboxOptions) => UnifiedInboxPage
   getOutbox: (id: string) => OutboxRecord | null
   listAttention: (openOnly?: boolean) => AttentionItem[]
   enqueue: (draftId: string, operationKey: string) => OutboxRecord

@@ -37,5 +37,8 @@ export type {
   SendSnapshot,
   SentOutbox,
   StaleOutbox,
+  UnifiedInboxItem,
+  UnifiedInboxOptions,
+  UnifiedInboxPage,
   UnknownOutbox,
 } from './product/types.js'

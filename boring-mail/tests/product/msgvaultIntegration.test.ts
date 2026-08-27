@@ -1,21 +1,48 @@
 // @vitest-environment node
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
 import { openMsgvaultStore, resolveReplyTarget } from '../../src/mail/store/msgvaultAdapter.js'
 import { openProductStore } from '../../src/mail/store/internalProductStore.js'
-const schema = `CREATE TABLE conversations(id INTEGER,conversation_type TEXT,title TEXT,message_count INTEGER,unread_count INTEGER,last_message_at TEXT,last_message_preview TEXT);CREATE TABLE participants(id INTEGER,email_address TEXT,display_name TEXT);CREATE TABLE messages(id INTEGER PRIMARY KEY,conversation_id INTEGER,source_id INTEGER NOT NULL,rfc822_message_id TEXT,subject TEXT,snippet TEXT,sent_at TEXT,is_read INTEGER,attachment_count INTEGER,sender_id INTEGER,deleted_at TEXT);CREATE TABLE message_labels(message_id INTEGER,label_id INTEGER);CREATE TABLE labels(id INTEGER,name TEXT);CREATE TABLE message_raw(message_id INTEGER,raw_data BLOB,raw_format TEXT,compression TEXT);CREATE TABLE attachments(id INTEGER,message_id INTEGER,filename TEXT,mime_type TEXT,size INTEGER,content_hash TEXT,storage_path TEXT);CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED,subject);`
+const schema = readFileSync(new URL('../fixtures/msgvault-v0.19.sql', import.meta.url), 'utf8')
 describe('trusted msgvault integration', () => {
+  it('fails closed when connected-account identity storage is semantically corrupt', () => {
+    const root = mkdtempSync(join(tmpdir(), 'account-corrupt-')),
+      path = join(root, 'product.db'),
+      product = openProductStore(path, { now: () => 1, resolveReplyTarget: () => null })
+    try {
+      product.upsertAccount({
+        accountId: 'a', providerSourceId: 1, primaryAddress: 'a@x', sendAs: ['a@x'],
+      })
+      const writer = new DatabaseSync(path)
+      writer.prepare(`UPDATE mail_accounts SET send_as_json='[1]' WHERE account_id='a'`).run()
+      writer.close()
+      expect(() => product.connectedInboxSources()).toThrow(/send-as identities are invalid/)
+    } finally {
+      product.close()
+    }
+  })
+
   it('derives account from selected immutable row even when RFC822 ID is duplicated', () => {
     const root = mkdtempSync(join(tmpdir(), 'mv-')),
       path = join(root, 'mv.db'),
       raw = new DatabaseSync(path)
+    // This fixture deliberately includes one incoherent ownership row to prove
+    // the adapter rejects it rather than relying on provider FK enforcement.
+    raw.exec('PRAGMA foreign_keys=OFF')
     raw.exec(schema)
-    raw.exec(
-      `INSERT INTO messages(id,source_id,rfc822_message_id)VALUES(1,42,'<same@x>'),(2,43,'<same@x>'),(3,42,'<gone@x>'),(4,42,''),(5,'bad','<bad@x>');UPDATE messages SET deleted_at='x' WHERE id=3`,
-    )
+    raw.exec(`
+      INSERT INTO sources(id,source_type,identifier) VALUES(42,'gmail','a@x'),(43,'gmail','b@x');
+      INSERT INTO conversations(id,source_id,conversation_type) VALUES
+        (420,42,'email_thread'),(430,43,'email_thread'),(431,43,'calendar');
+      INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type) VALUES
+        (1,420,42,'<same@x>','email'),(2,430,43,'<same@x>','email'),
+        (3,420,42,'<gone@x>','email'),(4,420,42,'','email'),
+        (5,999,42,'<incoherent@x>','email'),(6,431,43,'<calendar@x>','calendar');
+      UPDATE messages SET deleted_at='x' WHERE id=3;
+    `)
     raw.close()
     const mv = openMsgvaultStore(path),
       product = openProductStore(join(root, 'product.db'), {
@@ -23,8 +50,19 @@ describe('trusted msgvault integration', () => {
         resolveReplyTarget: (id) => resolveReplyTarget(mv.db, id),
       })
     try {
-      product.upsertAccount({ accountId: 'a', providerSourceId: 42, primaryAddress: 'a@x', sendAs: ['a@x'] })
-      product.upsertAccount({ accountId: 'b', providerSourceId: 43, primaryAddress: 'b@x', sendAs: ['b@x'] })
+      product.upsertAccount({
+        accountId: 'a', providerSourceId: 42, primaryAddress: 'a@x', sendAs: ['alias@x'],
+      })
+      product.upsertAccount({
+        accountId: 'b', providerSourceId: 43, primaryAddress: 'b@x', sendAs: ['b@x'],
+      })
+      product.upsertAccount({
+        accountId: 'c', providerSourceId: 44, primaryAddress: 'c@x', sendAs: ['c@x'], connected: false,
+      })
+      expect(product.connectedInboxSources()).toEqual([
+        { sourceId: 42, identities: ['a@x', 'alias@x'] },
+        { sourceId: 43, identities: ['b@x'] },
+      ])
       const base = {
         kind: 'reply' as const,
         path: 'a.mail.md',
@@ -39,8 +77,10 @@ describe('trusted msgvault integration', () => {
         product.saveDraft({ ...base, path: 'b.mail.md', replyToMessageId: 2, sendAsAddress: 'b@x' }),
       ).toMatchObject({ accountId: 'b' })
       expect(() => product.saveDraft({ ...base, path: 'gone.mail.md', replyToMessageId: 3 })).toThrow(/absent/)
-      expect(() => resolveReplyTarget(mv.db, 4)).toThrow(/invalid RFC822\/source/)
-      expect(() => resolveReplyTarget(mv.db, 5)).toThrow(/invalid RFC822\/source/)
+      expect(resolveReplyTarget(mv.db, 4)).toBeNull()
+      expect(resolveReplyTarget(mv.db, 5)).toBeNull()
+      expect(resolveReplyTarget(mv.db, 6)).toBeNull()
+      expect(() => product.saveDraft({ ...base, path: 'calendar.mail.md', replyToMessageId: 6 })).toThrow(/absent/)
       expect(() => resolveReplyTarget(mv.db, 0)).toThrow(/positive safe integer/)
     } finally {
       product.close()

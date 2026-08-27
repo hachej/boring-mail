@@ -24,6 +24,7 @@ if (workerData?.silentStartup) {
     const values = {
       upsertAccount: undefined,
       getDraft: null,
+      listUnifiedInbox: { items: [], nextCursor: null },
       listAttention: [],
       claimNext: null,
       close: undefined,
