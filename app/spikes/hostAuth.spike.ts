@@ -329,6 +329,9 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
       assertResolvedViteTopology(config.server, expected)
     },
     configureServer(server) {
+      // configResolved hooks may run concurrently. Reassert after Vite has
+      // created the server so a later resolver cannot win a mutation race.
+      assertResolvedViteTopology(server.config.server, expected)
       server.httpServer?.once('close', clearSecrets)
       server.middlewares.use((request, response, next) => {
         if (disposed || !authorize(request, expectedToken, trustedProof)) {
@@ -341,6 +344,10 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
       // Install after every plugin has registered its upgrade listener, then
       // delegate to those listeners only after the Basic credential is consumed.
       return () => {
+        // A later configureServer hook can still mutate proxy/config fields.
+        // Reassert after all ordinary configure hooks, immediately before the
+        // upgrade gate delegates to Vite's already-created websocket listener.
+        assertResolvedViteTopology(server.config.server, expected)
         installUpgradeGate(server, expectedToken, trustedProof, () => disposed)
       }
     },

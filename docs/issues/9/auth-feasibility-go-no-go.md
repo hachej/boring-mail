@@ -20,7 +20,7 @@ The synthetic tests start an actual loopback Vite server and a separate loopback
 4. requires one whitespace-free canonical base64url token decoding to at least 32 bytes;
 5. compares decoded credentials with `timingSafeEqual`;
 6. consumes `Authorization`/`Proxy-Authorization`, removes spoofable Boring Mail proof/principal headers, and injects a fresh trusted proof only after successful authentication;
-7. supplies one authoritative Vite server object plus a detached immutable topology snapshot and rejects resolved host/port/origin/CORS/canonical-`server.ws`/proxy drift, including a separate HMR server and Vite's pre-auth CORS responder;
+7. supplies one authoritative Vite server object plus a detached immutable topology snapshot and reasserts resolved host/port/origin/CORS/canonical-`server.ws`/proxy values at resolution, server configuration entry, and the post-configure gate, rejecting later-plugin drift, a separate HMR server, and Vite's pre-auth CORS responder;
 8. rejects unauthenticated `OPTIONS`, assets, and proxy requests with 401 before they reach Vite/backend; and
 9. captures Vite's registered upgrade listeners and delegates to them only after authentication, while early disposal remains fail-closed.
 
@@ -30,9 +30,9 @@ The Playwright scenario independently proves browser HTTP credentials can load t
 
 | Command | Result | Redacted result |
 |---|---|---|
-| `pnpm --filter @hachej/boring-mail-playground test` | PASS | 1 file, 13 tests; actual Vite OPTIONS/asset/proxy/raw-HMR matrix, disposal denial, descriptor/special-file and resolved-topology refusals |
+| `pnpm --filter @hachej/boring-mail-playground test` | PASS | 1 file, 14 tests; actual Vite OPTIONS/asset/proxy/raw-HMR matrix, disposal denial, descriptor/special-file, resolved-topology, and late-plugin-mutation refusals |
 | `pnpm --filter @hachej/boring-mail-playground test:e2e` | PASS | 2 Playwright browser scenarios; authenticated page/proxy/HMR and unauthenticated rejection |
-| `pnpm test` | PASS | plugin 14 files / 120 tests; app 1 file / 13 tests |
+| `pnpm test` | PASS | plugin 14 files / 120 tests; app 1 file / 14 tests |
 | `pnpm typecheck` | PASS | plugin and app TypeScript projects |
 | `pnpm check-env` | PASS | supported Node/SQLite/flock and pinned host checks |
 | `pnpm build` | PASS | emitted worker smoke and production playground build; existing chunk-size warning only |
@@ -42,7 +42,7 @@ The Playwright scenario independently proves browser HTTP credentials can load t
 
 ## Review disposition
 
-The first independent Sol xhigh review found six material gaps: early-disposal fail-open, caller/actual-Vite config drift, blocking special-file open/special bits, pre-auth Vite CORS, weak Tailscale `Online` typing, and an optional race in the required msgvault wrapper plus unrelated lockfile peer churn. The next final pass found a shared-object/canonical-`server.ws` drift bypass and a canonical proof-script naming mismatch. All were fixed and covered by negative tests or an exact script alias before the final gates. No finding was waived.
+The first independent Sol xhigh review found six material gaps: early-disposal fail-open, caller/actual-Vite config drift, blocking special-file open/special bits, pre-auth Vite CORS, weak Tailscale `Online` typing, and an optional race in the required msgvault wrapper plus unrelated lockfile peer churn. The next pass found a shared-object/canonical-`server.ws` drift bypass and a canonical proof-script naming mismatch. A third pass found that concurrent/later plugin hooks could mutate topology after the first assertion. All were fixed and covered by negative tests or an exact script alias before the final gates. No finding was waived.
 
 ## Artifact policy
 

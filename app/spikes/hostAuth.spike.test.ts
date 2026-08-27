@@ -213,6 +213,44 @@ describe('standalone topology validation', () => {
       spike.dispose()
     }
   })
+
+  it('reasserts topology after later configResolved and configureServer mutators', async () => {
+    const root = temporaryRoot()
+    writeFileSync(join(root, 'index.html'), '<title>synthetic</title>', 'utf8')
+    const { path } = makeTokenFile(root)
+
+    const wsSpike = createHostAuthSpike(topology(path))
+    await expect(createViteServer({
+      configFile: false,
+      root,
+      logLevel: 'silent',
+      server: wsSpike.viteServer,
+      plugins: [wsSpike.plugin, {
+        name: 'synthetic-late-ws-mutator',
+        configResolved(config) {
+          config.server.ws = { host: '0.0.0.0', port: 24_678, clientPort: 24_678 }
+        },
+      }],
+    })).rejects.toThrow(/resolved Vite websocket topology/)
+    wsSpike.dispose()
+
+    const proxySpike = createHostAuthSpike(topology(path))
+    await expect(createViteServer({
+      configFile: false,
+      root,
+      logLevel: 'silent',
+      server: proxySpike.viteServer,
+      plugins: [proxySpike.plugin, {
+        name: 'synthetic-late-proxy-mutator',
+        configureServer(server) {
+          if (server.config.server.proxy) {
+            server.config.server.proxy['/api/v1'] = 'http://127.0.0.1:5291'
+          }
+        },
+      }],
+    })).rejects.toThrow(/resolved Vite proxy target/)
+    proxySpike.dispose()
+  })
 })
 
 describe('real Vite server auth spike', () => {
