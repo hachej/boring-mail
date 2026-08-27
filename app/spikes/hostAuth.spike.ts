@@ -161,8 +161,10 @@ function validateTopology(options: HostAuthSpikeOptions): {
   if (origin.protocol === 'http:') {
     if (!options.trustTailnetHttp) fail('tailnet HTTP requires explicit trust')
     validateTailscaleSelf((options.readTailscaleStatus ?? readBoundedTailscaleStatus)(), options.bindHost)
-  } else if (origin.protocol !== 'https:') {
-    fail('allowed origin must use HTTP over trusted tailnet or HTTPS')
+  } else if (origin.protocol === 'https:') {
+    fail('HTTPS is not modeled by this tailnet-only feasibility spike')
+  } else {
+    fail('allowed origin must use HTTP over trusted tailnet')
   }
 
   const proxyPaths = Object.freeze(['/api/boring-mail', '/api/v1'] as const)
@@ -205,6 +207,19 @@ function assertResolvedViteTopology(server: ServerOptions, expected: Readonly<Ex
     const actualEntry = proxy[path]
     if (typeof actualEntry !== 'string' || actualEntry !== expected.backendOrigin) {
       fail(`resolved Vite proxy target differs for ${path}`)
+    }
+  }
+}
+
+function assertFinalizerIsLastConfigureHook(plugins: readonly Plugin[], finalizer: Plugin): void {
+  const self = plugins.indexOf(finalizer)
+  if (self < 0) fail('host-auth finalizer is missing from resolved plugins')
+  for (const [index, plugin] of plugins.entries()) {
+    if (plugin === finalizer || plugin.configureServer === undefined) continue
+    const hook = plugin.configureServer
+    const order = typeof hook === 'object' && hook !== null ? hook.order : undefined
+    if (order === 'post' || (order !== 'pre' && index > self)) {
+      fail('host-auth finalizer must be the last resolved configureServer hook')
     }
   }
 }
@@ -341,10 +356,7 @@ export function createHostAuthSpike(options: HostAuthSpikeOptions): ValidatedHos
     enforce: 'post',
     configResolved(config) {
       assertResolvedViteTopology(config.server, expected)
-      const self = config.plugins.indexOf(finalizerPlugin)
-      if (self < 0 || config.plugins.slice(self + 1).some((plugin) => typeof plugin.configureServer === 'function')) {
-        fail('host-auth finalizer must be the last plugin with a configureServer hook')
-      }
+      assertFinalizerIsLastConfigureHook(config.plugins, finalizerPlugin)
     },
     configureServer(server) {
       // configResolved hooks may run concurrently. Reassert after Vite has

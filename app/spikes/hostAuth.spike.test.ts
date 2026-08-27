@@ -163,6 +163,7 @@ describe('standalone topology validation', () => {
     ['wildcard bind', { bindHost: '0.0.0.0', hmrHost: '0.0.0.0', allowedOrigin: 'http://0.0.0.0:5190' }],
     ['mismatched HMR host', { hmrHost: '127.0.0.2' }],
     ['untrusted HTTP', { trustTailnetHttp: false }],
+    ['unmodeled HTTPS', { allowedOrigin: 'https://127.0.0.1:5190', trustTailnetHttp: false }],
     ['non-loopback backend', { backendOrigin: 'http://100.64.0.2:5290' }],
     ['origin path', { allowedOrigin: 'http://127.0.0.1:5190/path' }],
     ['origin host mismatch', { allowedOrigin: 'http://127.0.0.2:5190' }],
@@ -270,6 +271,26 @@ describe('standalone topology validation', () => {
       }],
     })).rejects.toThrow(/resolved Vite proxy target/)
     returnedPostSpike.dispose()
+
+    const objectHookSpike = createHostAuthSpike(topology(path))
+    await expect(createViteServer({
+      configFile: false,
+      root,
+      logLevel: 'silent',
+      server: objectHookSpike.viteServer,
+      plugins: [...objectHookSpike.plugins, {
+        name: 'synthetic-object-post-hook',
+        configureServer: {
+          order: 'post',
+          handler(server) {
+            return () => {
+              server.httpServer?.prependListener('upgrade', () => undefined)
+            }
+          },
+        },
+      }],
+    })).rejects.toThrow(/finalizer must be the last resolved configureServer hook/)
+    objectHookSpike.dispose()
   })
 })
 
