@@ -15,6 +15,9 @@ describe('@hachej/boring-workspace 0.1.103 host contract tripwire', () => {
     expect(packageJson.exports).toHaveProperty('./server')
     expect(packageJson.exports).toHaveProperty('./plugin')
 
+    const appPackageJson = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { scripts?: Record<string, string> }
+    expect(appPackageJson.scripts?.dev).toBe('vite')
+
     const serverTypes = [
       readFileSync(`${packageRoot}/dist/server.d.ts`, 'utf8'),
       readFileSync(`${packageRoot}/dist/runtimeEnv-B1AfbgTN.d.ts`, 'utf8'),
@@ -45,6 +48,17 @@ describe('@hachej/boring-workspace 0.1.103 host contract tripwire', () => {
     expect(serverRuntime).toContain('?? "default"')
     expect(serverRuntime).toContain('options.allowedOrigins.includes(origin)')
     expect(serverRuntime).toContain('firstHeader(input.request?.headers, "x-csrf-token")')
+
+    const askUserPackageJsonPath = require.resolve('@hachej/boring-ask-user/package.json')
+    const askUserPackageRoot = askUserPackageJsonPath.replace(/\/package\.json$/, '')
+    const askUserPackageJson = JSON.parse(readFileSync(askUserPackageJsonPath, 'utf8')) as { version?: string }
+    expect(askUserPackageJson.version).toBe('0.1.103')
+    const askUserShared = readFileSync(`${askUserPackageRoot}/dist/shared/index.js`, 'utf8')
+    expect(askUserShared).toContain('answer: "ask-user:answer"')
+    expect(askUserShared).toContain('cancel: "ask-user:cancel"')
+    expect(askUserShared).toContain('pending: "ask-user:pending"')
+    expect(askUserShared).toContain('request: "ask-user:request"')
+    expect(askUserShared).toContain('transcriptRead: "ask-user:transcript.read"')
 
     const pluginTypes = readFileSync(`${packageRoot}/dist/plugin.d.ts`, 'utf8')
     for (const providerProp of [

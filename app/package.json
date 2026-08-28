@@ -6,7 +6,7 @@
   "license": "MIT",
   "description": "Standalone playground app for the Boring Mail workspace plugin.",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
+    "dev": "vite",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run -c vitest.config.ts",

@@ -1,7 +1,7 @@
 import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import { AGENT_API_PORT, VITE_PORT, startBoringMailPlaygroundServer } from './src/server/dev'
+import { AGENT_API_PORT, PLAYGROUND_WORKSPACE_ROOT, VITE_PORT, startBoringMailPlaygroundServer } from './src/server/dev'
 import { createStandaloneHostAuth, resolveStandaloneDeploymentConfig } from './src/server/standaloneHostAuth'
 
 const fsAllow = [
@@ -22,6 +22,7 @@ export default defineConfig(({ command }) => {
   const deployment = resolveStandaloneDeploymentConfig({
     backendPort: AGENT_API_PORT,
     defaultVitePort: VITE_PORT,
+    defaultWorkspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
   })
   const hostAuth = createStandaloneHostAuth(deployment)
 

@@ -44,9 +44,9 @@ let boot: Promise<void> | null = null
 export async function startBoringMailPlaygroundServer(options: StartBoringMailPlaygroundServerOptions): Promise<void> {
   if (boot) return boot
   const attempt = (async () => {
-    seedPlaygroundWorkspace()
+    seedPlaygroundWorkspace(options.deployment.workspaceRoot)
     const localRuntimeMode = process.env.BORING_AGENT_MODE?.trim() === 'direct' ? 'direct' : 'local'
-    console.log(`[boring-mail] playground workspace root: ${PLAYGROUND_WORKSPACE_ROOT}`)
+    console.log(`[boring-mail] playground workspace root: ${options.deployment.workspaceRoot}`)
     console.log(`[boring-mail] standalone deployment mode: ${options.deployment.mode}`)
     console.log(`[boring-mail] agent runtime mode: ${localRuntimeMode}`)
     console.log('[boring-mail] LLM/model provider config: default Pi host settings')
@@ -54,13 +54,13 @@ export async function startBoringMailPlaygroundServer(options: StartBoringMailPl
     let app: Awaited<ReturnType<typeof createWorkspaceAgentServer>> | null = null
     try {
       app = await createWorkspaceAgentServer({
-        workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
+        workspaceRoot: options.deployment.workspaceRoot,
         appRoot: APP_ROOT,
         mode: localRuntimeMode,
         logger: true,
         externalPlugins: false,
         installPluginAuthoring: false,
-        plugins: [createBoringMailServerPlugin({ workspaceRoot: PLAYGROUND_WORKSPACE_ROOT })],
+        plugins: [createBoringMailServerPlugin({ workspaceRoot: options.deployment.workspaceRoot, sync: options.deployment.sync })],
         defaultPluginPackages: ['@hachej/boring-ask-user'],
         workspaceBridge: { browserAuthPolicy: options.browserAuthPolicy },
       })
@@ -68,7 +68,7 @@ export async function startBoringMailPlaygroundServer(options: StartBoringMailPl
       app.get('/api/v1/workspace/meta', async () => ({
         projectName: 'Boring Mail',
         workspaceId: options.deployment.workspaceId,
-        workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
+        workspaceRoot: options.deployment.workspaceRoot,
       }))
 
       // 0.1.103: session routes moved from /api/v1/agent/pi-chat/sessions to

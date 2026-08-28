@@ -2,7 +2,8 @@ import { execFileSync } from 'node:child_process'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs'
 import { isIP } from 'node:net'
-import { basename, dirname, join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { TextDecoder } from 'node:util'
@@ -14,16 +15,20 @@ const MAX_TAILSCALE_STATUS_BYTES = 64 * 1024
 const AUTH_USERNAME = 'boring-mail'
 const OWNER_WORKSPACE_ID = 'default'
 const MAIL_READ_CAPABILITY = 'boring-mail:inbox:read'
+const ASK_USER_BROWSER_CAPABILITIES = Object.freeze(['ask-user:answer', 'ask-user:cancel', 'ask-user:pending'] as const)
+const STANDALONE_BROWSER_CAPABILITIES = Object.freeze([MAIL_READ_CAPABILITY, ...ASK_USER_BROWSER_CAPABILITIES] as const)
 const PROOF_HEADER = 'x-boring-mail-proxy-proof'
 const PRINCIPAL_HEADER = 'x-boring-mail-proxy-principal'
 const BASE64URL = /^[A-Za-z0-9_-]+$/
 const BASIC_BASE64 = /^[A-Za-z0-9+/]+={0,2}$/
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '[::1]'])
+const UNSUPPORTED_BACKEND_HOST_ENV = 'BORING_MAIL_BACKEND_HOST'
 const LIVE_PATH_ENV = ['BORING_MAIL_LIVE_DATA_DIR', 'BORING_MAIL_MSGVAULT_PATH'] as const
 const FIXTURE_PATH_ENV = ['BORING_MAIL_FIXTURE_ROOT'] as const
+const FIXTURE_FORBIDDEN_MAIL_ARCHIVE_ENV = ['MSGVAULT_HOME', 'MSGVAULT_DB_PATH', ...LIVE_PATH_ENV] as const
 const utf8 = new TextDecoder('utf-8', { fatal: true })
 
-export { AUTH_USERNAME as BORING_MAIL_BASIC_USERNAME, MAIL_READ_CAPABILITY as BORING_MAIL_READ_CAPABILITY, OWNER_WORKSPACE_ID as BORING_MAIL_WORKSPACE_ID, PRINCIPAL_HEADER as BORING_MAIL_PROXY_PRINCIPAL_HEADER, PROOF_HEADER as BORING_MAIL_PROXY_PROOF_HEADER }
+export { ASK_USER_BROWSER_CAPABILITIES as BORING_MAIL_PRESERVED_ASK_USER_BROWSER_CAPABILITIES, AUTH_USERNAME as BORING_MAIL_BASIC_USERNAME, MAIL_READ_CAPABILITY as BORING_MAIL_READ_CAPABILITY, OWNER_WORKSPACE_ID as BORING_MAIL_WORKSPACE_ID, PRINCIPAL_HEADER as BORING_MAIL_PROXY_PRINCIPAL_HEADER, PROOF_HEADER as BORING_MAIL_PROXY_PROOF_HEADER }
 
 export type StandaloneDeploymentMode = 'live' | 'fixture'
 
@@ -36,15 +41,18 @@ export interface StandaloneDeploymentConfig {
   backendOrigin: string
   trustTailnetHttp: boolean
   workspaceId: typeof OWNER_WORKSPACE_ID
+  workspaceRoot: string
+  sync: false | undefined
 }
 
 export interface ResolveStandaloneDeploymentOptions {
   env?: NodeJS.ProcessEnv
   backendPort: number
   defaultVitePort: number
+  defaultWorkspaceRoot: string
 }
 
-export interface StandaloneHostAuthOptions extends Omit<StandaloneDeploymentConfig, 'mode' | 'workspaceId'> {
+export interface StandaloneHostAuthOptions extends Omit<StandaloneDeploymentConfig, 'mode' | 'workspaceId' | 'workspaceRoot' | 'sync'> {
   mode?: StandaloneDeploymentMode
   workspaceId?: typeof OWNER_WORKSPACE_ID
   readTailscaleStatus?: () => string
@@ -89,19 +97,33 @@ function forbiddenEnv(env: NodeJS.ProcessEnv, names: readonly string[], mode: St
   }
 }
 
-export function resolveStandaloneDeploymentConfig({ env = process.env, backendPort, defaultVitePort }: ResolveStandaloneDeploymentOptions): StandaloneDeploymentConfig {
+function canonicalTemporaryFixtureRoot(path: string): string {
+  let fixtureRoot: string
+  let temporaryRoot: string
+  try {
+    fixtureRoot = realpathSync(path)
+    temporaryRoot = realpathSync(tmpdir())
+  } catch {
+    fail('BORING_MAIL_FIXTURE_ROOT must name an existing temporary fixture directory')
+  }
+  if (fixtureRoot !== temporaryRoot && !fixtureRoot.startsWith(`${temporaryRoot}${sep}`)) {
+    fail('BORING_MAIL_FIXTURE_ROOT must be under the system temporary directory')
+  }
+  return fixtureRoot
+}
+
+export function resolveStandaloneDeploymentConfig({ env = process.env, backendPort, defaultVitePort, defaultWorkspaceRoot }: ResolveStandaloneDeploymentOptions): StandaloneDeploymentConfig {
   const modeText = env.BORING_MAIL_DEPLOYMENT_MODE?.trim()
   if (modeText !== 'live' && modeText !== 'fixture') fail('BORING_MAIL_DEPLOYMENT_MODE must be exactly live or fixture')
   const mode = modeText
+  if (env[UNSUPPORTED_BACKEND_HOST_ENV]?.trim()) fail(`${UNSUPPORTED_BACKEND_HOST_ENV} is unsupported; backend is pinned to 127.0.0.1`)
   if (mode === 'live') forbiddenEnv(env, FIXTURE_PATH_ENV, mode)
-  else forbiddenEnv(env, LIVE_PATH_ENV, mode)
+  else forbiddenEnv(env, FIXTURE_FORBIDDEN_MAIL_ARCHIVE_ENV, mode)
 
   const tokenFile = requiredEnv(env, 'BORING_MAIL_OWNER_TOKEN_FILE')
   const bindHost = requiredEnv(env, 'BORING_MAIL_BIND_HOST')
   const hmrHost = requiredEnv(env, 'BORING_MAIL_HMR_HOST')
   const allowedOrigin = requiredEnv(env, 'BORING_MAIL_ALLOWED_ORIGIN')
-  const backendHost = env.BORING_MAIL_BACKEND_HOST?.trim() || '127.0.0.1'
-  if (!LOOPBACK_HOSTS.has(backendHost)) fail('BORING_MAIL_BACKEND_HOST must be an explicit loopback IP')
   if (!Number.isSafeInteger(backendPort) || backendPort < 1 || backendPort > 65_535) fail('backend port must be a valid TCP port')
   if (!Number.isSafeInteger(defaultVitePort) || defaultVitePort < 1 || defaultVitePort > 65_535) fail('Vite port must be a valid TCP port')
 
@@ -109,15 +131,20 @@ export function resolveStandaloneDeploymentConfig({ env = process.env, backendPo
   const originPort = Number(origin.port)
   if (originPort !== defaultVitePort) fail('BORING_MAIL_ALLOWED_ORIGIN port must match PORT/VITE port')
 
+  const fixtureRoot = mode === 'fixture' ? canonicalTemporaryFixtureRoot(requiredEnv(env, 'BORING_MAIL_FIXTURE_ROOT')) : undefined
+  if (mode === 'fixture' && env.BORING_MAIL_TRUST_TAILNET_HTTP?.trim()) fail('BORING_MAIL_TRUST_TAILNET_HTTP is not allowed in fixture mode')
+
   return {
     mode,
     tokenFile,
     bindHost,
     hmrHost,
     allowedOrigin,
-    backendOrigin: `http://${backendHost}:${backendPort}`,
-    trustTailnetHttp: env.BORING_MAIL_TRUST_TAILNET_HTTP?.trim() === '1',
+    backendOrigin: `http://127.0.0.1:${backendPort}`,
+    trustTailnetHttp: mode === 'live' && env.BORING_MAIL_TRUST_TAILNET_HTTP?.trim() === '1',
     workspaceId: OWNER_WORKSPACE_ID,
+    workspaceRoot: fixtureRoot ?? resolve(defaultWorkspaceRoot),
+    sync: mode === 'fixture' ? false : undefined,
   }
 }
 
@@ -203,10 +230,12 @@ function validateTopology(options: StandaloneHostAuthOptions): {
   viteServer: ServerOptions
   expected: Readonly<ExpectedViteTopology>
 } {
+  const mode = options.mode ?? 'live'
   if ((options.workspaceId ?? OWNER_WORKSPACE_ID) !== OWNER_WORKSPACE_ID) fail('workspace owner must be default')
   if (isIP(options.bindHost) === 0 || options.bindHost === '0.0.0.0' || options.bindHost === '::') {
     fail('bind host must be one explicit IP address')
   }
+  if (mode === 'fixture' && !LOOPBACK_HOSTS.has(options.bindHost)) fail('fixture mode must bind Vite to loopback')
   if (options.hmrHost !== options.bindHost) fail('HMR host must exactly match the explicit bind host')
 
   let origin: URL
@@ -229,8 +258,13 @@ function validateTopology(options: StandaloneHostAuthOptions): {
     fail('backend must be one exact HTTP origin on an explicit loopback IP and port')
   }
   if (origin.protocol === 'http:') {
-    if (!options.trustTailnetHttp) fail('tailnet HTTP requires explicit trust')
-    validateTailscaleSelf((options.readTailscaleStatus ?? readBoundedTailscaleStatus)(), options.bindHost)
+    if (mode === 'fixture') {
+      if (options.trustTailnetHttp) fail('fixture mode must not trust tailnet HTTP')
+      if (!LOOPBACK_HOSTS.has(origin.hostname)) fail('fixture mode origin must be loopback')
+    } else {
+      if (!options.trustTailnetHttp) fail('tailnet HTTP requires explicit trust')
+      validateTailscaleSelf((options.readTailscaleStatus ?? readBoundedTailscaleStatus)(), options.bindHost)
+    }
   } else if (origin.protocol === 'https:') {
     fail('HTTPS is not modeled; use exact trusted tailnet HTTP or add modeled TLS first')
   } else {
@@ -425,17 +459,22 @@ function proofMatches(input: BridgeAuthPolicyInput, trustedProof: Buffer): boole
   return ok
 }
 
-function createStandaloneBrowserBridgeAuthPolicy(allowedOrigin: string, trustedProof: Buffer): BridgeAuthPolicy {
+function createStandaloneBrowserBridgeAuthPolicy(
+  allowedOrigin: string,
+  trustedProof: Buffer,
+  isActive: () => boolean,
+): BridgeAuthPolicy {
   return createBrowserBridgeAuthPolicy({
     allowedOrigins: [allowedOrigin],
     requireCsrfHeader: true,
     getPrincipal(input) {
+      if (!isActive()) return null
       if (!proofMatches(input, trustedProof)) return null
       return { userId: 'boring-mail-owner', roles: ['owner'] }
     },
     authorizeWorkspace({ workspaceId }) {
       if (workspaceId !== OWNER_WORKSPACE_ID) return { allowed: false, capabilities: [] }
-      return { allowed: true, role: 'owner', capabilities: [MAIL_READ_CAPABILITY] }
+      return { allowed: true, role: 'owner', capabilities: STANDALONE_BROWSER_CAPABILITIES }
     },
   })
 }
@@ -457,11 +496,15 @@ export function createStandaloneHostAuth(options: StandaloneHostAuthOptions): Va
     expectedToken.fill(0)
     trustedProof.fill(0)
   }
+  const deactivate = (): void => {
+    disposed = true
+    clearSecrets()
+  }
   const authPlugin: Plugin = {
     name: 'boring-mail-host-auth:pre-auth',
     enforce: 'pre',
     configureServer(server) {
-      server.httpServer?.once('close', clearSecrets)
+      server.httpServer?.once('close', deactivate)
       server.middlewares.use((request, response, next) => {
         if (disposed || !authorize(request, expectedToken, trustedProof)) {
           rejectHttp(response)
@@ -494,13 +537,12 @@ export function createStandaloneHostAuth(options: StandaloneHostAuthOptions): Va
   }
   return {
     plugins: Object.freeze([authPlugin, finalizerPlugin]) as readonly [Plugin, Plugin],
-    browserAuthPolicy: createStandaloneBrowserBridgeAuthPolicy(options.allowedOrigin, trustedProof),
+    browserAuthPolicy: createStandaloneBrowserBridgeAuthPolicy(options.allowedOrigin, trustedProof, () => !disposed),
     proofHeader: PROOF_HEADER,
     principalHeader: PRINCIPAL_HEADER,
     viteServer,
     dispose() {
-      disposed = true
-      clearSecrets()
+      deactivate()
     },
   }
 }
