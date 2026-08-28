@@ -30,7 +30,7 @@ const page = (overrides: Partial<UnifiedInboxPage['items'][number]> = {}): Unifi
 })
 
 describe('mailBridgeListContract', () => {
-  it('strictly validates list inputs and status vocabulary', () => {
+  it('strictly validates list inputs, output byte caps, controls, emails, and status vocabulary', () => {
     expect(mailBridgeListInputContract.safeParse({ limit: 50, cursor: 'abc' }).success).toBe(true)
     expect(mailBridgeListInputContract.safeParse({ limit: 51 }).success).toBe(false)
     expect(mailBridgeListInputContract.safeParse({ limit: 1.5 }).success).toBe(false)
@@ -39,6 +39,21 @@ describe('mailBridgeListContract', () => {
     expect(mailBridgeListOutputContract.safeParse({ status: 'stale_cursor' }).success).toBe(true)
     expect(mailBridgeListOutputContract.safeParse({ status: 'unavailable' }).success).toBe(true)
     expect(mailBridgeListOutputContract.safeParse({ status: 'stale-cursor' }).success).toBe(false)
+    const validItem = mapUnifiedInboxPageToBrowserList(page({ senderEmail: 'sender@example.invalid' }), (id) => `bm1.${id}.tag`)
+    expect(mailBridgeListOutputContract.safeParse(validItem).success).toBe(true)
+    if (validItem.status !== 'ok') throw new Error('expected ok output')
+    expect(mailBridgeListOutputContract.safeParse({
+      ...validItem,
+      items: [{ ...validItem.items[0], subject: 'x'.repeat(1_025) }],
+    }).success).toBe(false)
+    expect(mailBridgeListOutputContract.safeParse({
+      ...validItem,
+      items: [{ ...validItem.items[0], snippet: 'bad\u0001control' }],
+    }).success).toBe(false)
+    expect(mailBridgeListOutputContract.safeParse({
+      ...validItem,
+      items: [{ ...validItem.items[0], senderEmail: 'bad email@example.invalid' }],
+    }).success).toBe(false)
   })
 
   it('maps storage rows to bounded browser DTOs without internal identifiers', () => {

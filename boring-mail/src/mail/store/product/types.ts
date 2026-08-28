@@ -216,6 +216,8 @@ export interface ConnectedInboxSource {
 export interface ProductStoreDependencies {
   now: () => number
   resolveReplyTarget: (messageId: number) => Omit<ResolvedReplyTarget, 'messageId'> | null
+  /** Process-secret HMAC key used for opaque read-catalog generations. */
+  readSourceDigestKey?: Uint8Array | string
 }
 
 export type ProductStoreErrorCode =

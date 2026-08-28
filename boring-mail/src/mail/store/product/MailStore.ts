@@ -51,7 +51,7 @@ export interface WorkerTransport {
   on(event: 'message', listener: (value: RpcResponse) => void): this
   on(event: 'error', listener: (error: Error) => void): this
   on(event: 'exit', listener: (code: number) => void): this
-  terminate(): Promise<number>
+  terminate(force?: boolean): Promise<number>
 }
 export type MailStoreWorkerFactory = (config: MailStoreWorkerConfig) => WorkerTransport
 export interface MailStoreOpenOptions {
@@ -217,15 +217,19 @@ class StorageProcessTransport extends EventEmitter {
     this.#child.send(value, (error) => { if (error) this.emit('error', error) })
   }
 
-  terminate(): Promise<number> {
+  terminate(force = false): Promise<number> {
     if (this.#termination) return this.#termination
     if (this.#closeCode !== null) return Promise.resolve(this.#closeCode)
     this.#termination = (async () => {
-      const force = setTimeout(() => this.#child.kill('SIGKILL'), TERMINATE_GRACE_MS)
-      force.unref()
+      if (force) {
+        this.#child.kill('SIGKILL')
+        return this.#closed
+      }
+      const forceTimer = setTimeout(() => this.#child.kill('SIGKILL'), TERMINATE_GRACE_MS)
+      forceTimer.unref()
       this.#child.kill('SIGTERM')
       const code = await this.#closed // `close` is guaranteed even when spawn fails.
-      clearTimeout(force)
+      clearTimeout(forceTimer)
       return code
     })()
     return this.#termination
@@ -302,6 +306,9 @@ class RpcClient {
       pending.reject(error)
     }
     this.#pending.clear()
+    if (error instanceof ProductStoreError && error.code === 'rpc_timeout') {
+      void this.worker.terminate(true)
+    }
     this.onFailure(error)
   }
 

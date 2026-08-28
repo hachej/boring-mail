@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID, type BinaryLike } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { decodeDraft, type DraftRow } from './codec.js'
 import { StoreContext, fail } from './context.js'
@@ -21,8 +21,10 @@ import {
 export class ProductStore {
   readonly outbox: OutboxMachine
   readonly #c: StoreContext
+  readonly #readSourceDigestKey: BinaryLike
   private constructor(db: DatabaseSync, deps: ProductStoreDependencies) {
     this.#c = new StoreContext(db, deps)
+    this.#readSourceDigestKey = deps.readSourceDigestKey ?? randomBytes(32)
     this.outbox = new OutboxMachine(this.#c)
   }
   static open(path: string, deps: ProductStoreDependencies): ProductStore {
@@ -121,10 +123,10 @@ export class ProductStore {
     })
   }
   private readSourceGeneration(): string {
-    const rows = this.#c.db.prepare(
-      `SELECT source_id,identities_json,enabled,present FROM mail_read_sources ORDER BY source_id`,
-    ).all() as Array<Record<string, unknown>>
-    return JSON.stringify(rows)
+    return createHmac('sha256', this.#readSourceDigestKey)
+      .update('boring-mail.read-source-eligibility.v1\0')
+      .update(JSON.stringify(this.connectedInboxSources()))
+      .digest('base64url')
   }
   upsertAccount(input: AccountInput): void {
     const id = input.accountId.trim(),

@@ -26,12 +26,17 @@ const msgvaultSchema = readFileSync(
   const fixture = new DatabaseSync(msgvaultDbPath)
   fixture.exec(msgvaultSchema)
   fixture.exec(`INSERT INTO sources(id,source_type,identifier) VALUES(1,'gmail','smoke@example.test');
+    INSERT INTO account_identities(source_id,address) VALUES(1,'smoke@example.test');
+    INSERT INTO participants(id,email_address,display_name) VALUES(1,'sender@example.test','Sender Smoke');
     INSERT INTO conversations(id,source_id,conversation_type,message_count,unread_count)
       VALUES(1,1,'email_thread',3,0);
-    INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,subject,sent_at,is_read,attachment_count)
-    VALUES(1,1,1,'<one@example.test>','email','one','2030-01-03 00:00:00+00:00',1,0),
-          (2,1,1,'<two@example.test>','email','two','2030-01-02 00:00:00+00:00',1,0),
-          (3,1,1,'<three@example.test>','email','three','2030-01-01 00:00:00+00:00',1,0)`)
+    INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,subject,snippet,sender_id,sent_at,is_read,attachment_count)
+    VALUES(1,1,1,'<one@example.test>','email','one','one',1,'2030-01-03 00:00:00+00:00',1,0),
+          (2,1,1,'<two@example.test>','email','two','two',1,'2030-01-02 00:00:00+00:00',1,0),
+          (3,1,1,'<three@example.test>','email','three','three',1,'2030-01-01 00:00:00+00:00',1,0)`)
+  const hostileSubject = `Q\u0000\u0001\"😀`.repeat(256 * 1024)
+  const hostileSnippet = `S\\\"\n😀`.repeat(256 * 1024)
+  fixture.prepare(`UPDATE messages SET subject=?,snippet=?`).run(hostileSubject, hostileSnippet)
   fixture.close()
 }
 const moduleUrl = new URL('../dist/mail/store/productDb.js', import.meta.url).href
@@ -138,6 +143,11 @@ try {
   if (firstInboxPage.items.length !== 1 || !firstInboxPage.nextCursor) {
     throw new Error('public async unified inbox did not return a cursor page')
   }
+  if (Buffer.byteLength(firstInboxPage.items[0].subject ?? '', 'utf8') > 1024 ||
+      Buffer.byteLength(firstInboxPage.items[0].snippet ?? '', 'utf8') > 2048 ||
+      !firstInboxPage.items[0].textTruncated.subject || !firstInboxPage.items[0].textTruncated.snippet) {
+    throw new Error('emitted worker did not physically bound hostile provider text')
+  }
   await store.listUnifiedInbox(null).then(
     () => { throw new Error('malformed unified inbox options were accepted') },
     (error) => { if (error?.code !== 'invalid_input') throw error },
@@ -232,6 +242,27 @@ try {
   if (!reopened.stdout.includes('OPENED')) {
     throw new Error(`lock was not released for second process: ${reopened.stdout}${reopened.stderr}`)
   }
+
+  process.env.BORING_MAIL_TEST_BLOCK_RPC = 'getDraft'
+  const timeoutStore = await openMailStore({ productDbPath }, {
+    startupTimeoutMs: 3_000, requestTimeoutMs: 40,
+  })
+  const timeoutOwner = JSON.parse(readFileSync(ownerPath, 'utf8')).pid
+  const startedTimeout = Date.now()
+  await timeoutStore.getDraft('blocked-timeout').then(
+    () => { throw new Error('blocked real child RPC unexpectedly resolved') },
+    (error) => { if (error?.code !== 'rpc_timeout') throw error },
+  )
+  delete process.env.BORING_MAIL_TEST_BLOCK_RPC
+  const elapsedTimeout = Date.now() - startedTimeout
+  if (elapsedTimeout > 1_000) throw new Error(`real child timeout did not fail-stop promptly: ${elapsedTimeout}ms`)
+  const reopenStarted = Date.now()
+  const afterTimeout = await openEventually()
+  const reopenElapsed = Date.now() - reopenStarted
+  if (reopenElapsed > 1_000) throw new Error(`timed out storage child held locks too long after SIGKILL: ${reopenElapsed}ms`)
+  void timeoutOwner
+  await timeoutStore.close()
+  await afterTimeout.close()
 
   // Atomic owner proof: kill the process that owns both flock and SQLite while
   // a large synchronous write is in flight. The old RPC must reject, while a

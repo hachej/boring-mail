@@ -4,7 +4,7 @@
  * to know msgvault table/index details. It remains internal; public reads cross
  * the async MailStore storage-process boundary.
  */
-import { createHash } from 'node:crypto'
+import { createHmac, type BinaryLike } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import {
   ProductStoreError,
@@ -23,6 +23,8 @@ export interface EligibleInboxSource {
 /** @internal Per-storage-process cursor generation; never crosses RPC. */
 export interface UnifiedInboxCursorAuthority {
   scope: string
+  /** Process-secret key shared with product read-catalog generation. */
+  digestKey: BinaryLike
   /** Deterministic race seam used only by adapter tests. */
   beforePageQuery?: () => void
 }
@@ -31,56 +33,82 @@ interface MsgvaultIndexCapabilities {
   rfc822: string
   liveRecency: string
   bySource: string
+  conversation: string
   recipientsByMessage: string
+  attachmentsByMessage: string
 }
 const indexCapabilities = new WeakMap<DatabaseSync, MsgvaultIndexCapabilities>()
 
 function quotedIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`
 }
-function indexColumns(db: DatabaseSync, name: string): Array<{ name: string | null }> {
-  return db.prepare(`PRAGMA index_info(${quotedIdentifier(name)})`).all() as Array<{ name: string | null }>
+interface IndexListRow { name: string; unique: number; partial: number }
+interface IndexXInfoRow { name: string | null; desc: number; key: number }
+function keyIndexColumns(db: DatabaseSync, name: string): Array<{ name: string | null; desc: number }> {
+  return (db.prepare(`PRAGMA index_xinfo(${quotedIdentifier(name)})`).all() as unknown as IndexXInfoRow[])
+    .filter((column) => column.key === 1)
+    .map((column) => ({ name: column.name, desc: column.desc }))
+}
+function findIndex(
+  indexes: IndexListRow[],
+  db: DatabaseSync,
+  spec: { unique: 0 | 1; partial: 0 | 1; columns: Array<{ name: string | null; desc: 0 | 1 }> },
+): string | null {
+  const found = indexes.find((index) => index.unique === spec.unique && index.partial === spec.partial &&
+    JSON.stringify(keyIndexColumns(db, index.name)) === JSON.stringify(spec.columns))
+  return found?.name ?? null
 }
 export function inspectIndexCapabilities(db: DatabaseSync): {
   value: MsgvaultIndexCapabilities | null
   errors: string[]
 } {
-  type IndexRow = { name: string; unique: number; partial: number }
-  const messageIndexes = db.prepare(`PRAGMA index_list(messages)`).all() as IndexRow[]
-  const recipientIndexes = db.prepare(`PRAGMA index_list(message_recipients)`).all() as IndexRow[]
-  const rfc822 = messageIndexes.find((index) => index.unique === 0 && index.partial === 0 &&
-    indexColumns(db, index.name)[0]?.name === 'rfc822_message_id')
-  const bySource = messageIndexes.find((index) => index.unique === 0 && index.partial === 0 &&
-    indexColumns(db, index.name)[0]?.name === 'source_id')
-  const recipientsByMessage = recipientIndexes.find((index) => index.partial === 0 &&
-    indexColumns(db, index.name)[0]?.name === 'message_id')
-  const indexSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name=?`)
-  const liveRecency = messageIndexes.find((index) => {
-    if (index.unique !== 0 || index.partial !== 1) return false
-    const columns = indexColumns(db, index.name)
-    if (columns[0]?.name !== null || columns[1]?.name !== 'id' || columns.length !== 2) return false
-    const sql = (indexSql.get(index.name) as { sql: string | null } | undefined)?.sql
-      ?.toLowerCase().replace(/["`\[\]]/g, '').replace(/\s+/g, '') ?? ''
-    return /^createindex.+onmessages\(coalesce\(sent_at,received_at,internal_date\)desc,iddesc\)wheredeleted_atisnullanddeleted_from_source_atisnull$/.test(sql)
+  const messageIndexes = db.prepare(`PRAGMA index_list(messages)`).all() as unknown as IndexListRow[]
+  const recipientIndexes = db.prepare(`PRAGMA index_list(message_recipients)`).all() as unknown as IndexListRow[]
+  const attachmentIndexes = db.prepare(`PRAGMA index_list(attachments)`).all() as unknown as IndexListRow[]
+  const rfc822 = findIndex(messageIndexes, db, {
+    unique: 0, partial: 0, columns: [{ name: 'rfc822_message_id', desc: 0 }],
   })
+  const bySource = findIndex(messageIndexes, db, {
+    unique: 0, partial: 0, columns: [{ name: 'source_id', desc: 0 }],
+  })
+  const conversation = findIndex(messageIndexes, db, {
+    unique: 0, partial: 0, columns: [{ name: 'conversation_id', desc: 0 }, { name: 'sent_at', desc: 1 }],
+  })
+  const recipientsByMessage = findIndex(recipientIndexes, db, {
+    unique: 0, partial: 0, columns: [{ name: 'message_id', desc: 0 }],
+  })
+  const attachmentsByMessage = findIndex(attachmentIndexes, db, {
+    unique: 0, partial: 0, columns: [{ name: 'message_id', desc: 0 }],
+  })
+  const liveRecency = findIndex(messageIndexes, db, {
+    unique: 0,
+    partial: 1,
+    columns: [{ name: null, desc: 1 }, { name: 'id', desc: 1 }],
+  })
+  const indexSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name=?`)
+  const liveSql = liveRecency
+    ? (indexSql.get(liveRecency) as { sql: string | null } | undefined)?.sql
+      ?.toLowerCase().replace(/["`\[\]]/g, '').replace(/\s+/g, '') ?? ''
+    : ''
+  const liveRecencyValid = !!liveRecency &&
+    /^createindex.+onmessages\(coalesce\(sent_at,received_at,internal_date\)desc,iddesc\)wheredeleted_atisnullanddeleted_from_source_atisnull$/.test(liveSql)
   const errors = [
-    !rfc822 ? 'messages requires a non-unique, non-partial index led by rfc822_message_id' : '',
-    !liveRecency
-      ? 'messages requires a live recency index on COALESCE(sent_at,received_at,internal_date) DESC,id DESC'
+    !rfc822 ? 'messages requires a non-unique, non-partial ASC index exactly on rfc822_message_id' : '',
+    !liveRecencyValid
+      ? 'messages requires a non-unique partial DESC index on COALESCE(sent_at,received_at,internal_date),id for live rows'
       : '',
-    !bySource ? 'messages requires a non-partial index led by source_id' : '',
+    !bySource ? 'messages requires a non-unique, non-partial ASC index exactly on source_id' : '',
+    !conversation ? 'messages requires a non-unique, non-partial index exactly on conversation_id ASC,sent_at DESC' : '',
     !recipientsByMessage
-      ? 'message_recipients requires a non-partial index led by message_id'
+      ? 'message_recipients requires a non-unique, non-partial ASC index exactly on message_id'
+      : '',
+    !attachmentsByMessage
+      ? 'attachments requires a non-unique, non-partial ASC index exactly on message_id'
       : '',
   ].filter(Boolean)
   return {
-    value: rfc822 && liveRecency && bySource && recipientsByMessage
-      ? {
-          rfc822: rfc822.name,
-          liveRecency: liveRecency.name,
-          bySource: bySource.name,
-          recipientsByMessage: recipientsByMessage.name,
-        }
+    value: rfc822 && liveRecencyValid && bySource && conversation && recipientsByMessage && attachmentsByMessage
+      ? { rfc822, liveRecency: liveRecency!, bySource, conversation, recipientsByMessage, attachmentsByMessage }
       : null,
     errors,
   }
@@ -114,10 +142,11 @@ const SENDER_NAME_BYTES = 512
 const SENDER_EMAIL_BYTES = 320
 const SUBJECT_BYTES = 1_024
 const SNIPPET_BYTES = 2_048
-const SENDER_NAME_PREFIX_CHARS = SENDER_NAME_BYTES + 1
-const SENDER_EMAIL_PREFIX_CHARS = SENDER_EMAIL_BYTES + 1
-const SUBJECT_PREFIX_CHARS = SUBJECT_BYTES + 1
-const SNIPPET_PREFIX_CHARS = SNIPPET_BYTES + 1
+const SENDER_NAME_PREFIX_BYTES = SENDER_NAME_BYTES + 4
+const SENDER_EMAIL_PREFIX_BYTES = SENDER_EMAIL_BYTES + 4
+const SUBJECT_PREFIX_BYTES = SUBJECT_BYTES + 4
+const SNIPPET_PREFIX_BYTES = SNIPPET_BYTES + 4
+const EXPLAIN_DIGEST_KEY = Buffer.alloc(32, 0)
 
 interface UnifiedCursorPayload {
   v: 1
@@ -157,23 +186,62 @@ function booleanSentinel(value: unknown, name: string): boolean {
   if (value === null || value === undefined) return false
   return booleanInteger(value, name)
 }
-function boundedTextField(value: unknown, overflow: unknown, name: string, maxBytes: number): { value: string | null; truncated: boolean } {
-  const text = nullableText(value, name)
-  if (text === null) return { value: null, truncated: booleanSentinel(overflow, `${name}_overflow`) }
-  const normalized = normalizeAndTruncateProviderText(text, maxBytes)
+function blobBytes(value: unknown, name: string): Uint8Array | null {
+  if (value === null) return null
+  if (Buffer.isBuffer(value)) return value
+  if (value instanceof Uint8Array) return value
+  throw new ProductStoreError('corrupt_data', `${name} bounded prefix must be bytes or null`)
+}
+function decodeUtf8Prefix(bytes: Uint8Array, name: string): string {
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  for (let end = bytes.length; end >= 0; end--) {
+    try { return decoder.decode(bytes.subarray(0, end)) }
+    catch {
+      if (end === 0) throw new ProductStoreError('corrupt_data', `${name} is not valid UTF-8 text`)
+    }
+  }
+  return ''
+}
+function boundedTextField(value: unknown, storageClass: unknown, overflow: unknown, name: string, maxBytes: number): { value: string | null; truncated: boolean } {
+  if (storageClass !== 'null' && storageClass !== 'text') {
+    throw new ProductStoreError('corrupt_data', `${name} storage class must be text or null`)
+  }
+  const bytes = blobBytes(value, name)
+  if (storageClass === 'null') {
+    if (bytes !== null) throw new ProductStoreError('corrupt_data', `${name} null storage carried bytes`)
+    return { value: null, truncated: booleanSentinel(overflow, `${name}_overflow`) }
+  }
+  if (bytes === null) throw new ProductStoreError('corrupt_data', `${name} text storage missing bytes`)
+  const normalized = normalizeAndTruncateProviderText(decodeUtf8Prefix(bytes, name), maxBytes)
   return { value: normalized.value, truncated: booleanSentinel(overflow, `${name}_overflow`) || normalized.truncated }
 }
-function boundedEmailField(value: unknown, overflow: unknown, name: string, maxBytes: number): { value: string | null; truncated: boolean } {
-  const text = nullableText(value, name)
-  const normalized = normalizeAndTruncateProviderEmail(text, maxBytes)
+function boundedEmailField(value: unknown, storageClass: unknown, overflow: unknown, name: string, maxBytes: number): { value: string | null; truncated: boolean } {
+  if (storageClass !== 'null' && storageClass !== 'text') {
+    throw new ProductStoreError('corrupt_data', `${name} storage class must be text or null`)
+  }
+  if (storageClass === 'null') return { value: null, truncated: booleanSentinel(overflow, `${name}_overflow`) }
+  const bytes = blobBytes(value, name)
+  if (bytes === null) throw new ProductStoreError('corrupt_data', `${name} text storage missing bytes`)
+  const normalized = normalizeAndTruncateProviderEmail(decodeUtf8Prefix(bytes, name), maxBytes)
   return { value: normalized.value, truncated: booleanSentinel(overflow, `${name}_overflow`) || normalized.truncated }
 }
 function dataVersion(db: DatabaseSync): number {
   const row = db.prepare('PRAGMA data_version').get() as { data_version?: unknown }
   return positiveInteger(row.data_version, 'msgvault data_version')
 }
-function sourceInput(sources: EligibleInboxSource[]): { json: string; digest: string } {
+export function eligibleSourceGeneration(
+  sources: EligibleInboxSource[],
+  authority: Pick<UnifiedInboxCursorAuthority, 'digestKey'>,
+): string {
+  return sourceInput(sources, authority).digest
+}
+
+function sourceInput(
+  sources: EligibleInboxSource[],
+  authority: Pick<UnifiedInboxCursorAuthority, 'digestKey'>,
+): { json: string; digest: string } {
   if (!Array.isArray(sources)) throw new ProductStoreError('invalid_input', 'eligible inbox sources are required')
+  if (!authority || !authority.digestKey) throw new ProductStoreError('invalid_input', 'cursor authority digest key is required')
   const seen = new Set<number>()
   const normalized = sources.map((source) => {
     if (!source || !Number.isSafeInteger(source.sourceId) || source.sourceId <= 0 || seen.has(source.sourceId)) {
@@ -192,7 +260,13 @@ function sourceInput(sources: EligibleInboxSource[]): { json: string; digest: st
     return { sourceId: source.sourceId, identities }
   }).sort((left, right) => left.sourceId - right.sourceId)
   const json = JSON.stringify(normalized)
-  return { json, digest: createHash('sha256').update(json).digest('base64url') }
+  return {
+    json,
+    digest: createHmac('sha256', authority.digestKey)
+      .update('boring-mail.read-source-eligibility.v1\0')
+      .update(json)
+      .digest('base64url'),
+  }
 }
 function encodeCursor(payload: UnifiedCursorPayload): string {
   return Buffer.from(JSON.stringify(payload)).toString('base64url')
@@ -222,7 +296,7 @@ function readCursor(
   const payload = value as Record<string, unknown>
   const keys = Object.keys(payload).sort()
   if (keys.join(',') !== 'd,e,i,s,t,v' || payload.v !== 1 || typeof payload.s !== 'string' ||
-      !Number.isSafeInteger(payload.d) || typeof payload.e !== 'string' ||
+      !Number.isSafeInteger(payload.d) || typeof payload.e !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(payload.e) ||
       (payload.t !== null && typeof payload.t !== 'string') ||
       !Number.isSafeInteger(payload.i) || Number(payload.i) <= 0) {
     throw new ProductStoreError('invalid_input', 'unified inbox cursor has an invalid payload')
@@ -289,10 +363,10 @@ function decodeUnifiedInboxItem(row: Record<string, unknown>): UnifiedInboxItem 
   if (!Number.isSafeInteger(attachmentCount) || Number(attachmentCount) < 0) {
     throw new ProductStoreError('corrupt_data', 'attachment_count must be a non-negative safe integer')
   }
-  const subject = boundedTextField(row.subject, row.subject_overflow, 'subject', SUBJECT_BYTES)
-  const snippet = boundedTextField(row.snippet, row.snippet_overflow, 'snippet', SNIPPET_BYTES)
-  const senderName = boundedTextField(row.sender_name, row.sender_name_overflow, 'sender_name', SENDER_NAME_BYTES)
-  const senderEmail = boundedEmailField(row.sender_email, row.sender_email_overflow, 'sender_email', SENDER_EMAIL_BYTES)
+  const subject = boundedTextField(row.subject_blob, row.subject_type, row.subject_overflow, 'subject', SUBJECT_BYTES)
+  const snippet = boundedTextField(row.snippet_blob, row.snippet_type, row.snippet_overflow, 'snippet', SNIPPET_BYTES)
+  const senderName = boundedTextField(row.sender_name_blob, row.sender_name_type, row.sender_name_overflow, 'sender_name', SENDER_NAME_BYTES)
+  const senderEmail = boundedEmailField(row.sender_email_blob, row.sender_email_type, row.sender_email_overflow, 'sender_email', SENDER_EMAIL_BYTES)
   return {
     messageId: positiveInteger(row.message_id, 'message_id'),
     conversationId: positiveInteger(row.conversation_id, 'conversation_id'),
@@ -328,6 +402,12 @@ export type UnifiedQueryStrategy = 'recent-window' | 'source-fallback'
 const MIN_RECENT_SCAN_WINDOW = 2_000
 const MAX_RECENT_CORRELATION_COPIES = 64
 
+function boundedBlobSelect(alias: string, column: string, output: string, maxBytes: number, prefixBytes: number): string {
+  return `typeof(${alias}.${column}) AS ${output}_type,
+          substr(CAST(${alias}.${column} AS BLOB),1,${prefixBytes}) AS ${output}_blob,
+          CASE WHEN ${alias}.${column} IS NOT NULL AND length(CAST(${alias}.${column} AS BLOB))>${maxBytes} THEN 1 ELSE 0 END AS ${output}_overflow`
+}
+
 function unifiedInboxSql(
   capabilities: MsgvaultIndexCapabilities,
   mode: UnifiedKeysetMode,
@@ -361,6 +441,11 @@ function unifiedInboxSql(
            json_extract(value,'$.identities') AS identities_json
       FROM json_each(?)
   )`
+  const finalTextSelect = `
+           ${boundedBlobSelect('message', 'subject', 'subject', SUBJECT_BYTES, SUBJECT_PREFIX_BYTES)},
+           ${boundedBlobSelect('message', 'snippet', 'snippet', SNIPPET_BYTES, SNIPPET_PREFIX_BYTES)},
+           ${boundedBlobSelect('sender', 'display_name', 'sender_name', SENDER_NAME_BYTES, SENDER_NAME_PREFIX_BYTES)},
+           ${boundedBlobSelect('sender', 'email_address', 'sender_email', SENDER_EMAIL_BYTES, SENDER_EMAIL_PREFIX_BYTES)}`
 
   if (strategy === 'source-fallback') {
     return `
@@ -369,19 +454,8 @@ function unifiedInboxSql(
         SELECT candidate.id AS message_id,
                candidate.conversation_id,
                candidate.source_id,
-               source.identifier AS source_identifier,
                boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
-               substr(candidate.subject,1,${SUBJECT_PREFIX_CHARS}) AS subject,
-               CASE WHEN candidate.subject IS NOT NULL AND length(candidate.subject)>${SUBJECT_PREFIX_CHARS} THEN 1 ELSE 0 END AS subject_overflow,
-               substr(candidate.snippet,1,${SNIPPET_PREFIX_CHARS}) AS snippet,
-               CASE WHEN candidate.snippet IS NOT NULL AND length(candidate.snippet)>${SNIPPET_PREFIX_CHARS} THEN 1 ELSE 0 END AS snippet_overflow,
-               substr(sender.display_name,1,${SENDER_NAME_PREFIX_CHARS}) AS sender_name,
-               CASE WHEN sender.display_name IS NOT NULL AND length(sender.display_name)>${SENDER_NAME_PREFIX_CHARS} THEN 1 ELSE 0 END AS sender_name_overflow,
-               substr(sender.email_address,1,${SENDER_EMAIL_PREFIX_CHARS}) AS sender_email,
-               CASE WHEN sender.email_address IS NOT NULL AND length(sender.email_address)>${SENDER_EMAIL_PREFIX_CHARS} THEN 1 ELSE 0 END AS sender_email_overflow,
                ${timestamp} AS message_at,
-               candidate.is_read,
-               candidate.attachment_count,
                CASE WHEN boring_mail_message_id(candidate.rfc822_message_id) IS NULL
                     THEN '#'||candidate.id ELSE candidate.rfc822_message_id END AS correlation_key,
                ${addressed('candidate', 'candidate_source')} AS addressed
@@ -391,8 +465,6 @@ function unifiedInboxSql(
           JOIN conversations conversation
             ON conversation.id=candidate.conversation_id
            AND conversation.source_id=candidate.source_id
-          JOIN sources source ON source.id=candidate.source_id
-          LEFT JOIN participants sender ON sender.id=candidate.sender_id
          WHERE ${replyableEmail('candidate', 'conversation')}
       ),
       ranked_candidates AS MATERIALIZED (
@@ -403,23 +475,46 @@ function unifiedInboxSql(
                  ORDER BY addressed DESC,message_at DESC NULLS LAST,source_id ASC,message_id ASC
                ) AS representative_rank
           FROM source_candidates
+      ),
+      selected_page AS MATERIALIZED (
+        SELECT message_id,conversation_id,source_id,valid_rfc822_message_id,message_at,copy_count
+          FROM ranked_candidates ranked
+         WHERE representative_rank=1
+           ${representativeKeyset}
+         ORDER BY message_at DESC NULLS LAST,message_id DESC
+         LIMIT ?
       )
-      SELECT message_id,conversation_id,source_id,source_identifier,
-             valid_rfc822_message_id,subject,subject_overflow,snippet,snippet_overflow,
-             sender_name,sender_name_overflow,sender_email,sender_email_overflow,
-             message_at,is_read,attachment_count,copy_count
-        FROM ranked_candidates ranked
-       WHERE representative_rank=1
-         ${representativeKeyset}
-       ORDER BY message_at DESC NULLS LAST,message_id DESC
-       LIMIT ?
+      SELECT selected.message_id,
+             selected.conversation_id,
+             selected.source_id,
+             source.identifier AS source_identifier,
+             selected.valid_rfc822_message_id,
+             ${finalTextSelect},
+             selected.message_at,
+             message.is_read,
+             message.attachment_count,
+             selected.copy_count
+        FROM selected_page selected
+        JOIN messages message ON message.id=selected.message_id
+        JOIN sources source ON source.id=selected.source_id
+        LEFT JOIN participants sender ON sender.id=message.sender_id
+       ORDER BY selected.message_at DESC NULLS LAST,selected.message_id DESC
     `
   }
 
   return `
     WITH ${eligibleSources},
     recent_rows AS MATERIALIZED (
-      SELECT candidate.*
+      SELECT candidate.id,
+             candidate.conversation_id,
+             candidate.source_id,
+             candidate.rfc822_message_id,
+             candidate.message_type,
+             candidate.sent_at,
+             candidate.received_at,
+             candidate.internal_date,
+             candidate.deleted_at,
+             candidate.deleted_from_source_at
         FROM messages candidate INDEXED BY ${liveIndex}
        WHERE ${liveMessage('candidate')}
          ${candidateKeyset}
@@ -427,8 +522,11 @@ function unifiedInboxSql(
        LIMIT ?
     ),
     recent_candidates AS MATERIALIZED (
-      SELECT candidate.*,
+      SELECT candidate.id,
+             candidate.conversation_id,
+             candidate.source_id,
              boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
+             COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) AS message_at,
              CASE WHEN boring_mail_message_id(candidate.rfc822_message_id) IS NULL
                   THEN '#'||candidate.id ELSE candidate.rfc822_message_id END AS correlation_key
         FROM recent_rows candidate
@@ -478,31 +576,34 @@ function unifiedInboxSql(
         FROM recent_correlations correlation
         CROSS JOIN recent_safety safety
        WHERE safety.safe=1
+    ),
+    selected_page AS MATERIALIZED (
+      SELECT candidate.id AS message_id,
+             candidate.conversation_id,
+             candidate.source_id,
+             candidate.valid_rfc822_message_id,
+             candidate.message_at,
+             selected.copy_count
+        FROM selected_correlations selected
+        JOIN recent_candidates candidate ON candidate.id=selected.message_id
+       ORDER BY candidate.message_at DESC NULLS LAST,candidate.id DESC
+       LIMIT ?
     )
-    SELECT candidate.id AS message_id,
-           candidate.conversation_id,
-           candidate.source_id,
+    SELECT selected.message_id,
+           selected.conversation_id,
+           selected.source_id,
            source.identifier AS source_identifier,
-           candidate.valid_rfc822_message_id,
-           substr(candidate.subject,1,${SUBJECT_PREFIX_CHARS}) AS subject,
-           CASE WHEN candidate.subject IS NOT NULL AND length(candidate.subject)>${SUBJECT_PREFIX_CHARS} THEN 1 ELSE 0 END AS subject_overflow,
-           substr(candidate.snippet,1,${SNIPPET_PREFIX_CHARS}) AS snippet,
-           CASE WHEN candidate.snippet IS NOT NULL AND length(candidate.snippet)>${SNIPPET_PREFIX_CHARS} THEN 1 ELSE 0 END AS snippet_overflow,
-           substr(sender.display_name,1,${SENDER_NAME_PREFIX_CHARS}) AS sender_name,
-           CASE WHEN sender.display_name IS NOT NULL AND length(sender.display_name)>${SENDER_NAME_PREFIX_CHARS} THEN 1 ELSE 0 END AS sender_name_overflow,
-           substr(sender.email_address,1,${SENDER_EMAIL_PREFIX_CHARS}) AS sender_email,
-           CASE WHEN sender.email_address IS NOT NULL AND length(sender.email_address)>${SENDER_EMAIL_PREFIX_CHARS} THEN 1 ELSE 0 END AS sender_email_overflow,
-           COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) AS message_at,
-           candidate.is_read,
-           candidate.attachment_count,
+           selected.valid_rfc822_message_id,
+           ${finalTextSelect},
+           selected.message_at,
+           message.is_read,
+           message.attachment_count,
            selected.copy_count
-      FROM selected_correlations selected
-      JOIN recent_candidates candidate ON candidate.id=selected.message_id
-      JOIN sources source ON source.id=candidate.source_id
-      LEFT JOIN participants sender ON sender.id=candidate.sender_id
-     ORDER BY COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) DESC NULLS LAST,
-              candidate.id DESC
-     LIMIT ?
+      FROM selected_page selected
+      JOIN messages message ON message.id=selected.message_id
+      JOIN sources source ON source.id=selected.source_id
+      LEFT JOIN participants sender ON sender.id=message.sender_id
+     ORDER BY selected.message_at DESC NULLS LAST,selected.message_id DESC
   `
 }
 
@@ -514,7 +615,7 @@ export function explainUnifiedInboxQueryPlan(
   strategy: UnifiedQueryStrategy = 'recent-window',
 ): string[] {
   const capabilities = requireUnifiedCapabilities(db)
-  const eligible = sourceInput(eligibleSources)
+  const eligible = sourceInput(eligibleSources, { digestKey: EXPLAIN_DIGEST_KEY })
   const mode: UnifiedKeysetMode = !after ? 'all' : after.messageAt === null ? 'before-null' : 'before-timestamp'
   const keysetArgs = !after ? [] : after.messageAt === null
     ? [after.messageId]
@@ -555,7 +656,7 @@ export function listUnifiedInboxInSnapshot(
   const opts = input as UnifiedInboxOptions
   const limit = boundedLimit(opts.limit)
   const capabilities = requireUnifiedCapabilities(db)
-  const eligible = sourceInput(eligibleSources)
+  const eligible = sourceInput(eligibleSources, authority)
   const cursor = opts.cursor !== undefined
     ? readCursor(opts.cursor, authority, snapshotDataVersion, eligible.digest)
     : null

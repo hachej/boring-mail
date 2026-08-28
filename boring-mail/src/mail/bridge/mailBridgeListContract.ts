@@ -8,6 +8,15 @@ const OUTPUT_MAX_BYTES = 480 * 1_024
 const LIST_LIMIT_MAX = 50
 
 const utf8BytesAtMost = (max: number) => (value: string) => utf8ByteLength(value) <= max
+const normalizedTextAtMost = (max: number) => z.string()
+  .refine((value) => value === value.normalize('NFC'), 'text must be NFC normalized')
+  .refine((value) => !/[\x00-\x08\x0B-\x1F\x7F]/u.test(value), 'text contains forbidden controls')
+  .refine(utf8BytesAtMost(max), `text exceeds ${max} UTF-8 bytes`)
+const canonicalEmail = z.string()
+  .refine((value) => value === value.normalize('NFC'), 'email must be NFC normalized')
+  .refine(utf8BytesAtMost(320), 'email exceeds 320 UTF-8 bytes')
+  .refine((value) => !/[\s\x00-\x1F\x7F]/u.test(value), 'email must be printable single-line text')
+  .refine((value) => value.indexOf('@') > 0 && value.indexOf('@') === value.lastIndexOf('@') && !value.endsWith('@'), 'email must be canonical email text')
 const targetSchema = z.string()
   .min(1)
   .refine(utf8BytesAtMost(TARGET_MAX_BYTES), 'target exceeds 160 UTF-8 bytes')
@@ -20,10 +29,10 @@ export const mailBridgeListInputContract = z.object({
 
 export const mailBridgeInboxItemContract = z.object({
   target: targetSchema,
-  senderName: z.string().nullable(),
-  senderEmail: z.string().nullable(),
-  subject: z.string(),
-  snippet: z.string(),
+  senderName: normalizedTextAtMost(512).nullable(),
+  senderEmail: canonicalEmail.nullable(),
+  subject: normalizedTextAtMost(1_024),
+  snippet: normalizedTextAtMost(2_048),
   messageAt: z.string().refine(utf8BytesAtMost(64), 'messageAt exceeds 64 UTF-8 bytes').nullable(),
   unread: z.boolean(),
   hasAttachments: z.boolean(),
@@ -73,7 +82,10 @@ export function mapUnifiedInboxPageToBrowserList(
   const output: BrowserInboxListOutput = {
     status: 'ok',
     items: page.items.map((item) => {
-      const subject = normalizeAndTruncateProviderText(item.subject && item.subject.trim() ? item.subject : '(no subject)', 1_024)
+      const normalizedSubject = normalizeAndTruncateProviderText(item.subject ?? '', 1_024)
+      const subject = normalizedSubject.value.trim()
+        ? normalizedSubject
+        : { value: '(no subject)', truncated: normalizedSubject.truncated }
       const snippet = normalizeAndTruncateProviderText(item.snippet ?? '', 2_048)
       const senderName = item.senderName === null ? { value: null, truncated: false } : normalizeAndTruncateProviderText(item.senderName, 512)
       const senderEmail = normalizeAndTruncateProviderEmail(item.senderEmail, 320)

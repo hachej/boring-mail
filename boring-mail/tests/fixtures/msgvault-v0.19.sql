@@ -96,6 +96,7 @@ CREATE TABLE attachments (
   content_hash TEXT,
   storage_path TEXT NOT NULL
 );
+CREATE INDEX idx_attachments_message ON attachments(message_id);
 CREATE VIRTUAL TABLE messages_fts USING fts5(
   message_id UNINDEXED, subject, body, from_addr
 );

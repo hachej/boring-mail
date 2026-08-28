@@ -22,7 +22,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     { sourceId: 1, identities: ['owner-a@example.com', 'alias-a@example.com'] },
     { sourceId: 2, identities: ['owner-b@example.com'] },
   ]
-  const authority = { scope: 'fixture-process' }
+  const authority = { scope: 'fixture-process', digestKey: Buffer.alloc(32, 1) }
 
   beforeAll(() => {
     const path = join(mkdtempSync(join(tmpdir(), 'msgvault-unified-')), 'fixture.db')
@@ -225,6 +225,9 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     expect(() => listUnifiedInbox(store.db, eligible, authority, { cursor: `${cursor}=` })).toThrow(/malformed/)
     expect(() => listUnifiedInbox(store.db, eligible, authority, { cursor: `${cursor}x` })).toThrow(/malformed/)
     const payload = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Record<string, unknown>
+    expect(payload.e).toEqual(expect.stringMatching(/^[A-Za-z0-9_-]{43}$/))
+    expect(String(payload.e)).not.toContain('owner-a')
+    expect(String(payload.e)).not.toContain('alias-a')
     const extraKey = Buffer.from(JSON.stringify({ ...payload, extra: true })).toString('base64url')
     expect(() => listUnifiedInbox(store.db, eligible, authority, { cursor: extraKey })).toThrow(/invalid payload/)
     const reordered = Buffer.from(JSON.stringify({
@@ -235,7 +238,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
       store.db, eligible.slice(0, 1), authority, { cursor },
     )).toThrowError(expect.objectContaining({ code: 'stale_cursor' }))
     expect(() => listUnifiedInbox(
-      store.db, eligible, { scope: 'replacement-process' }, { cursor },
+      store.db, eligible, { scope: 'replacement-process', digestKey: authority.digestKey }, { cursor },
     )).toThrowError(expect.objectContaining({ code: 'stale_cursor' }))
 
     try {
@@ -255,6 +258,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     try {
       expect(() => listUnifiedInbox(store.db, eligible, {
         scope: authority.scope,
+        digestKey: authority.digestKey,
         beforePageQuery: () => raw.exec(`INSERT INTO messages(
           id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count
         ) VALUES(901,11,1,'<race@example.com>','email','2035-01-01 00:00:00+00:00','race',1,0)`),
@@ -290,6 +294,13 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     expect(() => listUnifiedInbox(
       store.db, [{ sourceId: 6, identities: ['time@example.com'] }], authority,
     )).toThrowError(expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/canonical UTC/) }))
+    raw.exec(`INSERT INTO sources(id,source_type,identifier) VALUES(7,'gmail','blob@example.com');
+      INSERT INTO conversations(id,source_id,conversation_type) VALUES(19,7,'email_thread')`)
+    raw.prepare(`INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count)
+      VALUES(952,19,7,'<blob@example.com>','email','2036-01-02 00:00:00+00:00',?,1,0)`).run(Buffer.from([0xff]))
+    expect(() => listUnifiedInbox(
+      store.db, [{ sourceId: 7, identities: ['blob@example.com'] }], authority,
+    )).toThrowError(expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/subject storage class/) }))
     expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 0 })).toThrow(/limit must/)
     expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 51 })).toThrow(/limit must/)
     expect(() => listUnifiedInbox(

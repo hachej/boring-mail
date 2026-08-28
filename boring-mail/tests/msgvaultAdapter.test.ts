@@ -129,6 +129,18 @@ describe('msgvaultAdapter', () => {
     expect(() => openMsgvaultStore(path)).toThrow(/messages\.id must have INTEGER affinity and be the single primary key/)
   })
 
+  it('rejects duplicate-participant schemas by requiring participants.id as the single integer PK', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'msgvault-duplicate-participants-')), 'bad.db')
+    const bad = new DatabaseSync(path)
+    bad.exec(SCHEMA
+      .replace('CREATE TABLE participants (\n  id INTEGER PRIMARY KEY,', 'CREATE TABLE participants (\n  id INTEGER,')
+      .replace(/sender_id INTEGER REFERENCES participants\(id\),/g, 'sender_id INTEGER,')
+      .replace(/participant_id INTEGER NOT NULL REFERENCES participants\(id\),/g, 'participant_id INTEGER NOT NULL,'))
+    bad.exec(`INSERT INTO participants(id,email_address,display_name) VALUES(1,'a@example.invalid','A'),(1,'b@example.invalid','B')`)
+    bad.close()
+    expect(() => openMsgvaultStore(path)).toThrow(/participants\.id must have INTEGER affinity and be the single primary key/)
+  })
+
   it('opens read-only and rejects schema drift', async () => {
     const opened = openMsgvaultStore(dbPath)
     expect(opened.db.prepare('SELECT COUNT(*) c FROM messages').get()).toEqual({ c: 3 })
@@ -178,7 +190,7 @@ describe('msgvaultAdapter', () => {
     ))
     scopedIndex.close()
     expect(() => openMsgvaultStore(scopedIndexPath)).toThrow(
-      /non-unique, non-partial index led by rfc822_message_id/,
+      /non-unique, non-partial ASC index exactly on rfc822_message_id/,
     )
 
     const uniqueIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-unique-index-')), 'drift.db')
@@ -188,16 +200,25 @@ describe('msgvaultAdapter', () => {
       'CREATE UNIQUE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
     ))
     uniqueIndex.close()
-    expect(() => openMsgvaultStore(uniqueIndexPath)).toThrow(/non-unique, non-partial index/)
+    expect(() => openMsgvaultStore(uniqueIndexPath)).toThrow(/non-unique, non-partial ASC index exactly on rfc822_message_id/)
 
-    const equivalentIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-equivalent-index-')), 'ok.db')
-    const equivalentIndex = new DatabaseSync(equivalentIndexPath)
-    equivalentIndex.exec(SCHEMA.replace(
+    const extraColumnIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-extra-index-column-')), 'drift.db')
+    const extraColumnIndex = new DatabaseSync(extraColumnIndexPath)
+    extraColumnIndex.exec(SCHEMA.replace(
       'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
       'CREATE INDEX renamed_global_correlation ON messages(rfc822_message_id,source_id);',
     ))
-    equivalentIndex.close()
-    const equivalentStore = openMsgvaultStore(equivalentIndexPath)
+    extraColumnIndex.close()
+    expect(() => openMsgvaultStore(extraColumnIndexPath)).toThrow(/exactly on rfc822_message_id/)
+
+    const renamedEquivalentIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-equivalent-index-')), 'ok.db')
+    const renamedEquivalentIndex = new DatabaseSync(renamedEquivalentIndexPath)
+    renamedEquivalentIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+      'CREATE INDEX renamed_global_correlation ON messages(rfc822_message_id);',
+    ))
+    renamedEquivalentIndex.close()
+    const equivalentStore = openMsgvaultStore(renamedEquivalentIndexPath)
     equivalentStore.db.close()
 
     const missingLiveIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-live-index-')), 'drift.db')
@@ -208,7 +229,7 @@ describe('msgvaultAdapter', () => {
     ))
     missingLiveIndex.close()
     expect(() => openMsgvaultStore(missingLiveIndexPath)).toThrowError(
-      expect.objectContaining({ code: 'unsupported_schema', message: expect.stringMatching(/REMEDIATION:.*live recency index/) }),
+      expect.objectContaining({ code: 'unsupported_schema', message: expect.stringMatching(/REMEDIATION:.*live rows/) }),
     )
 
     const scopedLiveIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-scoped-live-index-')), 'drift.db')
@@ -218,7 +239,7 @@ describe('msgvaultAdapter', () => {
       'WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL AND source_id=1;',
     ))
     scopedLiveIndex.close()
-    expect(() => openMsgvaultStore(scopedLiveIndexPath)).toThrow(/live recency index/)
+    expect(() => openMsgvaultStore(scopedLiveIndexPath)).toThrow(/live rows/)
 
     for (const table of ['sources', 'conversations'] as const) {
       const duplicateKeyPath = join(mkdtempSync(join(tmpdir(), `msgvault-${table}-identity-`)), 'drift.db')
@@ -235,7 +256,7 @@ describe('msgvaultAdapter', () => {
     const missingSourceIndex = new DatabaseSync(missingSourceIndexPath)
     missingSourceIndex.exec(SCHEMA.replace('CREATE INDEX idx_messages_source ON messages(source_id);', ''))
     missingSourceIndex.close()
-    expect(() => openMsgvaultStore(missingSourceIndexPath)).toThrow(/non-partial index led by source_id/)
+    expect(() => openMsgvaultStore(missingSourceIndexPath)).toThrow(/ASC index exactly on source_id/)
 
     const missingRecipientIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-index-')), 'drift.db')
     const missingRecipientIndex = new DatabaseSync(missingRecipientIndexPath)
@@ -245,8 +266,34 @@ describe('msgvaultAdapter', () => {
     ))
     missingRecipientIndex.close()
     expect(() => openMsgvaultStore(missingRecipientIndexPath)).toThrow(
-      /message_recipients requires a non-partial index led by message_id/,
+      /message_recipients requires a non-unique, non-partial ASC index exactly on message_id/,
     )
+
+    const missingAttachmentIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-attachment-index-')), 'drift.db')
+    const missingAttachmentIndex = new DatabaseSync(missingAttachmentIndexPath)
+    missingAttachmentIndex.exec(SCHEMA.replace('CREATE INDEX idx_attachments_message ON attachments(message_id);', ''))
+    missingAttachmentIndex.close()
+    expect(() => openMsgvaultStore(missingAttachmentIndexPath)).toThrow(
+      /attachments requires a non-unique, non-partial ASC index exactly on message_id/,
+    )
+
+    const participantPkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-participant-pk-')), 'drift.db')
+    const participantPk = new DatabaseSync(participantPkPath)
+    participantPk.exec(SCHEMA.replace('CREATE TABLE participants (\n  id INTEGER PRIMARY KEY,', 'CREATE TABLE participants (\n  id INTEGER,'))
+    participantPk.close()
+    expect(() => openMsgvaultStore(participantPkPath)).toThrow(/participants\.id must have INTEGER affinity and be the single primary key/)
+
+    const senderFkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-sender-fk-')), 'drift.db')
+    const senderFk = new DatabaseSync(senderFkPath)
+    senderFk.exec(SCHEMA.replace('sender_id INTEGER REFERENCES participants(id),', 'sender_id INTEGER,'))
+    senderFk.close()
+    expect(() => openMsgvaultStore(senderFkPath)).toThrow(/messages\.sender_id must reference participants\(id\)/)
+
+    const bodyFkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-body-fk-')), 'drift.db')
+    const bodyFk = new DatabaseSync(bodyFkPath)
+    bodyFk.exec(SCHEMA.replace('message_id INTEGER PRIMARY KEY REFERENCES messages(id),', 'message_id INTEGER PRIMARY KEY,'))
+    bodyFk.close()
+    expect(() => openMsgvaultStore(bodyFkPath)).toThrow(/message_bodies\.message_id must reference messages\(id\)/)
 
     const missingRecipientsPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-drift-')), 'drift.db')
     const missingRecipients = new DatabaseSync(missingRecipientsPath)
