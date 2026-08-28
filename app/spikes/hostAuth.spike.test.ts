@@ -267,7 +267,7 @@ describe('standalone topology validation', () => {
         name: 'synthetic-late-finalizer-remover',
         async configResolved(config) {
           await new Promise((resolve) => setTimeout(resolve, 10))
-          const index = config.plugins.findIndex((plugin) => plugin.name === 'boring-mail-host-auth-spike:finalizer')
+          const index = config.plugins.findIndex((plugin) => plugin.name === 'boring-mail-host-auth:finalizer')
           ;(config.plugins as Plugin[]).splice(index, 1)
         },
       }],

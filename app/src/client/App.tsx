@@ -17,7 +17,7 @@ seedMailWorkbenchSourceOpen()
 export function App() {
   return (
     <WorkspaceAgentFront
-      workspaceId="boring-mail"
+      workspaceId="default"
       agentTypeId="default"
       apiBaseUrl=""
       persistenceEnabled={false}

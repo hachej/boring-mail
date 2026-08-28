@@ -2,35 +2,47 @@ import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { AGENT_API_PORT, VITE_PORT, startBoringMailPlaygroundServer } from './src/server/dev'
+import { createStandaloneHostAuth, resolveStandaloneDeploymentConfig } from './src/server/standaloneHostAuth'
 
-export default defineConfig({
-  plugins: [
-    react(),
-    {
-      name: 'boring-mail-agent-backend',
-      async configureServer() {
-        await startBoringMailPlaygroundServer()
+const fsAllow = [
+  resolve(__dirname),
+  resolve(__dirname, '../boring-mail'),
+  // published @hachej deps live in the workspace-root node_modules
+  resolve(__dirname, '..'),
+]
+
+export default defineConfig(({ command }) => {
+  if (command !== 'serve') {
+    return {
+      plugins: [react()],
+      server: { fs: { allow: fsAllow } },
+    }
+  }
+
+  const deployment = resolveStandaloneDeploymentConfig({
+    backendPort: AGENT_API_PORT,
+    defaultVitePort: VITE_PORT,
+  })
+  const hostAuth = createStandaloneHostAuth(deployment)
+
+  return {
+    plugins: [
+      hostAuth.plugins[0],
+      react(),
+      {
+        name: 'boring-mail-agent-backend',
+        async configureServer() {
+          await startBoringMailPlaygroundServer({
+            browserAuthPolicy: hostAuth.browserAuthPolicy,
+            deployment,
+          })
+        },
       },
+      hostAuth.plugins[1],
+    ],
+    server: {
+      ...hostAuth.viteServer,
+      fs: { allow: fsAllow },
     },
-  ],
-  server: {
-    port: VITE_PORT,
-    host: true,
-    hmr: {
-      host: process.env.VITE_HMR_HOST ?? '100.68.199.114',
-      clientPort: Number(process.env.VITE_HMR_CLIENT_PORT ?? VITE_PORT),
-    },
-    fs: {
-      allow: [
-        resolve(__dirname),
-        resolve(__dirname, '../boring-mail'),
-        // published @hachej deps live in the workspace-root node_modules
-        resolve(__dirname, '..'),
-      ],
-    },
-    proxy: {
-      '/api/v1': `http://127.0.0.1:${AGENT_API_PORT}`,
-      '/api/boring-mail': `http://127.0.0.1:${AGENT_API_PORT}`,
-    },
-  },
+  }
 })
