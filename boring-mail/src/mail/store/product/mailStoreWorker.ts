@@ -10,7 +10,13 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
-import { listUnifiedInbox, openMsgvaultStore, resolveReplyTarget } from '../msgvaultAdapter.js'
+import {
+  currentMsgvaultDataVersion,
+  listUnifiedInboxInSnapshot,
+  openMsgvaultStore,
+  resolveReplyTarget,
+} from '../msgvaultAdapter.js'
+import { readMsgvaultGmailReadSourceSnapshot } from '../msgvault/readSources.js'
 import { ProductStore } from './ProductStore.js'
 import type {
   MailStoreWorkerConfig,
@@ -154,6 +160,28 @@ async function start(): Promise<void> {
       upsertAccount: (input) => productStore.upsertAccount(input),
       saveDraft: (input, id) => productStore.saveDraft(input, id),
       getDraft: (id) => productStore.getDraft(id),
+      reconcileMsgvaultReadSources: () => {
+        if (!vault) {
+          throw new ProductStoreError(
+            'msgvault_unavailable',
+            'REMEDIATION: configure msgvaultDbPath before reconciling msgvault read sources',
+          )
+        }
+        vault.db.exec('BEGIN DEFERRED')
+        try {
+          const before = currentMsgvaultDataVersion(vault.db)
+          const result = productStore.reconcileMsgvaultReadSources(readMsgvaultGmailReadSourceSnapshot(vault.db))
+          vault.db.exec('COMMIT')
+          if (currentMsgvaultDataVersion(vault.db) !== before) {
+            throw new ProductStoreError('stale_cursor', 'msgvault changed while reconciling read sources')
+          }
+          return result
+        } catch (error) {
+          try { vault.db.exec('ROLLBACK') } catch { /* preserve original failure */ }
+          throw error
+        }
+      },
+      setReadSourceEnabled: (sourceId, enabled) => productStore.setReadSourceEnabled(sourceId, enabled),
       listUnifiedInbox: (options) => {
         if (!vault) {
           throw new ProductStoreError(
@@ -161,12 +189,26 @@ async function start(): Promise<void> {
             'REMEDIATION: configure msgvaultDbPath before listing the unified inbox',
           )
         }
-        return listUnifiedInbox(
-          vault.db,
-          productStore.connectedInboxSources(),
-          cursorAuthority,
-          options,
-        )
+        vault.db.exec('BEGIN DEFERRED')
+        try {
+          const before = currentMsgvaultDataVersion(vault.db)
+          productStore.reconcileMsgvaultReadSources(readMsgvaultGmailReadSourceSnapshot(vault.db))
+          const page = listUnifiedInboxInSnapshot(
+            vault.db,
+            productStore.connectedInboxSources(),
+            cursorAuthority,
+            before,
+            options,
+          )
+          vault.db.exec('COMMIT')
+          if (currentMsgvaultDataVersion(vault.db) !== before) {
+            throw new ProductStoreError('stale_cursor', 'msgvault changed while reading a unified inbox page')
+          }
+          return page
+        } catch (error) {
+          try { vault.db.exec('ROLLBACK') } catch { /* preserve original failure */ }
+          throw error
+        }
       },
       getOutbox: (id) => productStore.outbox.get(id),
       listAttention: (openOnly) => productStore.outbox.listAttention(openOnly),

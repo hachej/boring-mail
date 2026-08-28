@@ -24,6 +24,8 @@ if (workerData?.silentStartup) {
     const values = {
       upsertAccount: undefined,
       getDraft: null,
+      reconcileMsgvaultReadSources: { inserted: 0, updated: 0, vanished: 0, generation: 'fixture' },
+      setReadSourceEnabled: undefined,
       listUnifiedInbox: { items: [], nextCursor: null },
       listAttention: [],
       claimNext: null,

@@ -11,6 +11,7 @@ import type {
   HumanDecisionOutbox,
   OutboxRecord,
   RejectedOutbox,
+  ReadSourceReconcileResult,
   SentOutbox,
   UnifiedInboxOptions,
   UnifiedInboxPage,
@@ -26,6 +27,8 @@ export interface MailStoreMethods {
   upsertAccount: (input: AccountInput) => void
   saveDraft: (input: DraftInput, requestedId?: string) => DraftRecord
   getDraft: (id: string) => DraftRecord | null
+  reconcileMsgvaultReadSources: () => ReadSourceReconcileResult
+  setReadSourceEnabled: (sourceId: number, enabled: boolean) => void
   listUnifiedInbox: (options?: UnifiedInboxOptions) => UnifiedInboxPage
   getOutbox: (id: string) => OutboxRecord | null
   listAttention: (openOnly?: boolean) => AttentionItem[]

@@ -12,6 +12,7 @@ import {
   type UnifiedInboxOptions,
   type UnifiedInboxPage,
 } from '../product/types.js'
+import { normalizeAndTruncateProviderEmail, normalizeAndTruncateProviderText } from '../../shared/textBounds.js'
 
 /** @internal Product-owned source eligibility supplied to the adapter worker. */
 export interface EligibleInboxSource {
@@ -107,8 +108,16 @@ export function correlatableMessageId(value: unknown): string | null {
   return value
 }
 
-const UNIFIED_INBOX_MAX_LIMIT = 200
+const UNIFIED_INBOX_MAX_LIMIT = 50
 const MAX_CURSOR_LENGTH = 2_048
+const SENDER_NAME_BYTES = 512
+const SENDER_EMAIL_BYTES = 320
+const SUBJECT_BYTES = 1_024
+const SNIPPET_BYTES = 2_048
+const SENDER_NAME_PREFIX_CHARS = SENDER_NAME_BYTES + 1
+const SENDER_EMAIL_PREFIX_CHARS = SENDER_EMAIL_BYTES + 1
+const SUBJECT_PREFIX_CHARS = SUBJECT_BYTES + 1
+const SNIPPET_PREFIX_CHARS = SNIPPET_BYTES + 1
 
 interface UnifiedCursorPayload {
   v: 1
@@ -120,7 +129,7 @@ interface UnifiedCursorPayload {
 }
 
 function boundedLimit(value: number | undefined): number {
-  const selected = value ?? 50
+  const selected = value ?? 30
   if (!Number.isSafeInteger(selected) || selected < 1 || selected > UNIFIED_INBOX_MAX_LIMIT) {
     throw new ProductStoreError(
       'invalid_input',
@@ -143,6 +152,21 @@ function nullableText(value: unknown, name: string): string | null {
 function booleanInteger(value: unknown, name: string): boolean {
   if (value !== 0 && value !== 1) throw new ProductStoreError('corrupt_data', `${name} must be 0 or 1`)
   return value === 1
+}
+function booleanSentinel(value: unknown, name: string): boolean {
+  if (value === null || value === undefined) return false
+  return booleanInteger(value, name)
+}
+function boundedTextField(value: unknown, overflow: unknown, name: string, maxBytes: number): { value: string | null; truncated: boolean } {
+  const text = nullableText(value, name)
+  if (text === null) return { value: null, truncated: booleanSentinel(overflow, `${name}_overflow`) }
+  const normalized = normalizeAndTruncateProviderText(text, maxBytes)
+  return { value: normalized.value, truncated: booleanSentinel(overflow, `${name}_overflow`) || normalized.truncated }
+}
+function boundedEmailField(value: unknown, overflow: unknown, name: string, maxBytes: number): { value: string | null; truncated: boolean } {
+  const text = nullableText(value, name)
+  const normalized = normalizeAndTruncateProviderEmail(text, maxBytes)
+  return { value: normalized.value, truncated: booleanSentinel(overflow, `${name}_overflow`) || normalized.truncated }
 }
 function dataVersion(db: DatabaseSync): number {
   const row = db.prepare('PRAGMA data_version').get() as { data_version?: unknown }
@@ -265,20 +289,32 @@ function decodeUnifiedInboxItem(row: Record<string, unknown>): UnifiedInboxItem 
   if (!Number.isSafeInteger(attachmentCount) || Number(attachmentCount) < 0) {
     throw new ProductStoreError('corrupt_data', 'attachment_count must be a non-negative safe integer')
   }
+  const subject = boundedTextField(row.subject, row.subject_overflow, 'subject', SUBJECT_BYTES)
+  const snippet = boundedTextField(row.snippet, row.snippet_overflow, 'snippet', SNIPPET_BYTES)
+  const senderName = boundedTextField(row.sender_name, row.sender_name_overflow, 'sender_name', SENDER_NAME_BYTES)
+  const senderEmail = boundedEmailField(row.sender_email, row.sender_email_overflow, 'sender_email', SENDER_EMAIL_BYTES)
   return {
     messageId: positiveInteger(row.message_id, 'message_id'),
     conversationId: positiveInteger(row.conversation_id, 'conversation_id'),
     sourceId: positiveInteger(row.source_id, 'source_id'),
     sourceIdentifier: row.source_identifier,
     rfc822MessageId: rfc822,
-    subject: nullableText(row.subject, 'subject'),
-    snippet: nullableText(row.snippet, 'snippet'),
+    subject: subject.value,
+    snippet: snippet.value,
+    senderName: senderName.value,
+    senderEmail: senderEmail.value,
     // msgvault v0.19's validated recency index orders this canonical UTC form.
     messageAt: row.message_at === null ? null : canonicalUtcTimestamp(row.message_at, 'message_at'),
     unread: !booleanInteger(row.is_read, 'is_read'),
     hasAttachments: Number(attachmentCount) > 0,
     coalesced: copyCount > 1,
     copyCount,
+    textTruncated: {
+      senderName: senderName.truncated,
+      senderEmail: senderEmail.truncated,
+      subject: subject.truncated,
+      snippet: snippet.truncated,
+    },
   }
 }
 
@@ -335,8 +371,14 @@ function unifiedInboxSql(
                candidate.source_id,
                source.identifier AS source_identifier,
                boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
-               candidate.subject,
-               candidate.snippet,
+               substr(candidate.subject,1,${SUBJECT_PREFIX_CHARS}) AS subject,
+               CASE WHEN candidate.subject IS NOT NULL AND length(candidate.subject)>${SUBJECT_PREFIX_CHARS} THEN 1 ELSE 0 END AS subject_overflow,
+               substr(candidate.snippet,1,${SNIPPET_PREFIX_CHARS}) AS snippet,
+               CASE WHEN candidate.snippet IS NOT NULL AND length(candidate.snippet)>${SNIPPET_PREFIX_CHARS} THEN 1 ELSE 0 END AS snippet_overflow,
+               substr(sender.display_name,1,${SENDER_NAME_PREFIX_CHARS}) AS sender_name,
+               CASE WHEN sender.display_name IS NOT NULL AND length(sender.display_name)>${SENDER_NAME_PREFIX_CHARS} THEN 1 ELSE 0 END AS sender_name_overflow,
+               substr(sender.email_address,1,${SENDER_EMAIL_PREFIX_CHARS}) AS sender_email,
+               CASE WHEN sender.email_address IS NOT NULL AND length(sender.email_address)>${SENDER_EMAIL_PREFIX_CHARS} THEN 1 ELSE 0 END AS sender_email_overflow,
                ${timestamp} AS message_at,
                candidate.is_read,
                candidate.attachment_count,
@@ -350,6 +392,7 @@ function unifiedInboxSql(
             ON conversation.id=candidate.conversation_id
            AND conversation.source_id=candidate.source_id
           JOIN sources source ON source.id=candidate.source_id
+          LEFT JOIN participants sender ON sender.id=candidate.sender_id
          WHERE ${replyableEmail('candidate', 'conversation')}
       ),
       ranked_candidates AS MATERIALIZED (
@@ -362,8 +405,9 @@ function unifiedInboxSql(
           FROM source_candidates
       )
       SELECT message_id,conversation_id,source_id,source_identifier,
-             valid_rfc822_message_id,subject,snippet,message_at,is_read,
-             attachment_count,copy_count
+             valid_rfc822_message_id,subject,subject_overflow,snippet,snippet_overflow,
+             sender_name,sender_name_overflow,sender_email,sender_email_overflow,
+             message_at,is_read,attachment_count,copy_count
         FROM ranked_candidates ranked
        WHERE representative_rank=1
          ${representativeKeyset}
@@ -440,8 +484,14 @@ function unifiedInboxSql(
            candidate.source_id,
            source.identifier AS source_identifier,
            candidate.valid_rfc822_message_id,
-           candidate.subject,
-           candidate.snippet,
+           substr(candidate.subject,1,${SUBJECT_PREFIX_CHARS}) AS subject,
+           CASE WHEN candidate.subject IS NOT NULL AND length(candidate.subject)>${SUBJECT_PREFIX_CHARS} THEN 1 ELSE 0 END AS subject_overflow,
+           substr(candidate.snippet,1,${SNIPPET_PREFIX_CHARS}) AS snippet,
+           CASE WHEN candidate.snippet IS NOT NULL AND length(candidate.snippet)>${SNIPPET_PREFIX_CHARS} THEN 1 ELSE 0 END AS snippet_overflow,
+           substr(sender.display_name,1,${SENDER_NAME_PREFIX_CHARS}) AS sender_name,
+           CASE WHEN sender.display_name IS NOT NULL AND length(sender.display_name)>${SENDER_NAME_PREFIX_CHARS} THEN 1 ELSE 0 END AS sender_name_overflow,
+           substr(sender.email_address,1,${SENDER_EMAIL_PREFIX_CHARS}) AS sender_email,
+           CASE WHEN sender.email_address IS NOT NULL AND length(sender.email_address)>${SENDER_EMAIL_PREFIX_CHARS} THEN 1 ELSE 0 END AS sender_email_overflow,
            COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) AS message_at,
            candidate.is_read,
            candidate.attachment_count,
@@ -449,6 +499,7 @@ function unifiedInboxSql(
       FROM selected_correlations selected
       JOIN recent_candidates candidate ON candidate.id=selected.message_id
       JOIN sources source ON source.id=candidate.source_id
+      LEFT JOIN participants sender ON sender.id=candidate.sender_id
      ORDER BY COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) DESC NULLS LAST,
               candidate.id DESC
      LIMIT ?
@@ -481,10 +532,15 @@ export function explainUnifiedInboxQueryPlan(
   })
 }
 
-export function listUnifiedInbox(
+export function currentMsgvaultDataVersion(db: DatabaseSync): number {
+  return dataVersion(db)
+}
+
+export function listUnifiedInboxInSnapshot(
   db: DatabaseSync,
   eligibleSources: EligibleInboxSource[],
   authority: UnifiedInboxCursorAuthority,
+  snapshotDataVersion: number,
   input: UnifiedInboxOptions | undefined = {},
 ): UnifiedInboxPage {
   if (!authority || typeof authority.scope !== 'string' || !authority.scope ||
@@ -500,71 +556,78 @@ export function listUnifiedInbox(
   const limit = boundedLimit(opts.limit)
   const capabilities = requireUnifiedCapabilities(db)
   const eligible = sourceInput(eligibleSources)
+  const cursor = opts.cursor !== undefined
+    ? readCursor(opts.cursor, authority, snapshotDataVersion, eligible.digest)
+    : null
+  if (eligibleSources.length === 0) {
+    return { items: [], nextCursor: null }
+  }
 
+  authority.beforePageQuery?.()
+  const run = (
+    mode: UnifiedKeysetMode,
+    args: Array<string | number | null>,
+    wanted: number,
+    strategy: UnifiedQueryStrategy,
+  ) => {
+    const strategyArgs = strategy === 'recent-window'
+      ? [...args, Math.max(MIN_RECENT_SCAN_WINDOW, wanted * 10), wanted]
+      : [...args, wanted]
+    return db.prepare(unifiedInboxSql(capabilities, mode, strategy)).all(
+      eligible.json, ...strategyArgs,
+    ) as Array<Record<string, unknown>>
+  }
+  const adaptive = (mode: UnifiedKeysetMode, args: Array<string | number | null>, wanted: number) => {
+    const recent = run(mode, args, wanted, 'recent-window')
+    return recent.length >= wanted
+      ? { rows: recent, strategy: 'recent-window' as const }
+      : { rows: run(mode, args, wanted, 'source-fallback'), strategy: 'source-fallback' as const }
+  }
+  const wanted = limit + 1
+  let selected: { rows: Array<Record<string, unknown>>; strategy: UnifiedQueryStrategy }
+  if (!cursor) {
+    selected = adaptive('all', [], wanted)
+  } else if (cursor.t === null) {
+    selected = adaptive('before-null', [cursor.i], wanted)
+  } else {
+    selected = adaptive('before-timestamp', [cursor.t, cursor.t, cursor.i], wanted)
+    if (selected.rows.length < wanted) {
+      // A timestamp-phase shortfall must have discarded the recent window.
+      if (selected.strategy !== 'source-fallback') {
+        throw new ProductStoreError('corrupt_data', 'unified inbox adaptive strategy violated its exactness invariant')
+      }
+      selected.rows.push(...run('all-null', [], wanted - selected.rows.length, selected.strategy))
+    }
+  }
+  const rows = selected.rows
+  const hasMore = rows.length > limit
+  const items = rows.slice(0, limit).map(decodeUnifiedInboxItem)
+  const last = items.at(-1)
+  return {
+    items,
+    nextCursor: hasMore && last
+      ? encodeCursor({
+          v: 1,
+          s: authority.scope,
+          d: snapshotDataVersion,
+          e: eligible.digest,
+          t: last.messageAt,
+          i: last.messageId,
+        })
+      : null,
+  }
+}
+
+export function listUnifiedInbox(
+  db: DatabaseSync,
+  eligibleSources: EligibleInboxSource[],
+  authority: UnifiedInboxCursorAuthority,
+  input: UnifiedInboxOptions | undefined = {},
+): UnifiedInboxPage {
   db.exec('BEGIN DEFERRED')
   try {
     const version = dataVersion(db)
-    const cursor = opts.cursor !== undefined
-      ? readCursor(opts.cursor, authority, version, eligible.digest)
-      : null
-    if (eligibleSources.length === 0) {
-      db.exec('COMMIT')
-      return { items: [], nextCursor: null }
-    }
-
-    authority.beforePageQuery?.()
-    const run = (
-      mode: UnifiedKeysetMode,
-      args: Array<string | number | null>,
-      wanted: number,
-      strategy: UnifiedQueryStrategy,
-    ) => {
-      const strategyArgs = strategy === 'recent-window'
-        ? [...args, Math.max(MIN_RECENT_SCAN_WINDOW, wanted * 10), wanted]
-        : [...args, wanted]
-      return db.prepare(unifiedInboxSql(capabilities, mode, strategy)).all(
-        eligible.json, ...strategyArgs,
-      ) as Array<Record<string, unknown>>
-    }
-    const adaptive = (mode: UnifiedKeysetMode, args: Array<string | number | null>, wanted: number) => {
-      const recent = run(mode, args, wanted, 'recent-window')
-      return recent.length >= wanted
-        ? { rows: recent, strategy: 'recent-window' as const }
-        : { rows: run(mode, args, wanted, 'source-fallback'), strategy: 'source-fallback' as const }
-    }
-    const wanted = limit + 1
-    let selected: { rows: Array<Record<string, unknown>>; strategy: UnifiedQueryStrategy }
-    if (!cursor) {
-      selected = adaptive('all', [], wanted)
-    } else if (cursor.t === null) {
-      selected = adaptive('before-null', [cursor.i], wanted)
-    } else {
-      selected = adaptive('before-timestamp', [cursor.t, cursor.t, cursor.i], wanted)
-      if (selected.rows.length < wanted) {
-        // A timestamp-phase shortfall must have discarded the recent window.
-        if (selected.strategy !== 'source-fallback') {
-          throw new ProductStoreError('corrupt_data', 'unified inbox adaptive strategy violated its exactness invariant')
-        }
-        selected.rows.push(...run('all-null', [], wanted - selected.rows.length, selected.strategy))
-      }
-    }
-    const rows = selected.rows
-    const hasMore = rows.length > limit
-    const items = rows.slice(0, limit).map(decodeUnifiedInboxItem)
-    const last = items.at(-1)
-    const page = {
-      items,
-      nextCursor: hasMore && last
-        ? encodeCursor({
-            v: 1,
-            s: authority.scope,
-            d: version,
-            e: eligible.digest,
-            t: last.messageAt,
-            i: last.messageId,
-          })
-        : null,
-    }
+    const page = listUnifiedInboxInSnapshot(db, eligibleSources, authority, version, input)
     db.exec('COMMIT')
     if (dataVersion(db) !== version) {
       throw new ProductStoreError('stale_cursor', 'msgvault changed while reading a unified inbox page')

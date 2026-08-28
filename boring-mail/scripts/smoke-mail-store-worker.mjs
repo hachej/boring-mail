@@ -142,23 +142,28 @@ try {
     () => { throw new Error('malformed unified inbox options were accepted') },
     (error) => { if (error?.code !== 'invalid_input') throw error },
   )
-  await store.upsertAccount({
-    accountId: 'smoke', providerSourceId: 1,
-    primaryAddress: 'smoke@example.test', sendAs: ['smoke@example.test'], connected: false,
-  })
+  await store.setReadSourceEnabled(1, false)
   await store.listUnifiedInbox({ cursor: firstInboxPage.nextCursor }).then(
-    () => { throw new Error('account eligibility mutation did not invalidate unified inbox cursor') },
+    () => { throw new Error('read eligibility mutation did not invalidate unified inbox cursor') },
     (error) => { if (error?.code !== 'stale_cursor') throw error },
   )
-  await store.upsertAccount({
-    accountId: 'smoke', providerSourceId: 1,
-    primaryAddress: 'smoke@example.test', sendAs: ['smoke@example.test'], connected: true,
-  })
+  await store.setReadSourceEnabled(1, true)
+  const identityCursor = (await store.listUnifiedInbox({ limit: 1 })).nextCursor
+  if (!identityCursor) throw new Error('identity cursor fixture did not produce a next page')
+  const identityWriter = new DatabaseSync(msgvaultDbPath)
+  identityWriter.exec(`INSERT INTO account_identities(source_id,address) VALUES(1,'alias-smoke@example.test')`)
+  identityWriter.close()
+  await store.listUnifiedInbox({ cursor: identityCursor }).then(
+    () => { throw new Error('read identity mutation did not invalidate unified inbox cursor') },
+    (error) => { if (error?.code !== 'stale_cursor') throw error },
+  )
+  const dataCursor = (await store.listUnifiedInbox({ limit: 1 })).nextCursor
+  if (!dataCursor) throw new Error('data cursor fixture did not produce a next page')
   const msgvaultWriter = new DatabaseSync(msgvaultDbPath)
   msgvaultWriter.exec(`INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,subject,sent_at,is_read,attachment_count)
     VALUES(4,1,1,'<four@example.test>','email','four','2030-01-04 00:00:00+00:00',1,0)`)
   msgvaultWriter.close()
-  await store.listUnifiedInbox({ cursor: firstInboxPage.nextCursor }).then(
+  await store.listUnifiedInbox({ cursor: dataCursor }).then(
     () => { throw new Error('sync mutation did not invalidate unified inbox cursor') },
     (error) => { if (error?.code !== 'stale_cursor') throw error },
   )
@@ -270,11 +275,12 @@ try {
   const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)))
   symlinkSync(packageRoot, join(scope, 'boring-mail'), 'dir')
   writeFileSync(join(consumer, 'index.ts'), `
-    import { openMailStore, ProductStoreError, type DraftInput, type MailStore, type UnifiedInboxPage } from '@hachej/boring-mail/mail-store'
+    import { openMailStore, ProductStoreError, type DraftInput, type MailStore, type ReadSourceReconcileResult, type UnifiedInboxPage } from '@hachej/boring-mail/mail-store'
     const draft: DraftInput = { kind: 'compose', path: 'x.mail.md', accountId: 'a', sendAsAddress: 'a@x', to: ['b@x'], subject: '', bodyMarkdown: '' }
     const opened: Promise<MailStore> = openMailStore({ productDbPath: '/tmp/example.db' })
     const page: Promise<UnifiedInboxPage> = opened.then((store) => store.listUnifiedInbox({ limit: 25 }))
-    void draft; void opened; void page; void ProductStoreError
+    const reconcile: Promise<ReadSourceReconcileResult> = opened.then((store) => store.reconcileMsgvaultReadSources())
+    void draft; void opened; void page; void reconcile; void ProductStoreError
   `)
   writeFileSync(join(consumer, 'tsconfig.json'), JSON.stringify({ compilerOptions: {
     strict: true, noEmit: true, target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', skipLibCheck: false,

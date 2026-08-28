@@ -86,8 +86,8 @@ function runScenario(name, options) {
     const pages = []
     const seen = []
     let cursor
-    for (let pageNumber = 0; pageNumber < 5 && seen.length < expectedIds.length; pageNumber++) {
-      const timed = timedPage(store.db, eligible, authority, { limit: 200, ...(cursor ? { cursor } : {}) })
+    for (let pageNumber = 0; pageNumber < 20 && seen.length < expectedIds.length; pageNumber++) {
+      const timed = timedPage(store.db, eligible, authority, { limit: 50, ...(cursor ? { cursor } : {}) })
       pages.push(timed.elapsedMs)
       seen.push(...timed.page.items.map((item) => item.messageId))
       cursor = timed.page.nextCursor ?? undefined
@@ -100,7 +100,7 @@ function runScenario(name, options) {
     if (seen.length < Math.min(800, expectedIds.length)) {
       throw new Error(`${name} did not traverse a meaningful deep page`)
     }
-    const first = listUnifiedInbox(store.db, eligible, authority, { limit: 200 })
+    const first = listUnifiedInbox(store.db, eligible, authority, { limit: 50 })
     if (highFanout > 0) {
       const group = first.items.find((item) => item.rfc822MessageId === '<high-fanout@bench.test>')
       if (!group || group.messageId !== prefix + 1 || group.copyCount !== highFanout || !group.coalesced) {

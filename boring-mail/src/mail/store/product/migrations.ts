@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { ProductStoreError } from './types.js'
 
-export const PRODUCT_SCHEMA_VERSION = 1
+export const PRODUCT_SCHEMA_VERSION = 2
 
 const V1_SCHEMA = `
 CREATE TABLE mail_accounts (
@@ -9,6 +9,14 @@ CREATE TABLE mail_accounts (
  primary_address TEXT NOT NULL,
  send_as_json TEXT NOT NULL CHECK(json_valid(send_as_json) AND json_type(send_as_json)='array'),
  connected INTEGER NOT NULL CHECK(connected IN(0,1)), created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL
+) STRICT;
+CREATE TABLE mail_read_sources (
+ source_id INTEGER PRIMARY KEY,
+ exact_identifier TEXT NOT NULL,
+ identities_json TEXT NOT NULL CHECK(json_valid(identities_json) AND json_type(identities_json)='array'),
+ enabled INTEGER NOT NULL CHECK(enabled IN(0,1)),
+ present INTEGER NOT NULL CHECK(present IN(0,1)),
+ reconciled_ms INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE mail_drafts (
  id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, revision INTEGER NOT NULL CHECK(revision>0),
@@ -172,6 +180,20 @@ export function migrateProductDatabase(db: DatabaseSync): void {
       const existing = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'mail_%'`).all()
       if (existing.length) throw new ProductStoreError('unsupported_schema', 'unversioned product tables found')
       db.exec(V1_SCHEMA)
+      db.exec(`PRAGMA user_version=${PRODUCT_SCHEMA_VERSION}`)
+    } else if (version === 1) {
+      db.exec(`CREATE TABLE mail_read_sources (
+ source_id INTEGER PRIMARY KEY,
+ exact_identifier TEXT NOT NULL,
+ identities_json TEXT NOT NULL CHECK(json_valid(identities_json) AND json_type(identities_json)='array'),
+ enabled INTEGER NOT NULL CHECK(enabled IN(0,1)),
+ present INTEGER NOT NULL CHECK(present IN(0,1)),
+ reconciled_ms INTEGER NOT NULL
+) STRICT;`)
+      db.exec(`INSERT INTO mail_read_sources(source_id,exact_identifier,identities_json,enabled,present,reconciled_ms)
+        SELECT provider_source_id,primary_address,send_as_json,1,1,updated_ms
+          FROM mail_accounts WHERE connected=1
+        ON CONFLICT(source_id) DO NOTHING`)
       db.exec(`PRAGMA user_version=${PRODUCT_SCHEMA_VERSION}`)
     }
     validate(db)

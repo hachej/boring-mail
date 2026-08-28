@@ -156,6 +156,12 @@ export interface AttentionItem {
   readonly resolvedAt: number | null
 }
 /** One globally correlated inbox message from its selected connected copy. */
+export interface UnifiedInboxTextTruncation {
+  senderName: boolean
+  senderEmail: boolean
+  subject: boolean
+  snippet: boolean
+}
 export interface UnifiedInboxItem {
   messageId: number
   conversationId: number
@@ -164,11 +170,14 @@ export interface UnifiedInboxItem {
   rfc822MessageId: string | null
   subject: string | null
   snippet: string | null
+  senderName: string | null
+  senderEmail: string | null
   messageAt: string | null
   unread: boolean
   hasAttachments: boolean
   coalesced: boolean
   copyCount: number
+  textTruncated: UnifiedInboxTextTruncation
 }
 export interface UnifiedInboxOptions {
   limit?: number
@@ -180,6 +189,18 @@ export interface UnifiedInboxPage {
   nextCursor: string | null
 }
 
+export interface MsgvaultReadSourceInput {
+  sourceId: number
+  exactIdentifier: string
+  identities: string[]
+}
+export interface ReadSourceReconcileResult {
+  inserted: number
+  updated: number
+  vanished: number
+  generation: string
+}
+
 export interface AccountInput {
   accountId: string
   providerSourceId: number
@@ -187,7 +208,7 @@ export interface AccountInput {
   sendAs: string[]
   connected?: boolean
 }
-/** @internal Strictly decoded product-account eligibility for unified reads. */
+/** @internal Strictly decoded product read-source eligibility for unified reads. */
 export interface ConnectedInboxSource {
   sourceId: number
   identities: string[]

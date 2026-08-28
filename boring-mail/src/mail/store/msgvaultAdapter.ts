@@ -15,6 +15,8 @@ import { ProductStoreError } from './product/types.js'
 import {
   openMsgvaultReadOnly,
   readMsgvaultTableColumns,
+  validateMsgvaultAccountIdentitiesSchema,
+  validateMsgvaultMessageBodiesSchema,
   validateMsgvaultSourcesSchema,
   type MsgvaultSchemaColumn,
 } from './msgvault/schema.js'
@@ -56,8 +58,10 @@ export interface MessageBody {
 
 export {
   correlatableMessageId,
+  currentMsgvaultDataVersion,
   explainUnifiedInboxQueryPlan,
   listUnifiedInbox,
+  listUnifiedInboxInSnapshot,
 } from './msgvault/unifiedInboxProjection.js'
 export type {
   EligibleInboxSource,
@@ -114,6 +118,8 @@ const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
   message_raw: ['message_id', 'raw_data', 'raw_format', 'compression'],
   attachments: ['id', 'message_id', 'filename', 'mime_type', 'size', 'content_hash', 'storage_path'],
   messages_fts: ['message_id'],
+  account_identities: ['source_id', 'address', 'source_signal', 'confirmed_at'],
+  message_bodies: ['message_id', 'body_text', 'body_html'],
 }
 
 /**
@@ -170,6 +176,12 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
         columnErrors.push('conversations.source_id must be a NOT NULL integer')
       }
     }
+    if (table === 'account_identities') {
+      columnErrors.push(...validateMsgvaultAccountIdentitiesSchema(columns))
+    }
+    if (table === 'message_bodies') {
+      columnErrors.push(...validateMsgvaultMessageBodiesSchema(columns))
+    }
     if (table === 'message_recipients') {
       const message = columns.find((column) => column.name === 'message_id')
       const recipientType = columns.find((column) => column.name === 'recipient_type')
@@ -186,16 +198,20 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
     }
   }
   const capabilities = inspectIndexCapabilities(db)
+  const conversationIndex = db.prepare(`PRAGMA index_info(idx_messages_conversation)`).all() as Array<{ name: string | null }>
+  const conversationIndexValid = conversationIndex[0]?.name === 'conversation_id' &&
+    conversationIndex[1]?.name === 'sent_at' && conversationIndex.length === 2
   const ftsRow = db.prepare(`SELECT sql FROM sqlite_master WHERE name='messages_fts'`).get() as
     | { sql: string | null }
     | undefined
   const invalidFts =
     have.has('messages_fts') && !/CREATE\s+VIRTUAL\s+TABLE[\s\S]*USING\s+fts5/i.test(ftsRow?.sql ?? '')
-  if (missingTables.length > 0 || columnErrors.length > 0 || invalidFts || capabilities.errors.length > 0) {
+  if (missingTables.length > 0 || columnErrors.length > 0 || invalidFts || !conversationIndexValid || capabilities.errors.length > 0) {
     const details = [
       missingTables.length > 0 ? `missing table(s): ${missingTables.join(', ')}` : '',
       ...columnErrors,
       invalidFts ? 'messages_fts is not an FTS5 virtual table' : '',
+      !conversationIndexValid ? 'messages requires idx_messages_conversation(conversation_id,sent_at DESC)' : '',
       ...capabilities.errors,
     ]
       .filter(Boolean)

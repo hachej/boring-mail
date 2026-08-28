@@ -41,7 +41,8 @@ describe('msgvaultAdapter — unified inbox projection', () => {
         (1001,'ALIAS-A@example.com',NULL,'example.com'),
         (1002,'alias-a@example.com',NULL,'example.com'),
         (1003,'owner-b@example.com',NULL,'example.com'),
-        (1004,'disconnected@example.com',NULL,'example.com');
+        (1004,'disconnected@example.com',NULL,'example.com'),
+        (1005,'sender@example.com','Sender Name','example.com');
     `)
     const insert = raw.prepare(`INSERT INTO messages(
       id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,
@@ -81,6 +82,10 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     message(402, 11, 1, '<stable@example.com>', '2030-01-02 00:00:00+00:00', 'source one')
 
     message(601, 11, 1, '<single@example.com>', '2030-01-01 00:00:00+00:00', 'singleton')
+    raw.prepare(`UPDATE messages SET sender_id=1005,snippet=?,subject=? WHERE id=601`).run(
+      'quote " '.repeat(3_000),
+      'é'.repeat(2_000),
+    )
     message(602, 11, 1, null, '2029-12-31 00:00:00+00:00', 'missing id')
     message(603, 12, 2, '<equal-b@example.com>', '2029-12-30 00:00:00+00:00', 'equal b')
     message(604, 11, 1, '<equal-a@example.com>', '2029-12-30 00:00:00+00:00', 'equal a')
@@ -157,8 +162,18 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     })
   })
 
+  it('bounds provider text prefixes and maps sender fields without changing page order', () => {
+    const singleton = listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).items.find((item) => item.messageId === 601)!
+    expect(singleton.senderName).toBe('Sender Name')
+    expect(singleton.senderEmail).toBe('sender@example.com')
+    expect(Buffer.byteLength(singleton.subject ?? '', 'utf8')).toBeLessThanOrEqual(1024)
+    expect(Buffer.byteLength(singleton.snippet ?? '', 'utf8')).toBeLessThanOrEqual(2048)
+    expect(singleton.textTruncated.subject).toBe(true)
+    expect(singleton.textTruncated.snippet).toBe(true)
+  })
+
   it('returns only replyable ownership for every correlated item', () => {
-    const items = listUnifiedInbox(store.db, eligible, authority, { limit: 200 }).items
+    const items = listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).items
     for (const item of items) {
       if (item.rfc822MessageId === null) continue
       expect(resolveReplyTarget(store.db, item.messageId)).toEqual({
@@ -199,7 +214,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     } while (cursor)
     expect(seen).toEqual(expected)
     expect(new Set(seen).size).toBe(seen.length)
-    expect(listUnifiedInbox(store.db, eligible, authority, { limit: 200 }).nextCursor).toBeNull()
+    expect(listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).nextCursor).toBeNull()
   })
 
   it('strictly decodes opaque cursors and invalidates eligibility, process and archive changes', () => {
@@ -276,7 +291,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
       store.db, [{ sourceId: 6, identities: ['time@example.com'] }], authority,
     )).toThrowError(expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/canonical UTC/) }))
     expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 0 })).toThrow(/limit must/)
-    expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 201 })).toThrow(/limit must/)
+    expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 51 })).toThrow(/limit must/)
     expect(() => listUnifiedInbox(
       store.db, eligible, authority, null as unknown as Parameters<typeof listUnifiedInbox>[3],
     )).toThrowError(expect.objectContaining({ code: 'invalid_input' }))

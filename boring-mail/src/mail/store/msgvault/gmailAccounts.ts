@@ -12,6 +12,12 @@ function remediation(message: string): Error {
   return new Error(`REMEDIATION: ${message}`)
 }
 
+function validExactGmailIdentifier(account: string): boolean {
+  return account.length > 0 && account.length <= 320 && account === account.trim() &&
+    !/[\s\x00-\x1F\x7F]/u.test(account) &&
+    account.indexOf('@') > 0 && account.indexOf('@') === account.lastIndexOf('@') && !account.endsWith('@')
+}
+
 /** Typed v0.19 archive-reader boundary for Gmail source identifiers. */
 export async function discoverMsgvaultGmailAccounts(
   options: MsgvaultGmailAccountDiscoveryOptions,
@@ -36,8 +42,7 @@ export async function discoverMsgvaultGmailAccounts(
       // msgvault 0.19 resolves source identifiers by exact spelling. Reject
       // surrounding whitespace instead of silently changing the lookup key.
       const account = row.identifier
-      if (!account || account !== account.trim() || account.length > 320 || /[\s\x00-\x1f\x7f]/u.test(account) ||
-          account.indexOf('@') <= 0 || account.indexOf('@') !== account.lastIndexOf('@') || account.endsWith('@')) {
+      if (!validExactGmailIdentifier(account)) {
         throw remediation('msgvault Gmail account identifier is invalid')
       }
       const canonical = account.toLowerCase()

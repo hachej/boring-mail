@@ -42,9 +42,22 @@ CREATE TABLE messages (
 );
 CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);
 CREATE INDEX idx_messages_source ON messages(source_id);
+CREATE INDEX idx_messages_conversation ON messages(conversation_id, sent_at DESC);
 CREATE INDEX idx_messages_live_sent_at
   ON messages(COALESCE(sent_at, received_at, internal_date) DESC, id DESC)
   WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
+CREATE TABLE account_identities (
+  source_id INTEGER NOT NULL,
+  address TEXT NOT NULL,
+  source_signal TEXT NOT NULL DEFAULT '',
+  confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(source_id, address)
+);
+CREATE TABLE message_bodies (
+  message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+  body_text TEXT,
+  body_html TEXT
+);
 CREATE TABLE message_recipients (
   id INTEGER PRIMARY KEY,
   message_id INTEGER NOT NULL REFERENCES messages(id),
