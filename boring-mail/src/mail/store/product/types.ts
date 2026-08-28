@@ -189,6 +189,40 @@ export interface UnifiedInboxPage {
   nextCursor: string | null
 }
 
+export interface UnifiedThreadRecipient {
+  type: 'to' | 'cc' | 'bcc'
+  name: string | null
+  email: string
+}
+export interface UnifiedThreadAttachment {
+  filename: string | null
+  mimeType: string | null
+  byteSize: number | null
+}
+export interface UnifiedThreadMessage {
+  /** Internal retention/budgeting key; bridge mappers must not expose it. */
+  messageId: number
+  /** Internal selected-row marker; bridge mappers must not expose it. */
+  selected: boolean
+  sentAt: string | null
+  sender: { name: string | null; email: string | null }
+  recipients: UnifiedThreadRecipient[]
+  bodyText: string
+  bodyUnavailable: boolean
+  bodyTruncated: boolean
+  attachments: UnifiedThreadAttachment[]
+  metadataTruncated: boolean
+}
+export interface UnifiedThreadDetail {
+  /** Internal selected-row key; bridge mappers must not expose it. */
+  selectedMessageId: number
+  subject: string
+  messages: UnifiedThreadMessage[]
+  historyTruncated: boolean
+  selectedOutsideRecentWindow: boolean
+  replyCapability: { allowed: false; reason: 'drafts_not_in_scope' }
+}
+
 export interface MsgvaultReadSourceInput {
   sourceId: number
   exactIdentifier: string

@@ -12,6 +12,7 @@ import {
 import { dirname } from 'node:path'
 import { openMsgvaultStore, resolveReplyTarget } from '../msgvaultAdapter.js'
 import {
+  getUnifiedThreadWithReconciledSnapshot,
   listUnifiedInboxWithReconciledSnapshot,
   reconcileMsgvaultReadSourcesInSnapshot,
 } from './msgvaultSnapshot.js'
@@ -178,6 +179,15 @@ async function start(): Promise<void> {
           )
         }
         return listUnifiedInboxWithReconciledSnapshot(vault.db, productStore, cursorAuthority, options)
+      },
+      getUnifiedThread: (input) => {
+        if (!vault) {
+          throw new ProductStoreError(
+            'msgvault_unavailable',
+            'REMEDIATION: configure msgvaultDbPath before reading thread detail',
+          )
+        }
+        return getUnifiedThreadWithReconciledSnapshot(vault.db, productStore, input)
       },
       getOutbox: (id) => productStore.outbox.get(id),
       listAttention: (openOnly) => productStore.outbox.listAttention(openOnly),

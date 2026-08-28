@@ -29,7 +29,7 @@ export interface UnifiedInboxCursorAuthority {
   beforePageQuery?: () => void
 }
 
-interface MsgvaultIndexCapabilities {
+export interface MsgvaultIndexCapabilities {
   rfc822: string
   liveRecency: string
   bySource: string
@@ -39,8 +39,11 @@ interface MsgvaultIndexCapabilities {
 }
 const indexCapabilities = new WeakMap<DatabaseSync, MsgvaultIndexCapabilities>()
 
-function quotedIdentifier(value: string): string {
+export function quotedSqlIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`
+}
+function quotedIdentifier(value: string): string {
+  return quotedSqlIdentifier(value)
 }
 interface IndexListRow { name: string; unique: number; origin: string; partial: number }
 interface IndexXInfoRow { seqno: number; cid: number; name: string | null; desc: number; coll: string; key: number }
@@ -363,12 +366,15 @@ function liveMessage(alias: string): string {
 function replyableEmail(message: string, conversation: string): string {
   return `${liveMessage(message)} AND ${message}.message_type='email' AND ${conversation}.conversation_type='email_thread'`
 }
-function requireUnifiedCapabilities(db: DatabaseSync): MsgvaultIndexCapabilities {
+export function getMsgvaultIndexCapabilities(db: DatabaseSync): MsgvaultIndexCapabilities {
   const capabilities = indexCapabilities.get(db)
   if (!capabilities) {
-    throw new ProductStoreError('unsupported_schema', 'msgvault unified-inbox index capabilities are unavailable')
+    throw new ProductStoreError('unsupported_schema', 'msgvault index capabilities are unavailable')
   }
   return capabilities
+}
+function requireUnifiedCapabilities(db: DatabaseSync): MsgvaultIndexCapabilities {
+  return getMsgvaultIndexCapabilities(db)
 }
 function canonicalUtcTimestamp(
   value: unknown,

@@ -64,10 +64,15 @@ export {
   listUnifiedInbox,
   listUnifiedInboxInSnapshot,
 } from './msgvault/unifiedInboxProjection.js'
+export {
+  explainThreadDetailQueryPlans,
+  getUnifiedThreadInSnapshot,
+} from './msgvault/threadDetailProjection.js'
 export type {
   EligibleInboxSource,
   UnifiedInboxCursorAuthority,
 } from './msgvault/unifiedInboxProjection.js'
+export type { MsgvaultIndexCapabilities } from './msgvault/unifiedInboxProjection.js'
 import {
   correlatableMessageId,
   inspectIndexCapabilities,
@@ -247,6 +252,7 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
       integerAffinity(columns.find((column) => column.name === 'message_id'), 'attachments.message_id', true, columnErrors)
       textAffinity(columns.find((column) => column.name === 'filename'), 'attachments.filename', false, columnErrors)
       textAffinity(columns.find((column) => column.name === 'mime_type'), 'attachments.mime_type', false, columnErrors)
+      integerAffinity(columns.find((column) => column.name === 'size'), 'attachments.size', false, columnErrors)
       requireForeignKey(db, 'attachments', 'message_id', 'messages', 'id', columnErrors)
     }
   }

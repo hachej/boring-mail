@@ -41,5 +41,9 @@ export type {
   UnifiedInboxItem,
   UnifiedInboxOptions,
   UnifiedInboxPage,
+  UnifiedThreadAttachment,
+  UnifiedThreadDetail,
+  UnifiedThreadMessage,
+  UnifiedThreadRecipient,
   UnknownOutbox,
 } from './product/types.js'

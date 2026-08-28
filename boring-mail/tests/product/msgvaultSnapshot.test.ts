@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
 import { openProductStore } from '../../src/mail/store/internalProductStore.js'
 import { openMsgvaultStore } from '../../src/mail/store/msgvaultAdapter.js'
-import { listUnifiedInboxWithReconciledSnapshot } from '../../src/mail/store/product/msgvaultSnapshot.js'
+import { getUnifiedThreadWithReconciledSnapshot, listUnifiedInboxWithReconciledSnapshot } from '../../src/mail/store/product/msgvaultSnapshot.js'
 
 const schema = readFileSync(new URL('../fixtures/msgvault-v0.19.sql', import.meta.url), 'utf8')
 
@@ -24,6 +24,7 @@ describe('worker-owned msgvault snapshot orchestration', () => {
       INSERT INTO conversations(id,source_id,conversation_type) VALUES(1,1,'email_thread');
       INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count)
         VALUES(1,1,1,'<old@example.invalid>','email','2030-01-01 00:00:00+00:00','old',1,0);
+      INSERT INTO message_bodies(message_id,body_text,body_html) VALUES(1,'body','<b>html</b>');
     `)
     const vault = openMsgvaultStore(msgvaultPath)
     const product = openProductStore(productPath, {
@@ -44,6 +45,15 @@ describe('worker-owned msgvault snapshot orchestration', () => {
       })).toThrowError(expect.objectContaining({ code: 'stale_cursor' }))
       const fresh = listUnifiedInboxWithReconciledSnapshot(vault.db, product, authority, { limit: 2 })
       expect(fresh.items.map((item) => item.messageId)).toEqual([2, 1])
+      expect(getUnifiedThreadWithReconciledSnapshot(vault.db, product, { messageId: 1 })?.messages).toHaveLength(2)
+      expect(() => getUnifiedThreadWithReconciledSnapshot(vault.db, product, { messageId: 1 }, {
+        afterCatalogCapture: () => writer.exec(`
+          INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count)
+            VALUES(3,1,1,'<race-detail@example.invalid>','email','2030-01-03 00:00:00+00:00','race',1,0);
+        `),
+      })).toThrowError(expect.objectContaining({ code: 'msgvault_unavailable' }))
+      const refreshed = getUnifiedThreadWithReconciledSnapshot(vault.db, product, { messageId: 1 })
+      expect(refreshed?.messages.map((message) => message.messageId)).toEqual([1, 2, 3])
       expect(product.connectedInboxSources()).toEqual([
         { sourceId: 1, identities: ['alias@example.invalid', 'owner@example.invalid'] },
       ])
