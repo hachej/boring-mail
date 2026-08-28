@@ -145,6 +145,26 @@ describe('msgvaultAdapter — bounded authorized thread detail', () => {
     expect(selected.metadataTruncated).toBe(true)
   })
 
+  it('accepts only syntactically valid incomplete terminal UTF-8 prefixes from bounded oversized text', () => {
+    const cases = [
+      Buffer.from([0xc3]),
+      Buffer.from([0xe2]),
+      Buffer.from([0xe2, 0x82]),
+      Buffer.from([0xf0]),
+      Buffer.from([0xf0, 0x9f]),
+      Buffer.from([0xf0, 0x9f, 0x98]),
+    ]
+    for (const suffix of cases) {
+      raw.prepare(`UPDATE messages SET subject=CAST(? AS TEXT) WHERE id=1`).run(Buffer.concat([
+        Buffer.from('a'.repeat(2052 - suffix.length)), suffix, Buffer.from('overflow'),
+      ]))
+      const detail = getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 1 })!
+      expect(detail.subject).toBe('a'.repeat(2048))
+      expect(detail.historyTruncated).toBe(true)
+    }
+    raw.prepare(`UPDATE messages SET subject=NULL WHERE id=1`).run()
+  })
+
   it('fails unavailable-class corruption on malformed retained timestamp/text storage classes', () => {
     expect(() => getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 106 })).toThrowError(
       expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/canonical UTC/) }),
@@ -157,13 +177,22 @@ describe('msgvaultAdapter — bounded authorized thread detail', () => {
     } finally {
       raw.prepare(`UPDATE messages SET subject=NULL WHERE id=1`).run()
     }
-    raw.exec(`UPDATE messages SET subject=CAST(x'61ff62' AS TEXT) WHERE id=1`)
-    try {
-      expect(() => getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 1 })).toThrowError(
-        expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/valid UTF-8/) }),
-      )
-    } finally {
-      raw.prepare(`UPDATE messages SET subject=NULL WHERE id=1`).run()
+    const invalidUtf8Cases = [
+      Buffer.from([0x61, 0xff, 0x62]),
+      Buffer.concat([Buffer.from('a'.repeat(2050)), Buffer.from([0xe0, 0x80]), Buffer.from('overflow')]),
+      Buffer.concat([Buffer.from('a'.repeat(2050)), Buffer.from([0xc0, 0xaf]), Buffer.from('overflow')]),
+      Buffer.concat([Buffer.from('a'.repeat(2050)), Buffer.from([0xed, 0xa0]), Buffer.from('overflow')]),
+      Buffer.concat([Buffer.from('a'.repeat(2050)), Buffer.from([0xf4, 0x90]), Buffer.from('overflow')]),
+    ]
+    for (const bytes of invalidUtf8Cases) {
+      raw.prepare(`UPDATE messages SET subject=CAST(? AS TEXT) WHERE id=1`).run(bytes)
+      try {
+        expect(() => getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 1 })).toThrowError(
+          expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/valid UTF-8/) }),
+        )
+      } finally {
+        raw.prepare(`UPDATE messages SET subject=NULL WHERE id=1`).run()
+      }
     }
     raw.exec(`UPDATE attachments SET size=CAST('bad' AS TEXT) WHERE id=1`)
     try {

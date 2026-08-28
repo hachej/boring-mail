@@ -63,10 +63,33 @@ function blobBytes(value: unknown, name: string): Uint8Array | null {
   throw new ProductStoreError('corrupt_data', `${name} bounded prefix must be bytes or null`)
 }
 function continuationByte(value: number): boolean { return value >= 0x80 && value <= 0xbf }
-function validTerminalUtf8Prefix(bytes: Uint8Array): boolean {
-  if (bytes.length === 1) return bytes[0]! >= 0xc2 && bytes[0]! <= 0xf4
-  if (bytes.length === 2) return bytes[0]! >= 0xe0 && bytes[0]! <= 0xf4 && continuationByte(bytes[1]!)
-  if (bytes.length === 3) return bytes[0]! >= 0xf0 && bytes[0]! <= 0xf4 && continuationByte(bytes[1]!) && continuationByte(bytes[2]!)
+function validThreeByteLeadAndSecond(first: number, second: number): boolean {
+  if (first === 0xe0) return second >= 0xa0 && second <= 0xbf
+  if (first >= 0xe1 && first <= 0xec) return continuationByte(second)
+  if (first === 0xed) return second >= 0x80 && second <= 0x9f
+  if (first >= 0xee && first <= 0xef) return continuationByte(second)
+  return false
+}
+function validFourByteLeadAndSecond(first: number, second: number): boolean {
+  if (first === 0xf0) return second >= 0x90 && second <= 0xbf
+  if (first >= 0xf1 && first <= 0xf3) return continuationByte(second)
+  if (first === 0xf4) return second >= 0x80 && second <= 0x8f
+  return false
+}
+function validIncompleteTerminalUtf8Sequence(bytes: Uint8Array): boolean {
+  const first = bytes[0]
+  if (first === undefined) return false
+  if (bytes.length === 1) return first >= 0xc2 && first <= 0xf4
+  const second = bytes[1]
+  if (second === undefined) return false
+  if (bytes.length === 2) {
+    return validThreeByteLeadAndSecond(first, second) || validFourByteLeadAndSecond(first, second)
+  }
+  const third = bytes[2]
+  if (third === undefined) return false
+  if (bytes.length === 3) {
+    return validFourByteLeadAndSecond(first, second) && continuationByte(third)
+  }
   return false
 }
 function decodeUtf8Prefix(bytes: Uint8Array, name: string): { value: string; clippedTerminalBytes: boolean } {
@@ -75,7 +98,7 @@ function decodeUtf8Prefix(bytes: Uint8Array, name: string): { value: string; cli
   for (let clip = 0; clip <= maxClip; clip++) {
     try {
       const value = decoder.decode(bytes.subarray(0, bytes.length - clip))
-      if (clip === 0 || validTerminalUtf8Prefix(bytes.subarray(bytes.length - clip))) {
+      if (clip === 0 || validIncompleteTerminalUtf8Sequence(bytes.subarray(bytes.length - clip))) {
         return { value, clippedTerminalBytes: clip > 0 }
       }
     } catch {

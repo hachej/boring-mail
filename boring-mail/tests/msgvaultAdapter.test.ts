@@ -135,10 +135,24 @@ describe('msgvaultAdapter', () => {
     bad.exec(SCHEMA
       .replace('CREATE TABLE participants (\n  id INTEGER PRIMARY KEY,', 'CREATE TABLE participants (\n  id INTEGER,')
       .replace(/sender_id INTEGER REFERENCES participants\(id\),/g, 'sender_id INTEGER,')
-      .replace(/participant_id INTEGER NOT NULL REFERENCES participants\(id\),/g, 'participant_id INTEGER NOT NULL,'))
+      .replace(/participant_id INTEGER NOT NULL REFERENCES participants\(id\) ON DELETE CASCADE,/g, 'participant_id INTEGER NOT NULL,'))
     bad.exec(`INSERT INTO participants(id,email_address,display_name) VALUES(1,'a@example.invalid','A'),(1,'b@example.invalid','B')`)
     bad.close()
     expect(() => openMsgvaultStore(path)).toThrow(/participants\.id must have INTEGER affinity and be the single primary key/)
+  })
+
+  it('opens a structurally genuine msgvault v0.19.3 SQLite schema with required maintenance indexes', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'msgvault-genuine-v0193-')), 'genuine.db')
+    const genuine = new DatabaseSync(path)
+    genuine.exec(readFileSync('/tmp/pi-github-repos/kenn-io/msgvault@v0.19.3/internal/store/schema.sql', 'utf8'))
+    genuine.exec(readFileSync('/tmp/pi-github-repos/kenn-io/msgvault@v0.19.3/internal/store/schema_sqlite.sql', 'utf8'))
+    genuine.exec(`CREATE INDEX IF NOT EXISTS idx_messages_live_sent_at
+      ON messages(COALESCE(sent_at, received_at, internal_date) DESC, id DESC)
+      WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL`)
+    genuine.exec(`CREATE INDEX IF NOT EXISTS idx_messages_rfc822_message_id ON messages(rfc822_message_id)`)
+    genuine.close()
+    const opened = openMsgvaultStore(path)
+    opened.db.close()
   })
 
   it('opens read-only and rejects schema drift', async () => {
@@ -298,12 +312,12 @@ describe('msgvaultAdapter', () => {
     const missingRecipientParticipantFkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-participant-fk-')), 'drift.db')
     const missingRecipientParticipantFk = new DatabaseSync(missingRecipientParticipantFkPath)
     missingRecipientParticipantFk.exec(SCHEMA.replace(
-      'participant_id INTEGER NOT NULL REFERENCES participants(id),',
+      'participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,',
       'participant_id INTEGER NOT NULL,',
     ))
     missingRecipientParticipantFk.close()
     expect(() => openMsgvaultStore(missingRecipientParticipantFkPath)).toThrow(
-      /message_recipients\.participant_id must be an exact single-column NO ACTION foreign key to participants\(id\)/,
+      /message_recipients\.participant_id must be an exact single-column foreign key to participants\(id\) ON UPDATE NO ACTION ON DELETE CASCADE/,
     )
 
     const participantPkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-participant-pk-')), 'drift.db')
@@ -316,7 +330,7 @@ describe('msgvaultAdapter', () => {
     const senderFk = new DatabaseSync(senderFkPath)
     senderFk.exec(SCHEMA.replace('sender_id INTEGER REFERENCES participants(id),', 'sender_id INTEGER,'))
     senderFk.close()
-    expect(() => openMsgvaultStore(senderFkPath)).toThrow(/messages\.sender_id must be an exact single-column NO ACTION foreign key to participants\(id\)/)
+    expect(() => openMsgvaultStore(senderFkPath)).toThrow(/messages\.sender_id must be an exact single-column foreign key to participants\(id\) ON UPDATE NO ACTION ON DELETE NO ACTION/)
 
     const cascadingSenderFkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-sender-fk-action-')), 'drift.db')
     const cascadingSenderFk = new DatabaseSync(cascadingSenderFkPath)
@@ -325,13 +339,13 @@ describe('msgvaultAdapter', () => {
       'sender_id INTEGER REFERENCES participants(id) ON DELETE CASCADE,',
     ))
     cascadingSenderFk.close()
-    expect(() => openMsgvaultStore(cascadingSenderFkPath)).toThrow(/single-column NO ACTION foreign key/)
+    expect(() => openMsgvaultStore(cascadingSenderFkPath)).toThrow(/ON UPDATE NO ACTION ON DELETE NO ACTION/)
 
     const bodyFkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-body-fk-')), 'drift.db')
     const bodyFk = new DatabaseSync(bodyFkPath)
-    bodyFk.exec(SCHEMA.replace('message_id INTEGER PRIMARY KEY REFERENCES messages(id),', 'message_id INTEGER PRIMARY KEY,'))
+    bodyFk.exec(SCHEMA.replace('message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,', 'message_id INTEGER PRIMARY KEY,'))
     bodyFk.close()
-    expect(() => openMsgvaultStore(bodyFkPath)).toThrow(/message_bodies\.message_id must be an exact single-column NO ACTION foreign key to messages\(id\)/)
+    expect(() => openMsgvaultStore(bodyFkPath)).toThrow(/message_bodies\.message_id must be an exact single-column foreign key to messages\(id\) ON UPDATE NO ACTION ON DELETE CASCADE/)
 
     const missingRecipientsPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-drift-')), 'drift.db')
     const missingRecipients = new DatabaseSync(missingRecipientsPath)

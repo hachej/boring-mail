@@ -118,6 +118,7 @@ function requireForeignKey(
   targetTable: string,
   targetColumn: string,
   errors: string[],
+  expected: { onUpdate?: string; onDelete?: string } = {},
 ): void {
   const groups = new Map<number, ForeignKeyRow[]>()
   for (const row of foreignKeys(db, table)) {
@@ -125,15 +126,20 @@ function requireForeignKey(
     group.push(row)
     groups.set(row.id, group)
   }
-  const expected = [...groups.values()].some((group) => {
+  const onUpdate = expected.onUpdate ?? 'NO ACTION'
+  const onDelete = expected.onDelete ?? 'NO ACTION'
+  const found = [...groups.values()].some((group) => {
     const rows = group.sort((left, right) => left.seq - right.seq)
     const row = rows[0]
     return rows.length === 1 && row !== undefined && row.seq === 0 && row.from === from &&
       row.table === targetTable && row.to === targetColumn && row.match === 'NONE' &&
-      row.on_update === 'NO ACTION' && row.on_delete === 'NO ACTION'
+      row.on_update === onUpdate && row.on_delete === onDelete
   })
-  if (!expected) {
-    errors.push(`${table}.${from} must be an exact single-column NO ACTION foreign key to ${targetTable}(${targetColumn})`)
+  if (!found) {
+    errors.push(
+      `${table}.${from} must be an exact single-column foreign key to ${targetTable}(${targetColumn}) ` +
+      `ON UPDATE ${onUpdate} ON DELETE ${onDelete}`,
+    )
   }
 }
 
@@ -169,7 +175,7 @@ const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
   participants: ['id', 'email_address', 'display_name'],
   message_recipients: ['id', 'message_id', 'participant_id', 'recipient_type', 'display_name', 'email_address'],
   message_labels: ['message_id', 'label_id'],
-  labels: ['id', 'name'],
+  labels: ['id', 'source_id', 'name'],
   message_raw: ['message_id', 'raw_data', 'raw_format', 'compression'],
   attachments: ['id', 'message_id', 'filename', 'mime_type', 'size', 'content_hash', 'storage_path'],
   messages_fts: ['message_id'],
@@ -219,14 +225,14 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
       textAffinity(columns.find((column) => column.name === 'message_type'), 'messages.message_type', true, columnErrors)
       textAffinity(columns.find((column) => column.name === 'subject'), 'messages.subject', false, columnErrors)
       textAffinity(columns.find((column) => column.name === 'snippet'), 'messages.snippet', false, columnErrors)
-      requireForeignKey(db, 'messages', 'conversation_id', 'conversations', 'id', columnErrors)
-      requireForeignKey(db, 'messages', 'source_id', 'sources', 'id', columnErrors)
+      requireForeignKey(db, 'messages', 'conversation_id', 'conversations', 'id', columnErrors, { onDelete: 'CASCADE' })
+      requireForeignKey(db, 'messages', 'source_id', 'sources', 'id', columnErrors, { onDelete: 'CASCADE' })
       requireForeignKey(db, 'messages', 'sender_id', 'participants', 'id', columnErrors)
     }
     if (table === 'conversations') {
       integerAffinity(columns.find((column) => column.name === 'source_id'), 'conversations.source_id', true, columnErrors)
       textAffinity(columns.find((column) => column.name === 'conversation_type'), 'conversations.conversation_type', true, columnErrors)
-      requireForeignKey(db, 'conversations', 'source_id', 'sources', 'id', columnErrors)
+      requireForeignKey(db, 'conversations', 'source_id', 'sources', 'id', columnErrors, { onDelete: 'CASCADE' })
     }
     if (table === 'participants') {
       validateIntegerPrimaryKey(columns, table, columnErrors)
@@ -235,10 +241,11 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
     }
     if (table === 'account_identities') {
       columnErrors.push(...validateMsgvaultAccountIdentitiesSchema(columns))
+      requireForeignKey(db, 'account_identities', 'source_id', 'sources', 'id', columnErrors, { onDelete: 'CASCADE' })
     }
     if (table === 'message_bodies') {
       columnErrors.push(...validateMsgvaultMessageBodiesSchema(columns))
-      requireForeignKey(db, 'message_bodies', 'message_id', 'messages', 'id', columnErrors)
+      requireForeignKey(db, 'message_bodies', 'message_id', 'messages', 'id', columnErrors, { onDelete: 'CASCADE' })
     }
     if (table === 'message_recipients') {
       validateIntegerPrimaryKey(columns, table, columnErrors)
@@ -247,8 +254,8 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
       textAffinity(columns.find((column) => column.name === 'recipient_type'), 'message_recipients.recipient_type', true, columnErrors)
       textAffinity(columns.find((column) => column.name === 'display_name'), 'message_recipients.display_name', false, columnErrors)
       textAffinity(columns.find((column) => column.name === 'email_address'), 'message_recipients.email_address', false, columnErrors)
-      requireForeignKey(db, 'message_recipients', 'message_id', 'messages', 'id', columnErrors)
-      requireForeignKey(db, 'message_recipients', 'participant_id', 'participants', 'id', columnErrors)
+      requireForeignKey(db, 'message_recipients', 'message_id', 'messages', 'id', columnErrors, { onDelete: 'CASCADE' })
+      requireForeignKey(db, 'message_recipients', 'participant_id', 'participants', 'id', columnErrors, { onDelete: 'CASCADE' })
     }
     if (table === 'attachments') {
       validateIntegerPrimaryKey(columns, table, columnErrors)
@@ -256,7 +263,18 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
       textAffinity(columns.find((column) => column.name === 'filename'), 'attachments.filename', false, columnErrors)
       textAffinity(columns.find((column) => column.name === 'mime_type'), 'attachments.mime_type', false, columnErrors)
       integerAffinity(columns.find((column) => column.name === 'size'), 'attachments.size', false, columnErrors)
-      requireForeignKey(db, 'attachments', 'message_id', 'messages', 'id', columnErrors)
+      requireForeignKey(db, 'attachments', 'message_id', 'messages', 'id', columnErrors, { onDelete: 'CASCADE' })
+    }
+    if (table === 'labels') {
+      validateIntegerPrimaryKey(columns, table, columnErrors)
+      requireForeignKey(db, 'labels', 'source_id', 'sources', 'id', columnErrors, { onDelete: 'CASCADE' })
+    }
+    if (table === 'message_labels') {
+      requireForeignKey(db, 'message_labels', 'message_id', 'messages', 'id', columnErrors, { onDelete: 'CASCADE' })
+      requireForeignKey(db, 'message_labels', 'label_id', 'labels', 'id', columnErrors, { onDelete: 'CASCADE' })
+    }
+    if (table === 'message_raw') {
+      requireForeignKey(db, 'message_raw', 'message_id', 'messages', 'id', columnErrors, { onDelete: 'CASCADE' })
     }
   }
   const capabilities = inspectIndexCapabilities(db)
