@@ -15,7 +15,7 @@ gate) · **SUPERSEDED**.
 
 ---
 
-## D1 — Plugin API surface: WorkspaceBridge operations, not Fastify routes — **PROPOSED**
+## D1 — Plugin API surface: WorkspaceBridge operations, not Fastify routes — **LOCKED**
 
 **What.** State-changing API moves to `workspaceBridgeHandlers` as
 `boring-mail.v1.*` operations. `WorkspaceServerPlugin.routes` is used **only**
@@ -46,7 +46,7 @@ need appears that the bridge envelope cannot carry.
 
 ---
 
-## D2 — Plugin tier: Tier A internal app-package plugin with `trust: "internal"` — **PROPOSED**
+## D2 — Plugin tier: Tier A internal app-package plugin with `trust: "internal"` — **LOCKED**
 
 **What.** Ship as an internal app-package plugin composed into the app shell,
 not as a Tier C external plugin under `.pi/extensions`.

@@ -1,12 +1,19 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { createWorkspaceAgentServer } from '@hachej/boring-workspace/app/server'
+import type { BridgeAuthPolicy } from '@hachej/boring-workspace/server'
 import createBoringMailServerPlugin from '@hachej/boring-mail/server'
+import type { StandaloneDeploymentConfig } from './standaloneHostAuth'
 
 export const AGENT_API_PORT = Number(process.env.AGENT_API_PORT) || 5290
 export const VITE_PORT = Number(process.env.PORT) || 5190
 export const APP_ROOT = resolve(import.meta.dirname, '../..')
 export const PLAYGROUND_WORKSPACE_ROOT = resolve(APP_ROOT, process.env.BORING_MAIL_PLAYGROUND_ROOT || '.playground')
+
+interface StartBoringMailPlaygroundServerOptions {
+  browserAuthPolicy: BridgeAuthPolicy
+  deployment: StandaloneDeploymentConfig
+}
 
 function seedPlaygroundWorkspace(workspaceRoot = PLAYGROUND_WORKSPACE_ROOT): void {
   mkdirSync(resolve(workspaceRoot, 'drafts'), { recursive: true })
@@ -34,33 +41,34 @@ function seedPlaygroundWorkspace(workspaceRoot = PLAYGROUND_WORKSPACE_ROOT): voi
 
 let boot: Promise<void> | null = null
 
-export async function startBoringMailPlaygroundServer(): Promise<void> {
+export async function startBoringMailPlaygroundServer(options: StartBoringMailPlaygroundServerOptions): Promise<void> {
   if (boot) return boot
   const attempt = (async () => {
-    seedPlaygroundWorkspace()
+    seedPlaygroundWorkspace(options.deployment.workspaceRoot)
     const localRuntimeMode = process.env.BORING_AGENT_MODE?.trim() === 'direct' ? 'direct' : 'local'
-    console.log(`[boring-mail] playground workspace root: ${PLAYGROUND_WORKSPACE_ROOT}`)
+    console.log(`[boring-mail] playground workspace root: ${options.deployment.workspaceRoot}`)
+    console.log(`[boring-mail] standalone deployment mode: ${options.deployment.mode}`)
     console.log(`[boring-mail] agent runtime mode: ${localRuntimeMode}`)
     console.log('[boring-mail] LLM/model provider config: default Pi host settings')
 
     let app: Awaited<ReturnType<typeof createWorkspaceAgentServer>> | null = null
     try {
       app = await createWorkspaceAgentServer({
-        workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
+        workspaceRoot: options.deployment.workspaceRoot,
         appRoot: APP_ROOT,
         mode: localRuntimeMode,
         logger: true,
         externalPlugins: false,
         installPluginAuthoring: false,
-        plugins: [createBoringMailServerPlugin({ workspaceRoot: PLAYGROUND_WORKSPACE_ROOT })],
+        plugins: [createBoringMailServerPlugin({ workspaceRoot: options.deployment.workspaceRoot, sync: options.deployment.sync })],
         defaultPluginPackages: ['@hachej/boring-ask-user'],
-        workspaceBridge: { allowInsecureLocalCliBrowserAuth: true },
+        workspaceBridge: { browserAuthPolicy: options.browserAuthPolicy },
       })
 
       app.get('/api/v1/workspace/meta', async () => ({
         projectName: 'Boring Mail',
-        workspaceId: 'boring-mail-playground',
-        workspaceRoot: PLAYGROUND_WORKSPACE_ROOT,
+        workspaceId: options.deployment.workspaceId,
+        workspaceRoot: options.deployment.workspaceRoot,
       }))
 
       // 0.1.103: session routes moved from /api/v1/agent/pi-chat/sessions to
