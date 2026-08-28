@@ -7,18 +7,35 @@ import { acquireMsgvaultArchiveLock } from '../src/mail/sync/msgvaultArchiveLock
 import { verifyMsgvaultContract } from '../src/mail/sync/msgvaultContract.ts'
 
 const requestedExecutable = process.env.MSGVAULT_EXECUTABLE?.trim() || 'msgvault'
-const version = spawnSync(requestedExecutable, ['version'], { encoding: 'utf8' })
-if (version.error?.code === 'ENOENT') {
+const required = process.env.BORING_MAIL_REQUIRE_MSGVAULT === '1'
+const candidate = requestedExecutable.includes('/')
+  ? requestedExecutable
+  : (process.env.PATH ?? '').split(':').map((directory) => join(directory, requestedExecutable))
+      .find((path) => existsSync(path))
+if (!candidate) {
+  if (required) throw new Error('required msgvault smoke needs exact installed msgvault v0.19.3; executable was unavailable')
   console.log('↷ msgvault direct-worker smoke skipped: executable unavailable')
   process.exit(0)
 }
-if (version.status !== 0 || !/(?:^|\n)msgvault v0\.19\.3(?:\r?\n|$)/.test(`${version.stdout}\n${version.stderr}`)) {
+let executable
+try {
+  executable = realpathSync(candidate)
+} catch (error) {
+  if (error?.code === 'ENOENT') {
+    if (required) throw new Error('required msgvault smoke needs exact installed msgvault v0.19.3; executable was unavailable')
+    console.log('↷ msgvault direct-worker smoke skipped: executable unavailable')
+    process.exit(0)
+  }
+  throw error
+}
+const version = spawnSync(executable, ['version'], {
+  encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024,
+})
+if (version.error) throw version.error
+if (version.status !== 0 || version.signal ||
+    !/(?:^|\n)msgvault v0\.19\.3(?:\r?\n|$)/.test(`${version.stdout}\n${version.stderr}`)) {
   throw new Error('msgvault direct-worker smoke requires exact installed msgvault v0.19.3')
 }
-const executable = realpathSync(requestedExecutable.includes('/')
-  ? requestedExecutable
-  : (process.env.PATH ?? '').split(':').map((directory) => join(directory, requestedExecutable))
-      .find((candidate) => existsSync(candidate)) ?? requestedExecutable)
 
 function directEnv() {
   return { ...process.env, MSGVAULT_DAEMON_CLI_PARENT_PID: String(process.pid) }
