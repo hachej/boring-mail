@@ -50,10 +50,23 @@ describe('mailBridgeListContract', () => {
       ...validItem,
       items: [{ ...validItem.items[0], snippet: 'bad\u0001control' }],
     }).success).toBe(false)
+    expect(validItem.items[0]?.messageAt).toBe('2030-01-01T00:00:00.000Z')
     expect(mailBridgeListOutputContract.safeParse({
       ...validItem,
       items: [{ ...validItem.items[0], senderEmail: 'bad email@example.invalid' }],
     }).success).toBe(false)
+    for (const messageAt of [
+      '2030-01-01 00:00:00+00:00',
+      '2030-01-01T00:00:00Z',
+      '2030-01-01T00:00:00.000+00:00',
+      '2030-02-31T00:00:00.000Z',
+      '2030-01-01T00:00:00.000Z\n',
+    ]) {
+      expect(mailBridgeListOutputContract.safeParse({
+        ...validItem,
+        items: [{ ...validItem.items[0], messageAt }],
+      }).success).toBe(false)
+    }
   })
 
   it('maps storage rows to bounded browser DTOs without internal identifiers', () => {
@@ -72,10 +85,13 @@ describe('mailBridgeListContract', () => {
       senderEmail: null,
       subject: '(no subject)',
       snippet: 'hello world',
+      messageAt: '2030-01-01T00:00:00.000Z',
     })
     expect(output.items[0].senderName).not.toContain('\u0301')
     expect(Buffer.byteLength(output.items[0].senderName ?? '', 'utf8')).toBeLessThanOrEqual(512)
     expect(output.items[0].truncated.senderName).toBe(true)
+    expect(() => mapUnifiedInboxPageToBrowserList(page({ messageAt: '2030-01-01T00:00:00Z' }), (id) => `bm1.${id}.tag`))
+      .toThrow(/canonical UTC/)
     expect(Object.keys(output.items[0]).sort()).toEqual([
       'coalesced', 'copyCount', 'hasAttachments', 'messageAt', 'senderEmail', 'senderName',
       'snippet', 'subject', 'target', 'truncated', 'unread',

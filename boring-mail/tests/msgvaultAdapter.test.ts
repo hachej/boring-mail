@@ -211,6 +211,24 @@ describe('msgvaultAdapter', () => {
     extraColumnIndex.close()
     expect(() => openMsgvaultStore(extraColumnIndexPath)).toThrow(/exactly on rfc822_message_id/)
 
+    const collatedIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-collated-index-')), 'drift.db')
+    const collatedIndex = new DatabaseSync(collatedIndexPath)
+    collatedIndex.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id);',
+      'CREATE INDEX idx_messages_rfc822_message_id ON messages(rfc822_message_id COLLATE NOCASE);',
+    ))
+    collatedIndex.close()
+    expect(() => openMsgvaultStore(collatedIndexPath)).toThrow(/exactly on rfc822_message_id/)
+
+    const wrongConversationDirectionPath = join(mkdtempSync(join(tmpdir(), 'msgvault-conversation-index-direction-')), 'drift.db')
+    const wrongConversationDirection = new DatabaseSync(wrongConversationDirectionPath)
+    wrongConversationDirection.exec(SCHEMA.replace(
+      'CREATE INDEX idx_messages_conversation ON messages(conversation_id, sent_at DESC);',
+      'CREATE INDEX idx_messages_conversation ON messages(conversation_id, sent_at ASC);',
+    ))
+    wrongConversationDirection.close()
+    expect(() => openMsgvaultStore(wrongConversationDirectionPath)).toThrow(/conversation_id ASC,sent_at DESC/)
+
     const renamedEquivalentIndexPath = join(mkdtempSync(join(tmpdir(), 'msgvault-equivalent-index-')), 'ok.db')
     const renamedEquivalentIndex = new DatabaseSync(renamedEquivalentIndexPath)
     renamedEquivalentIndex.exec(SCHEMA.replace(
@@ -277,6 +295,17 @@ describe('msgvaultAdapter', () => {
       /attachments requires a non-unique, non-partial ASC index exactly on message_id/,
     )
 
+    const missingRecipientParticipantFkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-participant-fk-')), 'drift.db')
+    const missingRecipientParticipantFk = new DatabaseSync(missingRecipientParticipantFkPath)
+    missingRecipientParticipantFk.exec(SCHEMA.replace(
+      'participant_id INTEGER NOT NULL REFERENCES participants(id),',
+      'participant_id INTEGER NOT NULL,',
+    ))
+    missingRecipientParticipantFk.close()
+    expect(() => openMsgvaultStore(missingRecipientParticipantFkPath)).toThrow(
+      /message_recipients\.participant_id must be an exact single-column NO ACTION foreign key to participants\(id\)/,
+    )
+
     const participantPkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-participant-pk-')), 'drift.db')
     const participantPk = new DatabaseSync(participantPkPath)
     participantPk.exec(SCHEMA.replace('CREATE TABLE participants (\n  id INTEGER PRIMARY KEY,', 'CREATE TABLE participants (\n  id INTEGER,'))
@@ -287,13 +316,22 @@ describe('msgvaultAdapter', () => {
     const senderFk = new DatabaseSync(senderFkPath)
     senderFk.exec(SCHEMA.replace('sender_id INTEGER REFERENCES participants(id),', 'sender_id INTEGER,'))
     senderFk.close()
-    expect(() => openMsgvaultStore(senderFkPath)).toThrow(/messages\.sender_id must reference participants\(id\)/)
+    expect(() => openMsgvaultStore(senderFkPath)).toThrow(/messages\.sender_id must be an exact single-column NO ACTION foreign key to participants\(id\)/)
+
+    const cascadingSenderFkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-sender-fk-action-')), 'drift.db')
+    const cascadingSenderFk = new DatabaseSync(cascadingSenderFkPath)
+    cascadingSenderFk.exec(SCHEMA.replace(
+      'sender_id INTEGER REFERENCES participants(id),',
+      'sender_id INTEGER REFERENCES participants(id) ON DELETE CASCADE,',
+    ))
+    cascadingSenderFk.close()
+    expect(() => openMsgvaultStore(cascadingSenderFkPath)).toThrow(/single-column NO ACTION foreign key/)
 
     const bodyFkPath = join(mkdtempSync(join(tmpdir(), 'msgvault-body-fk-')), 'drift.db')
     const bodyFk = new DatabaseSync(bodyFkPath)
     bodyFk.exec(SCHEMA.replace('message_id INTEGER PRIMARY KEY REFERENCES messages(id),', 'message_id INTEGER PRIMARY KEY,'))
     bodyFk.close()
-    expect(() => openMsgvaultStore(bodyFkPath)).toThrow(/message_bodies\.message_id must reference messages\(id\)/)
+    expect(() => openMsgvaultStore(bodyFkPath)).toThrow(/message_bodies\.message_id must be an exact single-column NO ACTION foreign key to messages\(id\)/)
 
     const missingRecipientsPath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-drift-')), 'drift.db')
     const missingRecipients = new DatabaseSync(missingRecipientsPath)

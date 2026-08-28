@@ -396,7 +396,7 @@ function positiveOption(value: number | undefined, fallback: number, name: strin
 function limits(options: MailStoreOpenOptions): RpcLimits {
   return {
     startupTimeoutMs: positiveOption(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 'startupTimeoutMs'),
-    requestTimeoutMs: positiveOption(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 'requestTimeoutMs'),
+    requestTimeoutMs: positiveOption(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 'requestTimeoutMs', DEFAULT_REQUEST_TIMEOUT_MS),
     maxPendingRequests: positiveOption(options.maxPendingRequests, DEFAULT_MAX_PENDING_REQUESTS, 'maxPendingRequests'),
   }
 }

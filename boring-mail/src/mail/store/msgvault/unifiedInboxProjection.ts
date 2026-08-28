@@ -42,22 +42,30 @@ const indexCapabilities = new WeakMap<DatabaseSync, MsgvaultIndexCapabilities>()
 function quotedIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`
 }
-interface IndexListRow { name: string; unique: number; partial: number }
-interface IndexXInfoRow { name: string | null; desc: number; key: number }
-function keyIndexColumns(db: DatabaseSync, name: string): Array<{ name: string | null; desc: number }> {
+interface IndexListRow { name: string; unique: number; origin: string; partial: number }
+interface IndexXInfoRow { seqno: number; cid: number; name: string | null; desc: number; coll: string; key: number }
+interface ExpectedIndexColumn { cid: number; name: string | null; desc: 0 | 1; coll: 'BINARY'; key: 0 | 1 }
+function indexShape(db: DatabaseSync, name: string): ExpectedIndexColumn[] {
   return (db.prepare(`PRAGMA index_xinfo(${quotedIdentifier(name)})`).all() as unknown as IndexXInfoRow[])
-    .filter((column) => column.key === 1)
-    .map((column) => ({ name: column.name, desc: column.desc }))
+    .sort((left, right) => left.seqno - right.seqno)
+    .map((column) => ({
+      cid: column.cid,
+      name: column.name,
+      desc: column.desc as 0 | 1,
+      coll: column.coll as 'BINARY',
+      key: column.key as 0 | 1,
+    }))
 }
 function findIndex(
   indexes: IndexListRow[],
   db: DatabaseSync,
-  spec: { unique: 0 | 1; partial: 0 | 1; columns: Array<{ name: string | null; desc: 0 | 1 }> },
+  spec: { unique: 0 | 1; origin: 'c'; partial: 0 | 1; shape: ExpectedIndexColumn[] },
 ): string | null {
-  const found = indexes.find((index) => index.unique === spec.unique && index.partial === spec.partial &&
-    JSON.stringify(keyIndexColumns(db, index.name)) === JSON.stringify(spec.columns))
+  const found = indexes.find((index) => index.unique === spec.unique && index.origin === spec.origin &&
+    index.partial === spec.partial && JSON.stringify(indexShape(db, index.name)) === JSON.stringify(spec.shape))
   return found?.name ?? null
 }
+
 export function inspectIndexCapabilities(db: DatabaseSync): {
   value: MsgvaultIndexCapabilities | null
   errors: string[]
@@ -66,24 +74,45 @@ export function inspectIndexCapabilities(db: DatabaseSync): {
   const recipientIndexes = db.prepare(`PRAGMA index_list(message_recipients)`).all() as unknown as IndexListRow[]
   const attachmentIndexes = db.prepare(`PRAGMA index_list(attachments)`).all() as unknown as IndexListRow[]
   const rfc822 = findIndex(messageIndexes, db, {
-    unique: 0, partial: 0, columns: [{ name: 'rfc822_message_id', desc: 0 }],
+    unique: 0, origin: 'c', partial: 0, shape: [
+      { cid: 4, name: 'rfc822_message_id', desc: 0, coll: 'BINARY', key: 1 },
+      { cid: -1, name: null, desc: 0, coll: 'BINARY', key: 0 },
+    ],
   })
   const bySource = findIndex(messageIndexes, db, {
-    unique: 0, partial: 0, columns: [{ name: 'source_id', desc: 0 }],
+    unique: 0, origin: 'c', partial: 0, shape: [
+      { cid: 2, name: 'source_id', desc: 0, coll: 'BINARY', key: 1 },
+      { cid: -1, name: null, desc: 0, coll: 'BINARY', key: 0 },
+    ],
   })
   const conversation = findIndex(messageIndexes, db, {
-    unique: 0, partial: 0, columns: [{ name: 'conversation_id', desc: 0 }, { name: 'sent_at', desc: 1 }],
+    unique: 0, origin: 'c', partial: 0, shape: [
+      { cid: 1, name: 'conversation_id', desc: 0, coll: 'BINARY', key: 1 },
+      { cid: 6, name: 'sent_at', desc: 1, coll: 'BINARY', key: 1 },
+      { cid: -1, name: null, desc: 0, coll: 'BINARY', key: 0 },
+    ],
   })
   const recipientsByMessage = findIndex(recipientIndexes, db, {
-    unique: 0, partial: 0, columns: [{ name: 'message_id', desc: 0 }],
+    unique: 0, origin: 'c', partial: 0, shape: [
+      { cid: 1, name: 'message_id', desc: 0, coll: 'BINARY', key: 1 },
+      { cid: -1, name: null, desc: 0, coll: 'BINARY', key: 0 },
+    ],
   })
   const attachmentsByMessage = findIndex(attachmentIndexes, db, {
-    unique: 0, partial: 0, columns: [{ name: 'message_id', desc: 0 }],
+    unique: 0, origin: 'c', partial: 0, shape: [
+      { cid: 1, name: 'message_id', desc: 0, coll: 'BINARY', key: 1 },
+      { cid: -1, name: null, desc: 0, coll: 'BINARY', key: 0 },
+    ],
   })
   const liveRecency = findIndex(messageIndexes, db, {
     unique: 0,
+    origin: 'c',
     partial: 1,
-    columns: [{ name: null, desc: 1 }, { name: 'id', desc: 1 }],
+    shape: [
+      { cid: -2, name: null, desc: 1, coll: 'BINARY', key: 1 },
+      { cid: 0, name: 'id', desc: 1, coll: 'BINARY', key: 1 },
+      { cid: -1, name: null, desc: 0, coll: 'BINARY', key: 0 },
+    ],
   })
   const indexSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name=?`)
   const liveSql = liveRecency
@@ -147,6 +176,7 @@ const SENDER_EMAIL_PREFIX_BYTES = SENDER_EMAIL_BYTES + 4
 const SUBJECT_PREFIX_BYTES = SUBJECT_BYTES + 4
 const SNIPPET_PREFIX_BYTES = SNIPPET_BYTES + 4
 const EXPLAIN_DIGEST_KEY = Buffer.alloc(32, 0)
+const RFC822_MESSAGE_ID_BYTES = 998
 
 interface UnifiedCursorPayload {
   v: 1
@@ -211,9 +241,13 @@ function boundedTextField(value: unknown, storageClass: unknown, overflow: unkno
     if (bytes !== null) throw new ProductStoreError('corrupt_data', `${name} null storage carried bytes`)
     return { value: null, truncated: booleanSentinel(overflow, `${name}_overflow`) }
   }
-  if (bytes === null) throw new ProductStoreError('corrupt_data', `${name} text storage missing bytes`)
+  const overflowed = booleanSentinel(overflow, `${name}_overflow`)
+  if (bytes === null) {
+    if (overflowed) return { value: null, truncated: true }
+    throw new ProductStoreError('corrupt_data', `${name} text storage missing bytes`)
+  }
   const normalized = normalizeAndTruncateProviderText(decodeUtf8Prefix(bytes, name), maxBytes)
-  return { value: normalized.value, truncated: booleanSentinel(overflow, `${name}_overflow`) || normalized.truncated }
+  return { value: normalized.value, truncated: overflowed || normalized.truncated }
 }
 function boundedEmailField(value: unknown, storageClass: unknown, overflow: unknown, name: string, maxBytes: number): { value: string | null; truncated: boolean } {
   if (storageClass !== 'null' && storageClass !== 'text') {
@@ -221,9 +255,13 @@ function boundedEmailField(value: unknown, storageClass: unknown, overflow: unkn
   }
   if (storageClass === 'null') return { value: null, truncated: booleanSentinel(overflow, `${name}_overflow`) }
   const bytes = blobBytes(value, name)
-  if (bytes === null) throw new ProductStoreError('corrupt_data', `${name} text storage missing bytes`)
+  const overflowed = booleanSentinel(overflow, `${name}_overflow`)
+  if (bytes === null) {
+    if (overflowed) return { value: null, truncated: true }
+    throw new ProductStoreError('corrupt_data', `${name} text storage missing bytes`)
+  }
   const normalized = normalizeAndTruncateProviderEmail(decodeUtf8Prefix(bytes, name), maxBytes)
-  return { value: normalized.value, truncated: booleanSentinel(overflow, `${name}_overflow`) || normalized.truncated }
+  return { value: normalized.value, truncated: overflowed || normalized.truncated }
 }
 function dataVersion(db: DatabaseSync): number {
   const row = db.prepare('PRAGMA data_version').get() as { data_version?: unknown }
@@ -402,10 +440,17 @@ export type UnifiedQueryStrategy = 'recent-window' | 'source-fallback'
 const MIN_RECENT_SCAN_WINDOW = 2_000
 const MAX_RECENT_CORRELATION_COPIES = 64
 
-function boundedBlobSelect(alias: string, column: string, output: string, maxBytes: number, prefixBytes: number): string {
+function boundedBlobSelect(alias: string, column: string, output: string, maxBytes: number, fetchCeilingBytes: number): string {
   return `typeof(${alias}.${column}) AS ${output}_type,
-          substr(CAST(${alias}.${column} AS BLOB),1,${prefixBytes}) AS ${output}_blob,
-          CASE WHEN ${alias}.${column} IS NOT NULL AND length(CAST(${alias}.${column} AS BLOB))>${maxBytes} THEN 1 ELSE 0 END AS ${output}_overflow`
+          CASE WHEN typeof(${alias}.${column})='text' AND octet_length(${alias}.${column})<=${fetchCeilingBytes}
+               THEN CAST(${alias}.${column} AS BLOB) ELSE NULL END AS ${output}_blob,
+          CASE WHEN ${alias}.${column} IS NOT NULL AND octet_length(${alias}.${column})>${maxBytes} THEN 1 ELSE 0 END AS ${output}_overflow`
+}
+function boundedRfc822(alias: string): string {
+  return `CASE WHEN typeof(${alias}.rfc822_message_id)='text'
+                 AND octet_length(${alias}.rfc822_message_id)<=${RFC822_MESSAGE_ID_BYTES}
+               THEN boring_mail_message_id(${alias}.rfc822_message_id)
+               ELSE NULL END`
 }
 
 function unifiedInboxSql(
@@ -454,10 +499,10 @@ function unifiedInboxSql(
         SELECT candidate.id AS message_id,
                candidate.conversation_id,
                candidate.source_id,
-               boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
+               ${boundedRfc822('candidate')} AS valid_rfc822_message_id,
                ${timestamp} AS message_at,
-               CASE WHEN boring_mail_message_id(candidate.rfc822_message_id) IS NULL
-                    THEN '#'||candidate.id ELSE candidate.rfc822_message_id END AS correlation_key,
+               CASE WHEN ${boundedRfc822('candidate')} IS NULL
+                    THEN '#'||candidate.id ELSE ${boundedRfc822('candidate')} END AS correlation_key,
                ${addressed('candidate', 'candidate_source')} AS addressed
           FROM eligible_sources candidate_source
           JOIN messages candidate INDEXED BY ${sourceIndex}
@@ -508,7 +553,9 @@ function unifiedInboxSql(
       SELECT candidate.id,
              candidate.conversation_id,
              candidate.source_id,
-             candidate.rfc822_message_id,
+             ${boundedRfc822('candidate')} AS valid_rfc822_message_id,
+             CASE WHEN ${boundedRfc822('candidate')} IS NULL
+                  THEN '#'||candidate.id ELSE ${boundedRfc822('candidate')} END AS correlation_key,
              candidate.message_type,
              candidate.sent_at,
              candidate.received_at,
@@ -525,10 +572,9 @@ function unifiedInboxSql(
       SELECT candidate.id,
              candidate.conversation_id,
              candidate.source_id,
-             boring_mail_message_id(candidate.rfc822_message_id) AS valid_rfc822_message_id,
+             candidate.valid_rfc822_message_id,
              COALESCE(candidate.sent_at,candidate.received_at,candidate.internal_date) AS message_at,
-             CASE WHEN boring_mail_message_id(candidate.rfc822_message_id) IS NULL
-                  THEN '#'||candidate.id ELSE candidate.rfc822_message_id END AS correlation_key
+             candidate.correlation_key
         FROM recent_rows candidate
         JOIN eligible_sources candidate_source ON candidate_source.source_id=candidate.source_id
         JOIN conversations conversation

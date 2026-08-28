@@ -172,6 +172,40 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     expect(singleton.textTruncated.snippet).toBe(true)
   })
 
+  it('uses octet_length guards for oversized provider fields and RFC822 ids', () => {
+    const longRfc822 = `<${'x'.repeat(1_000)}@example.com>`
+    const huge = 'é'.repeat(2_000_000)
+    try {
+      raw.prepare(`INSERT INTO messages(
+        id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,snippet,sender_id,is_read,attachment_count
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
+        980, 11, 1, longRfc822, 'email', '2036-01-01 00:00:00+00:00', huge, huge, 1005, 1, 0,
+      )
+      raw.prepare(`INSERT INTO messages(
+        id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count
+      ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+        981, 12, 2, longRfc822, 'email', '2035-12-31 00:00:00+00:00', 'same oversized id remains separate', 1, 0,
+      )
+      const items = listUnifiedInbox(store.db, eligible, authority, { limit: 5 }).items
+      expect(items.find((item) => item.messageId === 980)).toMatchObject({
+        rfc822MessageId: null,
+        subject: null,
+        snippet: null,
+        coalesced: false,
+        copyCount: 1,
+        textTruncated: { subject: true, snippet: true },
+      })
+      expect(items.find((item) => item.messageId === 981)).toMatchObject({
+        rfc822MessageId: null,
+        subject: 'same oversized id remains separate',
+        coalesced: false,
+        copyCount: 1,
+      })
+    } finally {
+      raw.exec('DELETE FROM messages WHERE id IN (980,981)')
+    }
+  })
+
   it('returns only replyable ownership for every correlated item', () => {
     const items = listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).items
     for (const item of items) {
@@ -272,6 +306,9 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     const plan = explainUnifiedInboxQueryPlan(store.db, eligible)
     expect(plan.some((detail) => /candidate USING INDEX idx_messages_live_sent_at/.test(detail))).toBe(true)
     expect(plan.some((detail) => /candidate USING (?:COVERING )?INDEX idx_messages_rfc822/.test(detail))).toBe(false)
+    expect(plan.some((detail) => /SEARCH primary_copy USING INDEX idx_messages_rfc822_message_id/.test(detail))).toBe(true)
+    expect(plan.some((detail) => /SEARCH copy USING INDEX idx_messages_rfc822_message_id/.test(detail))).toBe(true)
+    expect(plan.some((detail) => /SCAN (?:primary_copy|copy)\b/.test(detail))).toBe(false)
     const after = { messageAt: '2029-12-31 00:00:00+00:00', messageId: 602 }
     const deepPlan = explainUnifiedInboxQueryPlan(store.db, eligible, after)
     expect(deepPlan.some((detail) => /SEARCH candidate USING INDEX idx_messages_live_sent_at/.test(detail))).toBe(true)

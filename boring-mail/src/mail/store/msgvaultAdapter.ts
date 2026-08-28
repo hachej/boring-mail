@@ -93,8 +93,18 @@ function integerAffinity(column: SchemaColumn | undefined, name: string, notNull
     errors.push(`${name} must ${notNull ? 'be NOT NULL and ' : ''}have INTEGER affinity`)
   }
 }
-function foreignKeys(db: DatabaseSync, table: string): Array<{ table: string; from: string; to: string }> {
-  return db.prepare(`PRAGMA foreign_key_list(${table})`).all() as Array<{ table: string; from: string; to: string }>
+interface ForeignKeyRow {
+  id: number
+  seq: number
+  table: string
+  from: string
+  to: string
+  on_update: string
+  on_delete: string
+  match: string
+}
+function foreignKeys(db: DatabaseSync, table: string): ForeignKeyRow[] {
+  return db.prepare(`PRAGMA foreign_key_list(${table})`).all() as unknown as ForeignKeyRow[]
 }
 function requireForeignKey(
   db: DatabaseSync,
@@ -104,8 +114,21 @@ function requireForeignKey(
   targetColumn: string,
   errors: string[],
 ): void {
-  if (!foreignKeys(db, table).some((fk) => fk.from === from && fk.table === targetTable && fk.to === targetColumn)) {
-    errors.push(`${table}.${from} must reference ${targetTable}(${targetColumn})`)
+  const groups = new Map<number, ForeignKeyRow[]>()
+  for (const row of foreignKeys(db, table)) {
+    const group = groups.get(row.id) ?? []
+    group.push(row)
+    groups.set(row.id, group)
+  }
+  const expected = [...groups.values()].some((group) => {
+    const rows = group.sort((left, right) => left.seq - right.seq)
+    const row = rows[0]
+    return rows.length === 1 && row !== undefined && row.seq === 0 && row.from === from &&
+      row.table === targetTable && row.to === targetColumn && row.match === 'NONE' &&
+      row.on_update === 'NO ACTION' && row.on_delete === 'NO ACTION'
+  })
+  if (!expected) {
+    errors.push(`${table}.${from} must be an exact single-column NO ACTION foreign key to ${targetTable}(${targetColumn})`)
   }
 }
 
@@ -214,9 +237,11 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
     }
     if (table === 'message_recipients') {
       integerAffinity(columns.find((column) => column.name === 'message_id'), 'message_recipients.message_id', true, columnErrors)
+      integerAffinity(columns.find((column) => column.name === 'participant_id'), 'message_recipients.participant_id', true, columnErrors)
       textAffinity(columns.find((column) => column.name === 'recipient_type'), 'message_recipients.recipient_type', true, columnErrors)
       textAffinity(columns.find((column) => column.name === 'email_address'), 'message_recipients.email_address', false, columnErrors)
       requireForeignKey(db, 'message_recipients', 'message_id', 'messages', 'id', columnErrors)
+      requireForeignKey(db, 'message_recipients', 'participant_id', 'participants', 'id', columnErrors)
     }
     if (table === 'attachments') {
       integerAffinity(columns.find((column) => column.name === 'message_id'), 'attachments.message_id', true, columnErrors)

@@ -145,6 +145,9 @@ describe('async MailStore worker RPC facade', () => {
     await expect(openMailStoreForTest({ productDbPath: db }, {
       workerFactory: make, startupTimeoutMs: 0,
     })).rejects.toMatchObject({ code: 'invalid_input' })
+    await expect(openMailStoreForTest({ productDbPath: db }, {
+      workerFactory: make, requestTimeoutMs: 7_501,
+    })).rejects.toMatchObject({ code: 'invalid_input', message: expect.stringMatching(/7500/) })
     const store = await openMailStoreForTest({ productDbPath: db }, {
       workerFactory: make, requestTimeoutMs: 100,
     })

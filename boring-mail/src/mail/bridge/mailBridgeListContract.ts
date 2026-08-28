@@ -17,6 +17,12 @@ const canonicalEmail = z.string()
   .refine(utf8BytesAtMost(320), 'email exceeds 320 UTF-8 bytes')
   .refine((value) => !/[\s\x00-\x1F\x7F]/u.test(value), 'email must be printable single-line text')
   .refine((value) => value.indexOf('@') > 0 && value.indexOf('@') === value.lastIndexOf('@') && !value.endsWith('@'), 'email must be canonical email text')
+const canonicalUtcTimestamp = z.string()
+  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u, 'messageAt must be canonical UTC milliseconds')
+  .refine((value) => {
+    const instant = new Date(value)
+    return Number.isFinite(instant.getTime()) && instant.toISOString() === value
+  }, 'messageAt must be a valid canonical UTC instant')
 const targetSchema = z.string()
   .min(1)
   .refine(utf8BytesAtMost(TARGET_MAX_BYTES), 'target exceeds 160 UTF-8 bytes')
@@ -33,7 +39,7 @@ export const mailBridgeInboxItemContract = z.object({
   senderEmail: canonicalEmail.nullable(),
   subject: normalizedTextAtMost(1_024),
   snippet: normalizedTextAtMost(2_048),
-  messageAt: z.string().refine(utf8BytesAtMost(64), 'messageAt exceeds 64 UTF-8 bytes').nullable(),
+  messageAt: canonicalUtcTimestamp.nullable(),
   unread: z.boolean(),
   hasAttachments: z.boolean(),
   coalesced: z.boolean(),
@@ -72,6 +78,19 @@ function assertJsonBudget(output: BrowserInboxListOutput): void {
     throw new ProductStoreError('corrupt_data', 'browser inbox list JSON exceeds 480 KiB')
   }
 }
+function mapMessageAt(value: string | null): string | null {
+  if (value === null) return null
+  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?\+00:00$/u.exec(value)
+  if (!match) throw new ProductStoreError('corrupt_data', 'messageAt must be canonical UTC text')
+  const [, y, m, d, h, min, sec, fraction = ''] = match
+  const millis = fraction.padEnd(3, '0').slice(0, 3)
+  const iso = `${y}-${m}-${d}T${h}:${min}:${sec}.${millis}Z`
+  const instant = new Date(iso)
+  if (!Number.isFinite(instant.getTime()) || instant.toISOString() !== iso) {
+    throw new ProductStoreError('corrupt_data', 'messageAt must be canonical UTC text')
+  }
+  return iso
+}
 
 export function mapUnifiedInboxPageToBrowserList(
   page: UnifiedInboxPage,
@@ -95,7 +114,7 @@ export function mapUnifiedInboxPageToBrowserList(
         senderEmail: senderEmail.value,
         subject: subject.value,
         snippet: snippet.value,
-        messageAt: item.messageAt,
+        messageAt: mapMessageAt(item.messageAt),
         unread: item.unread,
         hasAttachments: item.hasAttachments,
         coalesced: item.coalesced,
