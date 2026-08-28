@@ -22,7 +22,7 @@ function timedPage(db, eligible, authority, options) {
 }
 
 function runScenario(name, options) {
-  const { total, ineligiblePrefix = 0, nonEmailPrefix = 0, highFanout = 0 } = options
+  const { total, ineligiblePrefix = 0, nonEmailPrefix = 0, highFanout = 0, hostileText = false } = options
   if (ineligiblePrefix && nonEmailPrefix) throw new Error('benchmark prefixes are mutually exclusive')
   const prefix = ineligiblePrefix + nonEmailPrefix
   const eligibleCount = total - prefix
@@ -66,6 +66,12 @@ function runScenario(name, options) {
       writer.exec(`UPDATE messages SET conversation_id=3,source_id=3
         WHERE id>${prefix} AND id<=${prefix + Math.min(1000, eligibleCount)} AND id%2=0`)
     }
+    if (hostileText) {
+      writer.exec(`INSERT INTO participants(id,email_address,display_name) VALUES(1,'sender@example.test','Sender')`)
+      const hostileSubject = `Q\u0000\u0001\"😀`.repeat(128 * 1024)
+      const hostileSnippet = `S\\\"\n😀`.repeat(128 * 1024)
+      writer.prepare(`UPDATE messages SET subject=?,snippet=?,sender_id=1 WHERE source_id IN(2,3)`).run(hostileSubject, hostileSnippet)
+    }
   } finally {
     writer.close()
   }
@@ -76,7 +82,7 @@ function runScenario(name, options) {
       { sourceId: 2, identities: ['connected@example.test'] },
       { sourceId: 3, identities: ['alias@example.test'] },
     ]
-    const authority = { scope: `benchmark-${name}` }
+    const authority = { scope: `benchmark-${name}`, digestKey: Buffer.alloc(32, name.length) }
     const expectedIds = []
     for (let x = 1; x <= eligibleCount; x++) {
       if (highFanout > 0 ? x > 1 && x <= highFanout : x <= 1000 && x % 2 === 0) continue
@@ -86,8 +92,8 @@ function runScenario(name, options) {
     const pages = []
     const seen = []
     let cursor
-    for (let pageNumber = 0; pageNumber < 5 && seen.length < expectedIds.length; pageNumber++) {
-      const timed = timedPage(store.db, eligible, authority, { limit: 200, ...(cursor ? { cursor } : {}) })
+    for (let pageNumber = 0; pageNumber < 20 && seen.length < expectedIds.length; pageNumber++) {
+      const timed = timedPage(store.db, eligible, authority, { limit: 50, ...(cursor ? { cursor } : {}) })
       pages.push(timed.elapsedMs)
       seen.push(...timed.page.items.map((item) => item.messageId))
       cursor = timed.page.nextCursor ?? undefined
@@ -100,7 +106,13 @@ function runScenario(name, options) {
     if (seen.length < Math.min(800, expectedIds.length)) {
       throw new Error(`${name} did not traverse a meaningful deep page`)
     }
-    const first = listUnifiedInbox(store.db, eligible, authority, { limit: 200 })
+    const first = listUnifiedInbox(store.db, eligible, authority, { limit: 50 })
+    if (hostileText && !first.items.every((item) =>
+      Buffer.byteLength(item.subject ?? '', 'utf8') <= 1024 &&
+      Buffer.byteLength(item.snippet ?? '', 'utf8') <= 2048 &&
+      item.textTruncated.subject && item.textTruncated.snippet)) {
+      throw new Error(`${name} did not bound hostile provider text on every returned row`)
+    }
     if (highFanout > 0) {
       const group = first.items.find((item) => item.rfc822MessageId === '<high-fanout@bench.test>')
       if (!group || group.messageId !== prefix + 1 || group.copyCount !== highFanout || !group.coalesced) {
@@ -127,6 +139,7 @@ function runScenario(name, options) {
       ineligiblePrefix,
       nonEmailPrefix,
       highFanout,
+      hostileText,
       firstPageMs: pages[0],
       deepPageMs: pages.at(-1),
       traversed: seen.length,
@@ -144,6 +157,7 @@ const results = [
   runScenario('sparse-500k', { total: 500_000, ineligiblePrefix: 498_000 }),
   runScenario('non-email-prefix-100k', { total: 100_000, nonEmailPrefix: 98_000 }),
   runScenario('high-fanout-50k', { total: 50_000, highFanout: 30_000 }),
+  runScenario('hostile-bounds-fallback', { total: 2_560, ineligiblePrefix: 2_500, hostileText: true }),
 ]
 console.log(JSON.stringify(results, null, 2))
 // Evidence tripwire, not a microbenchmark promise. Multi-second first-page

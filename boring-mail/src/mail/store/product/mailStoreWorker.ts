@@ -1,5 +1,5 @@
 /** Dedicated DatabaseSync owner, run as an emitted child process in production. */
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import {
   fstatSync,
   lstatSync,
@@ -10,7 +10,11 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
-import { listUnifiedInbox, openMsgvaultStore, resolveReplyTarget } from '../msgvaultAdapter.js'
+import { openMsgvaultStore, resolveReplyTarget } from '../msgvaultAdapter.js'
+import {
+  listUnifiedInboxWithReconciledSnapshot,
+  reconcileMsgvaultReadSourcesInSnapshot,
+} from './msgvaultSnapshot.js'
 import { ProductStore } from './ProductStore.js'
 import type {
   MailStoreWorkerConfig,
@@ -119,9 +123,11 @@ async function start(): Promise<void> {
     // Open SQLite immediately after inode verification while both inherited
     // locks are held. Revalidate the pathname after open before any slower
     // msgvault/schema work or readiness signal can create a TOCTOU window.
+    const readSourceDigestKey = randomBytes(32)
     store = ProductStore.open(config.productDbPath, {
       now: Date.now,
       resolveReplyTarget: (messageId) => vault ? resolveReplyTarget(vault.db, messageId) : null,
+      readSourceDigestKey,
     })
     assertCanonicalDatabasePath(config.productDbPath)
     if (lockedIdentity) {
@@ -149,11 +155,21 @@ async function start(): Promise<void> {
     }
     vault = config.msgvaultDbPath ? openMsgvaultStore(config.msgvaultDbPath) : null
     const productStore = store
-    const cursorAuthority = { scope: randomUUID() }
+    const cursorAuthority = { scope: randomUUID(), digestKey: readSourceDigestKey }
     const handlers: RpcHandlers = {
       upsertAccount: (input) => productStore.upsertAccount(input),
       saveDraft: (input, id) => productStore.saveDraft(input, id),
       getDraft: (id) => productStore.getDraft(id),
+      reconcileMsgvaultReadSources: () => {
+        if (!vault) {
+          throw new ProductStoreError(
+            'msgvault_unavailable',
+            'REMEDIATION: configure msgvaultDbPath before reconciling msgvault read sources',
+          )
+        }
+        return reconcileMsgvaultReadSourcesInSnapshot(vault.db, productStore)
+      },
+      setReadSourceEnabled: (sourceId, enabled) => productStore.setReadSourceEnabled(sourceId, enabled),
       listUnifiedInbox: (options) => {
         if (!vault) {
           throw new ProductStoreError(
@@ -161,12 +177,7 @@ async function start(): Promise<void> {
             'REMEDIATION: configure msgvaultDbPath before listing the unified inbox',
           )
         }
-        return listUnifiedInbox(
-          vault.db,
-          productStore.connectedInboxSources(),
-          cursorAuthority,
-          options,
-        )
+        return listUnifiedInboxWithReconciledSnapshot(vault.db, productStore, cursorAuthority, options)
       },
       getOutbox: (id) => productStore.outbox.get(id),
       listAttention: (openOnly) => productStore.outbox.listAttention(openOnly),
@@ -194,6 +205,9 @@ async function start(): Promise<void> {
     onRequest((request) => {
       void (async () => {
         try {
+          if (process.env.BORING_MAIL_TEST_BLOCK_RPC === request.method) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000)
+          }
           const invoke = handlers[request.method] as (...args: unknown[]) => unknown
           const value = await invoke(...request.args)
           send({ type: 'response', id: request.id, value })

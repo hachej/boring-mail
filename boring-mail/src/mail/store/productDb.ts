@@ -30,6 +30,7 @@ export type {
   OutboxStatus,
   PendingOutbox,
   ProductStoreErrorCode,
+  ReadSourceReconcileResult,
   RejectedOutbox,
   ReplyDraftInput,
   ResolvedReplyTarget,

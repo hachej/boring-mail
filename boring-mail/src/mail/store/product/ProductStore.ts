@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID, type BinaryLike } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { decodeDraft, type DraftRow } from './codec.js'
 import { StoreContext, fail } from './context.js'
@@ -9,6 +9,8 @@ import {
   ProductStoreError,
   type AccountInput,
   type ConnectedInboxSource,
+  type MsgvaultReadSourceInput,
+  type ReadSourceReconcileResult,
   type DraftInput,
   type DraftRecord,
   type ProductStoreDependencies,
@@ -19,8 +21,10 @@ import {
 export class ProductStore {
   readonly outbox: OutboxMachine
   readonly #c: StoreContext
+  readonly #readSourceDigestKey: BinaryLike
   private constructor(db: DatabaseSync, deps: ProductStoreDependencies) {
     this.#c = new StoreContext(db, deps)
+    this.#readSourceDigestKey = deps.readSourceDigestKey ?? randomBytes(32)
     this.outbox = new OutboxMachine(this.#c)
   }
   static open(path: string, deps: ProductStoreDependencies): ProductStore {
@@ -40,35 +44,89 @@ export class ProductStore {
   }
   connectedInboxSources(): ConnectedInboxSource[] {
     const rows = this.#c.db.prepare(
-      `SELECT provider_source_id,primary_address,send_as_json
-         FROM mail_accounts WHERE connected=1 ORDER BY provider_source_id`,
+      `SELECT source_id,identities_json FROM mail_read_sources
+        WHERE enabled=1 AND present=1 ORDER BY source_id`,
     ).all() as Array<Record<string, unknown>>
     return rows.map((row) => {
-      if (!Number.isSafeInteger(row.provider_source_id) || Number(row.provider_source_id) <= 0) {
-        throw new ProductStoreError('corrupt_data', 'connected account provider source must be a positive integer')
+      if (!Number.isSafeInteger(row.source_id) || Number(row.source_id) <= 0) {
+        throw new ProductStoreError('corrupt_data', 'read source id must be a positive integer')
       }
-      const primaryAddress = row.primary_address
-      if (typeof primaryAddress !== 'string' || !primaryAddress.trim() ||
-          primaryAddress !== primaryAddress.trim().toLowerCase()) {
-        throw new ProductStoreError('corrupt_data', 'connected account primary address must be normalized text')
-      }
-      if (typeof row.send_as_json !== 'string') {
-        throw new ProductStoreError('corrupt_data', 'connected account send-as identities must be JSON text')
+      if (typeof row.identities_json !== 'string') {
+        throw new ProductStoreError('corrupt_data', 'read-source identities must be JSON text')
       }
       let parsed: unknown
-      try { parsed = JSON.parse(row.send_as_json) }
-      catch { throw new ProductStoreError('corrupt_data', 'connected account send-as identities contain malformed JSON') }
-      if (!Array.isArray(parsed) || parsed.length === 0 ||
-          !parsed.every((identity) => typeof identity === 'string' && identity.trim() &&
-            identity === identity.trim().toLowerCase())) {
-        throw new ProductStoreError('corrupt_data', 'connected account send-as identities are invalid')
+      try { parsed = JSON.parse(row.identities_json) }
+      catch { throw new ProductStoreError('corrupt_data', 'read-source identities contain malformed JSON') }
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        throw new ProductStoreError('corrupt_data', 'read-source identities must be a non-empty array')
       }
-      const identities = [...new Set(parsed as string[])]
-      if (identities.length !== parsed.length || !identities.includes(primaryAddress)) {
-        throw new ProductStoreError('corrupt_data', 'connected account identities violate primary/send-as invariants')
-      }
-      return { sourceId: row.provider_source_id as number, identities }
+      const identities = decodeNormalizedIdentitySet(parsed, 'read-source identities')
+      return { sourceId: row.source_id as number, identities }
     })
+  }
+  setReadSourceEnabled(sourceId: number, enabled: boolean): void {
+    if (!Number.isSafeInteger(sourceId) || sourceId <= 0) fail('invalid_input', 'read source id must be a positive safe integer')
+    if (typeof enabled !== 'boolean') fail('invalid_input', 'read source enabled must be boolean')
+    const now = this.#c.now()
+    const result = this.#c.db.prepare(
+      `UPDATE mail_read_sources SET enabled=?,reconciled_ms=? WHERE source_id=?`,
+    ).run(enabled ? 1 : 0, now, sourceId)
+    if (result.changes !== 1) throw new ProductStoreError('not_found', 'read source not found')
+  }
+  reconcileMsgvaultReadSources(input: MsgvaultReadSourceInput[]): ReadSourceReconcileResult {
+    if (!Array.isArray(input)) fail('invalid_input', 'msgvault read sources are required')
+    const normalized = normalizeReadSourceInputs(input)
+    const now = this.#c.now()
+    return this.#c.transaction(() => {
+      let inserted = 0
+      let updated = 0
+      const seen = new Set<number>()
+      for (const source of normalized) {
+        seen.add(source.sourceId)
+        const existing = this.#c.db.prepare(
+          `SELECT source_id FROM mail_read_sources WHERE source_id=?`,
+        ).get(source.sourceId) as { source_id: number } | undefined
+        if (existing) updated++
+        else inserted++
+        this.#c.db.prepare(
+          `INSERT INTO mail_read_sources(source_id,exact_identifier,identities_json,enabled,present,reconciled_ms)
+           VALUES(?,?,?,?,?,?)
+           ON CONFLICT(source_id) DO UPDATE SET
+             exact_identifier=excluded.exact_identifier,
+             identities_json=excluded.identities_json,
+             present=1,
+             reconciled_ms=excluded.reconciled_ms`,
+        ).run(
+          source.sourceId,
+          source.exactIdentifier,
+          JSON.stringify(source.identities),
+          1,
+          1,
+          now,
+        )
+      }
+      const rows = this.#c.db.prepare(`SELECT source_id FROM mail_read_sources WHERE present=1`).all() as Array<{ source_id: unknown }>
+      let vanished = 0
+      for (const row of rows) {
+        if (!Number.isSafeInteger(row.source_id) || Number(row.source_id) <= 0) {
+          throw new ProductStoreError('corrupt_data', 'read source id must be a positive integer')
+        }
+        const sourceId = row.source_id as number
+        if (!seen.has(sourceId)) {
+          const result = this.#c.db.prepare(
+            `UPDATE mail_read_sources SET present=0,reconciled_ms=? WHERE source_id=?`,
+          ).run(now, sourceId)
+          vanished += Number(result.changes ?? 0)
+        }
+      }
+      return { inserted, updated, vanished, generation: this.readSourceGeneration() }
+    })
+  }
+  private readSourceGeneration(): string {
+    return createHmac('sha256', this.#readSourceDigestKey)
+      .update('boring-mail.read-source-eligibility.v1\0')
+      .update(JSON.stringify(this.connectedInboxSources()))
+      .digest('base64url')
   }
   upsertAccount(input: AccountInput): void {
     const id = input.accountId.trim(),
@@ -200,3 +258,57 @@ export class ProductStore {
 }
 export const openProductStore = (path: string, deps: ProductStoreDependencies): ProductStore =>
   ProductStore.open(path, deps)
+
+function validMailIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 320 &&
+    !/[\s\x00-\x1F\x7F]/u.test(value) &&
+    value.indexOf('@') > 0 && value.indexOf('@') === value.lastIndexOf('@') && !value.endsWith('@')
+}
+
+function decodeNormalizedIdentitySet(values: unknown[], name: string): string[] {
+  const identities = values.map((identity) => {
+    if (typeof identity !== 'string') throw new ProductStoreError('corrupt_data', `${name} must contain text`)
+    const normalized = identity.trim().toLowerCase()
+    if (identity !== normalized || !validMailIdentity(normalized)) {
+      throw new ProductStoreError('corrupt_data', `${name} must contain normalized email identities`)
+    }
+    return normalized
+  })
+  const unique = [...new Set(identities)]
+  if (unique.length !== identities.length || unique.length === 0) {
+    throw new ProductStoreError('corrupt_data', `${name} must be unique and non-empty`)
+  }
+  return unique
+}
+
+function normalizeReadSourceInputs(input: MsgvaultReadSourceInput[]): MsgvaultReadSourceInput[] {
+  const sourceIds = new Set<number>()
+  const identityOwners = new Map<string, number>()
+  return input.map((source) => {
+    if (!source || !Number.isSafeInteger(source.sourceId) || source.sourceId <= 0 || sourceIds.has(source.sourceId)) {
+      throw new ProductStoreError('corrupt_data', 'msgvault read source ids must be unique positive safe integers')
+    }
+    sourceIds.add(source.sourceId)
+    if (typeof source.exactIdentifier !== 'string' || !source.exactIdentifier || source.exactIdentifier !== source.exactIdentifier.trim() ||
+        !validMailIdentity(source.exactIdentifier)) {
+      throw new ProductStoreError('corrupt_data', 'msgvault source identifier is invalid')
+    }
+    if (!Array.isArray(source.identities)) {
+      throw new ProductStoreError('corrupt_data', 'msgvault identities must be an array')
+    }
+    const identities = [...new Set([source.exactIdentifier, ...source.identities].map((identity) => {
+      if (typeof identity !== 'string') throw new ProductStoreError('corrupt_data', 'msgvault identities must be text')
+      const normalized = identity.trim().toLowerCase()
+      if (!validMailIdentity(normalized)) throw new ProductStoreError('corrupt_data', 'msgvault identities must be email-like')
+      return normalized
+    }))].sort()
+    for (const identity of identities) {
+      const owner = identityOwners.get(identity)
+      if (owner !== undefined && owner !== source.sourceId) {
+        throw new ProductStoreError('corrupt_data', 'msgvault identity/source collision detected')
+      }
+      identityOwners.set(identity, source.sourceId)
+    }
+    return { sourceId: source.sourceId, exactIdentifier: source.exactIdentifier, identities }
+  }).sort((left, right) => left.sourceId - right.sourceId)
+}

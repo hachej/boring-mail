@@ -8,7 +8,7 @@ import { openMsgvaultStore, resolveReplyTarget } from '../../src/mail/store/msgv
 import { openProductStore } from '../../src/mail/store/internalProductStore.js'
 const schema = readFileSync(new URL('../fixtures/msgvault-v0.19.sql', import.meta.url), 'utf8')
 describe('trusted msgvault integration', () => {
-  it('fails closed when connected-account identity storage is semantically corrupt', () => {
+  it('keeps read eligibility separate from corrupt send-account identity storage', () => {
     const root = mkdtempSync(join(tmpdir(), 'account-corrupt-')),
       path = join(root, 'product.db'),
       product = openProductStore(path, { now: () => 1, resolveReplyTarget: () => null })
@@ -16,10 +16,14 @@ describe('trusted msgvault integration', () => {
       product.upsertAccount({
         accountId: 'a', providerSourceId: 1, primaryAddress: 'a@x', sendAs: ['a@x'],
       })
+      product.reconcileMsgvaultReadSources([{ sourceId: 1, exactIdentifier: 'a@x', identities: ['alias@x'] }])
       const writer = new DatabaseSync(path)
       writer.prepare(`UPDATE mail_accounts SET send_as_json='[1]' WHERE account_id='a'`).run()
       writer.close()
-      expect(() => product.connectedInboxSources()).toThrow(/send-as identities are invalid/)
+      expect(product.connectedInboxSources()).toEqual([{ sourceId: 1, identities: ['a@x', 'alias@x'] }])
+      expect(() => product.saveDraft({
+        kind: 'compose', path: 'x.mail.md', accountId: 'a', sendAsAddress: 'a@x', to: ['b@x'], subject: 's', bodyMarkdown: 'b',
+      })).toThrow(/account.send_as must be a string array/)
     } finally {
       product.close()
     }
@@ -59,6 +63,10 @@ describe('trusted msgvault integration', () => {
       product.upsertAccount({
         accountId: 'c', providerSourceId: 44, primaryAddress: 'c@x', sendAs: ['c@x'], connected: false,
       })
+      product.reconcileMsgvaultReadSources([
+        { sourceId: 42, exactIdentifier: 'a@x', identities: ['alias@x'] },
+        { sourceId: 43, exactIdentifier: 'b@x', identities: ['b@x'] },
+      ])
       expect(product.connectedInboxSources()).toEqual([
         { sourceId: 42, identities: ['a@x', 'alias@x'] },
         { sourceId: 43, identities: ['b@x'] },

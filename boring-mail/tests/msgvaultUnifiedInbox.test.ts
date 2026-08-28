@@ -22,7 +22,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     { sourceId: 1, identities: ['owner-a@example.com', 'alias-a@example.com'] },
     { sourceId: 2, identities: ['owner-b@example.com'] },
   ]
-  const authority = { scope: 'fixture-process' }
+  const authority = { scope: 'fixture-process', digestKey: Buffer.alloc(32, 1) }
 
   beforeAll(() => {
     const path = join(mkdtempSync(join(tmpdir(), 'msgvault-unified-')), 'fixture.db')
@@ -41,7 +41,8 @@ describe('msgvaultAdapter — unified inbox projection', () => {
         (1001,'ALIAS-A@example.com',NULL,'example.com'),
         (1002,'alias-a@example.com',NULL,'example.com'),
         (1003,'owner-b@example.com',NULL,'example.com'),
-        (1004,'disconnected@example.com',NULL,'example.com');
+        (1004,'disconnected@example.com',NULL,'example.com'),
+        (1005,'sender@example.com','Sender Name','example.com');
     `)
     const insert = raw.prepare(`INSERT INTO messages(
       id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,
@@ -81,6 +82,10 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     message(402, 11, 1, '<stable@example.com>', '2030-01-02 00:00:00+00:00', 'source one')
 
     message(601, 11, 1, '<single@example.com>', '2030-01-01 00:00:00+00:00', 'singleton')
+    raw.prepare(`UPDATE messages SET sender_id=1005,snippet=?,subject=? WHERE id=601`).run(
+      'quote " '.repeat(3_000),
+      'é'.repeat(2_000),
+    )
     message(602, 11, 1, null, '2029-12-31 00:00:00+00:00', 'missing id')
     message(603, 12, 2, '<equal-b@example.com>', '2029-12-30 00:00:00+00:00', 'equal b')
     message(604, 11, 1, '<equal-a@example.com>', '2029-12-30 00:00:00+00:00', 'equal a')
@@ -157,8 +162,52 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     })
   })
 
+  it('bounds provider text prefixes and maps sender fields without changing page order', () => {
+    const singleton = listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).items.find((item) => item.messageId === 601)!
+    expect(singleton.senderName).toBe('Sender Name')
+    expect(singleton.senderEmail).toBe('sender@example.com')
+    expect(Buffer.byteLength(singleton.subject ?? '', 'utf8')).toBeLessThanOrEqual(1024)
+    expect(Buffer.byteLength(singleton.snippet ?? '', 'utf8')).toBeLessThanOrEqual(2048)
+    expect(singleton.textTruncated.subject).toBe(true)
+    expect(singleton.textTruncated.snippet).toBe(true)
+  })
+
+  it('uses octet_length guards for oversized provider fields and RFC822 ids', () => {
+    const longRfc822 = `<${'x'.repeat(1_000)}@example.com>`
+    const huge = 'é'.repeat(2_000_000)
+    try {
+      raw.prepare(`INSERT INTO messages(
+        id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,snippet,sender_id,is_read,attachment_count
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
+        980, 11, 1, longRfc822, 'email', '2036-01-01 00:00:00+00:00', huge, huge, 1005, 1, 0,
+      )
+      raw.prepare(`INSERT INTO messages(
+        id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count
+      ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+        981, 12, 2, longRfc822, 'email', '2035-12-31 00:00:00+00:00', 'same oversized id remains separate', 1, 0,
+      )
+      const items = listUnifiedInbox(store.db, eligible, authority, { limit: 5 }).items
+      expect(items.find((item) => item.messageId === 980)).toMatchObject({
+        rfc822MessageId: null,
+        subject: null,
+        snippet: null,
+        coalesced: false,
+        copyCount: 1,
+        textTruncated: { subject: true, snippet: true },
+      })
+      expect(items.find((item) => item.messageId === 981)).toMatchObject({
+        rfc822MessageId: null,
+        subject: 'same oversized id remains separate',
+        coalesced: false,
+        copyCount: 1,
+      })
+    } finally {
+      raw.exec('DELETE FROM messages WHERE id IN (980,981)')
+    }
+  })
+
   it('returns only replyable ownership for every correlated item', () => {
-    const items = listUnifiedInbox(store.db, eligible, authority, { limit: 200 }).items
+    const items = listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).items
     for (const item of items) {
       if (item.rfc822MessageId === null) continue
       expect(resolveReplyTarget(store.db, item.messageId)).toEqual({
@@ -199,7 +248,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     } while (cursor)
     expect(seen).toEqual(expected)
     expect(new Set(seen).size).toBe(seen.length)
-    expect(listUnifiedInbox(store.db, eligible, authority, { limit: 200 }).nextCursor).toBeNull()
+    expect(listUnifiedInbox(store.db, eligible, authority, { limit: 50 }).nextCursor).toBeNull()
   })
 
   it('strictly decodes opaque cursors and invalidates eligibility, process and archive changes', () => {
@@ -210,6 +259,9 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     expect(() => listUnifiedInbox(store.db, eligible, authority, { cursor: `${cursor}=` })).toThrow(/malformed/)
     expect(() => listUnifiedInbox(store.db, eligible, authority, { cursor: `${cursor}x` })).toThrow(/malformed/)
     const payload = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Record<string, unknown>
+    expect(payload.e).toEqual(expect.stringMatching(/^[A-Za-z0-9_-]{43}$/))
+    expect(String(payload.e)).not.toContain('owner-a')
+    expect(String(payload.e)).not.toContain('alias-a')
     const extraKey = Buffer.from(JSON.stringify({ ...payload, extra: true })).toString('base64url')
     expect(() => listUnifiedInbox(store.db, eligible, authority, { cursor: extraKey })).toThrow(/invalid payload/)
     const reordered = Buffer.from(JSON.stringify({
@@ -220,7 +272,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
       store.db, eligible.slice(0, 1), authority, { cursor },
     )).toThrowError(expect.objectContaining({ code: 'stale_cursor' }))
     expect(() => listUnifiedInbox(
-      store.db, eligible, { scope: 'replacement-process' }, { cursor },
+      store.db, eligible, { scope: 'replacement-process', digestKey: authority.digestKey }, { cursor },
     )).toThrowError(expect.objectContaining({ code: 'stale_cursor' }))
 
     try {
@@ -240,6 +292,7 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     try {
       expect(() => listUnifiedInbox(store.db, eligible, {
         scope: authority.scope,
+        digestKey: authority.digestKey,
         beforePageQuery: () => raw.exec(`INSERT INTO messages(
           id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count
         ) VALUES(901,11,1,'<race@example.com>','email','2035-01-01 00:00:00+00:00','race',1,0)`),
@@ -253,6 +306,9 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     const plan = explainUnifiedInboxQueryPlan(store.db, eligible)
     expect(plan.some((detail) => /candidate USING INDEX idx_messages_live_sent_at/.test(detail))).toBe(true)
     expect(plan.some((detail) => /candidate USING (?:COVERING )?INDEX idx_messages_rfc822/.test(detail))).toBe(false)
+    expect(plan.some((detail) => /SEARCH primary_copy USING INDEX idx_messages_rfc822_message_id/.test(detail))).toBe(true)
+    expect(plan.some((detail) => /SEARCH copy USING INDEX idx_messages_rfc822_message_id/.test(detail))).toBe(true)
+    expect(plan.some((detail) => /SCAN (?:primary_copy|copy)\b/.test(detail))).toBe(false)
     const after = { messageAt: '2029-12-31 00:00:00+00:00', messageId: 602 }
     const deepPlan = explainUnifiedInboxQueryPlan(store.db, eligible, after)
     expect(deepPlan.some((detail) => /SEARCH candidate USING INDEX idx_messages_live_sent_at/.test(detail))).toBe(true)
@@ -275,8 +331,15 @@ describe('msgvaultAdapter — unified inbox projection', () => {
     expect(() => listUnifiedInbox(
       store.db, [{ sourceId: 6, identities: ['time@example.com'] }], authority,
     )).toThrowError(expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/canonical UTC/) }))
+    raw.exec(`INSERT INTO sources(id,source_type,identifier) VALUES(7,'gmail','blob@example.com');
+      INSERT INTO conversations(id,source_id,conversation_type) VALUES(19,7,'email_thread')`)
+    raw.prepare(`INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count)
+      VALUES(952,19,7,'<blob@example.com>','email','2036-01-02 00:00:00+00:00',?,1,0)`).run(Buffer.from([0xff]))
+    expect(() => listUnifiedInbox(
+      store.db, [{ sourceId: 7, identities: ['blob@example.com'] }], authority,
+    )).toThrowError(expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/subject storage class/) }))
     expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 0 })).toThrow(/limit must/)
-    expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 201 })).toThrow(/limit must/)
+    expect(() => listUnifiedInbox(store.db, eligible, authority, { limit: 51 })).toThrow(/limit must/)
     expect(() => listUnifiedInbox(
       store.db, eligible, authority, null as unknown as Parameters<typeof listUnifiedInbox>[3],
     )).toThrowError(expect.objectContaining({ code: 'invalid_input' }))

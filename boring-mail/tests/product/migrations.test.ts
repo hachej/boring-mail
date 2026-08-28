@@ -42,6 +42,21 @@ describe('product migrations', () => {
     ).toBe(1)
     db.close()
   })
+  it('migrates v1 connected send accounts into the independent read catalog once', () => {
+    const path = temp()
+    const first = openProductStore(path, deps)
+    first.upsertAccount({ accountId: 'a', providerSourceId: 1, primaryAddress: 'a@x', sendAs: ['a@x', 'alias@x'] })
+    first.upsertAccount({ accountId: 'b', providerSourceId: 2, primaryAddress: 'b@x', sendAs: ['b@x'], connected: false })
+    first.close()
+    const legacy = new DatabaseSync(path)
+    legacy.exec(`DROP TABLE mail_read_sources; PRAGMA user_version=1`)
+    legacy.close()
+    const migrated = openProductStore(path, deps)
+    expect(migrated.connectedInboxSources()).toEqual([{ sourceId: 1, identities: ['a@x', 'alias@x'] }])
+    migrated.upsertAccount({ accountId: 'c', providerSourceId: 3, primaryAddress: 'c@x', sendAs: ['c@x'] })
+    expect(migrated.connectedInboxSources()).toEqual([{ sourceId: 1, identities: ['a@x', 'alias@x'] }])
+    migrated.close()
+  })
   it('rejects future and version-only fake current schemas', () => {
     for (const fake of ['future', 'fake']) {
       const path = temp(),

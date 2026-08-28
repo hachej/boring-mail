@@ -25,6 +25,7 @@ import type {
   HumanDecisionOutbox,
   OutboxRecord,
   RejectedOutbox,
+  ReadSourceReconcileResult,
   SentOutbox,
   UnifiedInboxOptions,
   UnifiedInboxPage,
@@ -41,7 +42,7 @@ import type {
 } from './mailStoreProtocol.js'
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 10_000
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const DEFAULT_REQUEST_TIMEOUT_MS = 7_500
 const DEFAULT_MAX_PENDING_REQUESTS = 100
 const MAX_TIMER_MS = 2_147_483_647
 
@@ -50,7 +51,7 @@ export interface WorkerTransport {
   on(event: 'message', listener: (value: RpcResponse) => void): this
   on(event: 'error', listener: (error: Error) => void): this
   on(event: 'exit', listener: (code: number) => void): this
-  terminate(): Promise<number>
+  terminate(force?: boolean): Promise<number>
 }
 export type MailStoreWorkerFactory = (config: MailStoreWorkerConfig) => WorkerTransport
 export interface MailStoreOpenOptions {
@@ -90,6 +91,8 @@ export interface MailStore {
   upsertAccount(input: AccountInput): Promise<void>
   saveDraft(input: DraftInput, requestedId?: string): Promise<DraftRecord>
   getDraft(id: string): Promise<DraftRecord | null>
+  reconcileMsgvaultReadSources(): Promise<ReadSourceReconcileResult>
+  setReadSourceEnabled(sourceId: number, enabled: boolean): Promise<void>
   listUnifiedInbox(options?: UnifiedInboxOptions): Promise<UnifiedInboxPage>
   close(): Promise<void>
 }
@@ -214,15 +217,19 @@ class StorageProcessTransport extends EventEmitter {
     this.#child.send(value, (error) => { if (error) this.emit('error', error) })
   }
 
-  terminate(): Promise<number> {
+  terminate(force = false): Promise<number> {
     if (this.#termination) return this.#termination
     if (this.#closeCode !== null) return Promise.resolve(this.#closeCode)
     this.#termination = (async () => {
-      const force = setTimeout(() => this.#child.kill('SIGKILL'), TERMINATE_GRACE_MS)
-      force.unref()
+      if (force) {
+        this.#child.kill('SIGKILL')
+        return this.#closed
+      }
+      const forceTimer = setTimeout(() => this.#child.kill('SIGKILL'), TERMINATE_GRACE_MS)
+      forceTimer.unref()
       this.#child.kill('SIGTERM')
       const code = await this.#closed // `close` is guaranteed even when spawn fails.
-      clearTimeout(force)
+      clearTimeout(forceTimer)
       return code
     })()
     return this.#termination
@@ -299,6 +306,9 @@ class RpcClient {
       pending.reject(error)
     }
     this.#pending.clear()
+    if (error instanceof ProductStoreError && error.code === 'rpc_timeout') {
+      void this.worker.terminate(true)
+    }
     this.onFailure(error)
   }
 
@@ -386,7 +396,7 @@ function positiveOption(value: number | undefined, fallback: number, name: strin
 function limits(options: MailStoreOpenOptions): RpcLimits {
   return {
     startupTimeoutMs: positiveOption(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 'startupTimeoutMs'),
-    requestTimeoutMs: positiveOption(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 'requestTimeoutMs'),
+    requestTimeoutMs: positiveOption(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 'requestTimeoutMs', DEFAULT_REQUEST_TIMEOUT_MS),
     maxPendingRequests: positiveOption(options.maxPendingRequests, DEFAULT_MAX_PENDING_REQUESTS, 'maxPendingRequests'),
   }
 }
@@ -536,6 +546,12 @@ class MailStoreFacade implements MailStore {
     return this.call('saveDraft', input, requestedId)
   }
   getDraft(id: string): Promise<DraftRecord | null> { return this.call('getDraft', id) }
+  reconcileMsgvaultReadSources(): Promise<ReadSourceReconcileResult> {
+    return this.call('reconcileMsgvaultReadSources')
+  }
+  setReadSourceEnabled(sourceId: number, enabled: boolean): Promise<void> {
+    return this.call('setReadSourceEnabled', sourceId, enabled)
+  }
   listUnifiedInbox(options?: UnifiedInboxOptions): Promise<UnifiedInboxPage> {
     return this.call('listUnifiedInbox', options)
   }

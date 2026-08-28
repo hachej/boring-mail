@@ -15,6 +15,8 @@ import { ProductStoreError } from './product/types.js'
 import {
   openMsgvaultReadOnly,
   readMsgvaultTableColumns,
+  validateMsgvaultAccountIdentitiesSchema,
+  validateMsgvaultMessageBodiesSchema,
   validateMsgvaultSourcesSchema,
   type MsgvaultSchemaColumn,
 } from './msgvault/schema.js'
@@ -56,8 +58,11 @@ export interface MessageBody {
 
 export {
   correlatableMessageId,
+  currentMsgvaultDataVersion,
+  eligibleSourceGeneration,
   explainUnifiedInboxQueryPlan,
   listUnifiedInbox,
+  listUnifiedInboxInSnapshot,
 } from './msgvault/unifiedInboxProjection.js'
 export type {
   EligibleInboxSource,
@@ -75,6 +80,55 @@ function validateIntegerPrimaryKey(columns: SchemaColumn[], table: string, error
   const primaryKeys = columns.filter((column) => column.pk > 0)
   if (!id || !/int/i.test(id.type) || id.pk !== 1 || primaryKeys.length !== 1) {
     errors.push(`${table}.id must have INTEGER affinity and be the single primary key`)
+  }
+}
+
+function textAffinity(column: SchemaColumn | undefined, name: string, notNull: boolean, errors: string[]): void {
+  if (!column || !/(char|clob|text)/i.test(column.type) || (notNull && column.notnull !== 1)) {
+    errors.push(`${name} must ${notNull ? 'be NOT NULL and ' : ''}have TEXT affinity`)
+  }
+}
+function integerAffinity(column: SchemaColumn | undefined, name: string, notNull: boolean, errors: string[]): void {
+  if (!column || !/int/i.test(column.type) || (notNull && column.notnull !== 1)) {
+    errors.push(`${name} must ${notNull ? 'be NOT NULL and ' : ''}have INTEGER affinity`)
+  }
+}
+interface ForeignKeyRow {
+  id: number
+  seq: number
+  table: string
+  from: string
+  to: string
+  on_update: string
+  on_delete: string
+  match: string
+}
+function foreignKeys(db: DatabaseSync, table: string): ForeignKeyRow[] {
+  return db.prepare(`PRAGMA foreign_key_list(${table})`).all() as unknown as ForeignKeyRow[]
+}
+function requireForeignKey(
+  db: DatabaseSync,
+  table: string,
+  from: string,
+  targetTable: string,
+  targetColumn: string,
+  errors: string[],
+): void {
+  const groups = new Map<number, ForeignKeyRow[]>()
+  for (const row of foreignKeys(db, table)) {
+    const group = groups.get(row.id) ?? []
+    group.push(row)
+    groups.set(row.id, group)
+  }
+  const expected = [...groups.values()].some((group) => {
+    const rows = group.sort((left, right) => left.seq - right.seq)
+    const row = rows[0]
+    return rows.length === 1 && row !== undefined && row.seq === 0 && row.from === from &&
+      row.table === targetTable && row.to === targetColumn && row.match === 'NONE' &&
+      row.on_update === 'NO ACTION' && row.on_delete === 'NO ACTION'
+  })
+  if (!expected) {
+    errors.push(`${table}.${from} must be an exact single-column NO ACTION foreign key to ${targetTable}(${targetColumn})`)
   }
 }
 
@@ -114,6 +168,8 @@ const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
   message_raw: ['message_id', 'raw_data', 'raw_format', 'compression'],
   attachments: ['id', 'message_id', 'filename', 'mime_type', 'size', 'content_hash', 'storage_path'],
   messages_fts: ['message_id'],
+  account_identities: ['source_id', 'address', 'source_signal', 'confirmed_at'],
+  message_bodies: ['message_id', 'body_text', 'body_html'],
 }
 
 /**
@@ -151,38 +207,47 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
     }
     if (table === 'sources') columnErrors.push(...validateMsgvaultSourcesSchema(columns))
     if (table === 'messages') {
-      const source = columns.find((column) => column.name === 'source_id')
-      const rfc822 = columns.find((column) => column.name === 'rfc822_message_id')
-      const messageType = columns.find((column) => column.name === 'message_type')
-      if (!source || !/int/i.test(source.type) || source.notnull !== 1) {
-        columnErrors.push('messages.source_id must be a NOT NULL integer')
-      }
-      if (!rfc822 || !/(char|clob|text)/i.test(rfc822.type)) {
-        columnErrors.push('messages.rfc822_message_id must have TEXT affinity')
-      }
-      if (!messageType || !/(char|clob|text)/i.test(messageType.type) || messageType.notnull !== 1) {
-        columnErrors.push('messages.message_type must be NOT NULL with TEXT affinity')
-      }
+      integerAffinity(columns.find((column) => column.name === 'conversation_id'), 'messages.conversation_id', true, columnErrors)
+      integerAffinity(columns.find((column) => column.name === 'source_id'), 'messages.source_id', true, columnErrors)
+      integerAffinity(columns.find((column) => column.name === 'sender_id'), 'messages.sender_id', false, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'rfc822_message_id'), 'messages.rfc822_message_id', false, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'message_type'), 'messages.message_type', true, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'subject'), 'messages.subject', false, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'snippet'), 'messages.snippet', false, columnErrors)
+      requireForeignKey(db, 'messages', 'conversation_id', 'conversations', 'id', columnErrors)
+      requireForeignKey(db, 'messages', 'source_id', 'sources', 'id', columnErrors)
+      requireForeignKey(db, 'messages', 'sender_id', 'participants', 'id', columnErrors)
     }
     if (table === 'conversations') {
-      const source = columns.find((column) => column.name === 'source_id')
-      if (!source || !/int/i.test(source.type) || source.notnull !== 1) {
-        columnErrors.push('conversations.source_id must be a NOT NULL integer')
-      }
+      integerAffinity(columns.find((column) => column.name === 'source_id'), 'conversations.source_id', true, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'conversation_type'), 'conversations.conversation_type', true, columnErrors)
+      requireForeignKey(db, 'conversations', 'source_id', 'sources', 'id', columnErrors)
+    }
+    if (table === 'participants') {
+      validateIntegerPrimaryKey(columns, table, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'email_address'), 'participants.email_address', false, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'display_name'), 'participants.display_name', false, columnErrors)
+    }
+    if (table === 'account_identities') {
+      columnErrors.push(...validateMsgvaultAccountIdentitiesSchema(columns))
+    }
+    if (table === 'message_bodies') {
+      columnErrors.push(...validateMsgvaultMessageBodiesSchema(columns))
+      requireForeignKey(db, 'message_bodies', 'message_id', 'messages', 'id', columnErrors)
     }
     if (table === 'message_recipients') {
-      const message = columns.find((column) => column.name === 'message_id')
-      const recipientType = columns.find((column) => column.name === 'recipient_type')
-      const email = columns.find((column) => column.name === 'email_address')
-      if (!message || !/int/i.test(message.type) || message.notnull !== 1) {
-        columnErrors.push('message_recipients.message_id must be a NOT NULL integer')
-      }
-      if (!recipientType || !/(char|clob|text)/i.test(recipientType.type) || recipientType.notnull !== 1) {
-        columnErrors.push('message_recipients.recipient_type must be NOT NULL with TEXT affinity')
-      }
-      if (!email || !/(char|clob|text)/i.test(email.type)) {
-        columnErrors.push('message_recipients.email_address must have TEXT affinity')
-      }
+      integerAffinity(columns.find((column) => column.name === 'message_id'), 'message_recipients.message_id', true, columnErrors)
+      integerAffinity(columns.find((column) => column.name === 'participant_id'), 'message_recipients.participant_id', true, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'recipient_type'), 'message_recipients.recipient_type', true, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'email_address'), 'message_recipients.email_address', false, columnErrors)
+      requireForeignKey(db, 'message_recipients', 'message_id', 'messages', 'id', columnErrors)
+      requireForeignKey(db, 'message_recipients', 'participant_id', 'participants', 'id', columnErrors)
+    }
+    if (table === 'attachments') {
+      integerAffinity(columns.find((column) => column.name === 'message_id'), 'attachments.message_id', true, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'filename'), 'attachments.filename', false, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'mime_type'), 'attachments.mime_type', false, columnErrors)
+      requireForeignKey(db, 'attachments', 'message_id', 'messages', 'id', columnErrors)
     }
   }
   const capabilities = inspectIndexCapabilities(db)
