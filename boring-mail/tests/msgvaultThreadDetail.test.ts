@@ -17,6 +17,9 @@ const eligible = [{ sourceId: 1, identities: ['owner@example.invalid'] }]
 function stamp(day: number): string {
   return `2030-01-${String(day).padStart(2, '0')} 00:00:00+00:00`
 }
+function secondsBefore(baseIso: string, seconds: number): string {
+  return new Date(Date.parse(baseIso) - seconds * 1000).toISOString().replace('T', ' ').replace('.000Z', '+00:00')
+}
 
 describe('msgvaultAdapter — bounded authorized thread detail', () => {
   let raw: DatabaseSync
@@ -38,14 +41,19 @@ describe('msgvaultAdapter — bounded authorized thread detail', () => {
         (2,'owner@example.invalid','Owner Name','example.invalid');
       INSERT INTO account_identities(source_id,address) VALUES(1,'owner@example.invalid'),(2,'other@example.invalid');
     `)
+    const hugeSenderName = `Sender 😀 \" `.repeat(100_000)
+    const hugeSenderEmail = `${'a'.repeat(300)}@example.invalid${'b'.repeat(100_000)}`
+    raw.prepare(`UPDATE participants SET display_name=?,email_address=? WHERE id=1`).run(hugeSenderName, hugeSenderEmail)
     const insert = raw.prepare(`INSERT INTO messages(
       id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,sender_id,is_read,attachment_count,deleted_at,deleted_from_source_at
     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+    const hugeSubject = `subject \" 😀 `.repeat(300_000)
+    const hugeBody = `body \" \\ 😀\n`.repeat(100_000)
     for (let id = 1; id <= 30; id++) {
-      insert.run(id, 10, 1, `<m-${id}@example.invalid>`, 'email', stamp(id), id === 1 ? null : `subject ${id}`, 1, 1, 0, null, null)
+      insert.run(id, 10, 1, `<m-${id}@example.invalid>`, 'email', stamp(id), id === 30 ? hugeSubject : id === 1 ? null : `subject ${id}`, 1, 1, 0, null, null)
       raw.prepare(`INSERT INTO message_bodies(message_id,body_text,body_html) VALUES(?,?,?)`).run(
         id,
-        id === 1 ? `selected C0\u0000 quote " slash \\ astral 😀 ${'x'.repeat(4096)}` : `body ${id}`,
+        id === 1 ? `selected C0\u0000 quote " slash \\ astral 😀 ${'x'.repeat(128 * 1024)}` : id === 29 ? hugeBody : `body ${id}`,
         '<b>html must never be selected</b>',
       )
     }
@@ -63,13 +71,17 @@ describe('msgvaultAdapter — bounded authorized thread detail', () => {
         id, 30, 2, id === 23 ? 'reply-to' : id % 3 === 0 ? 'bcc' : id % 2 === 0 ? 'cc' : 'to',
         `Recipient ${id}`, id === 24 ? null : `recipient-${id}@example.invalid`,
       )
+      const filename = id === 1 ? `file-\"-😀-`.repeat(200_000) : id === 25 ? null : `file-${id}.txt`
+      const mimeType = id === 2 ? `application/x-${'m'.repeat(200_000)}` : 'text/plain'
+      const size = id === 24 ? -1 : id
       raw.prepare(`INSERT INTO attachments(id,message_id,filename,mime_type,size,content_hash,storage_path) VALUES(?,?,?,?,?,?,?)`).run(
-        id, 30, id === 25 ? null : `file-${id}.txt`, 'text/plain', id === 24 ? -1 : id, `hash-${id}`, `/private/${id}`,
+        id, 30, filename, mimeType, size, `hash-${id}`, `/private/${id}`,
       )
+      if (id === 18) raw.exec(`UPDATE attachments SET size=9007199254740992 WHERE id=18`)
     }
     for (let id = 1001; id <= 1505; id++) {
       const offset = id - 1000
-      insert.run(id, 40, 1, `<many-${offset}@example.invalid>`, 'email', `2032-01-${String(((offset - 1) % 28) + 1).padStart(2, '0')} 00:00:00+00:00`, `many ${offset}`, 1, 1, 0, null, null)
+      insert.run(id, 40, 1, `<many-${offset}@example.invalid>`, 'email', secondsBefore('2032-01-01T00:00:00.000Z', offset), `many ${offset}`, 1, 1, 0, null, null)
       raw.prepare(`INSERT INTO message_bodies(message_id,body_text,body_html) VALUES(?,?,?)`).run(id, `many body ${offset}`, '<i>html</i>')
     }
     store = openMsgvaultStore(path)
@@ -96,12 +108,18 @@ describe('msgvaultAdapter — bounded authorized thread detail', () => {
     expect(detail.historyTruncated).toBe(true)
     expect(detail.messages[0].bodyText).toContain('selected C0 quote')
     expect(detail.messages[0].bodyText).not.toContain('\u0000')
+    expect(Buffer.byteLength(detail.messages[0].bodyText, 'utf8')).toBeLessThanOrEqual(64 * 1024)
+    expect(detail.messages[0].bodyTruncated).toBe(true)
+    const oversizedNonSelected = detail.messages.find((message) => message.messageId === 29)!
+    expect(Buffer.byteLength(oversizedNonSelected.bodyText, 'utf8')).toBeLessThanOrEqual(64 * 1024)
+    expect(oversizedNonSelected.bodyText.length).toBeGreaterThan(0)
+    expect(oversizedNonSelected.bodyTruncated).toBe(true)
   })
 
   it('retains an old selected row beyond the 500 inspected candidates', () => {
-    const detail = getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 1001 })!
+    const detail = getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 1505 })!
     expect(detail.messages).toHaveLength(25)
-    expect(detail.messages.some((message) => message.messageId === 1001 && message.selected)).toBe(true)
+    expect(detail.messages.some((message) => message.messageId === 1505 && message.selected)).toBe(true)
     expect(detail.selectedOutsideRecentWindow).toBe(true)
     expect(detail.historyTruncated).toBe(true)
   })
@@ -113,6 +131,17 @@ describe('msgvaultAdapter — bounded authorized thread detail', () => {
     expect(selected.recipients.every((recipient) => ['to', 'cc', 'bcc'].includes(recipient.type) && recipient.email.endsWith('@example.invalid'))).toBe(true)
     expect(selected.attachments).toHaveLength(20)
     expect(selected.attachments.every((attachment) => !('contentHash' in attachment) && !('storagePath' in attachment))).toBe(true)
+    expect(detail.subject.length).toBeGreaterThan(0)
+    expect(Buffer.byteLength(detail.subject, 'utf8')).toBeLessThanOrEqual(2 * 1024)
+    expect(selected.sender.name?.length).toBeGreaterThan(0)
+    expect(Buffer.byteLength(selected.sender.name ?? '', 'utf8')).toBeLessThanOrEqual(512)
+    expect(selected.sender.email?.length).toBeGreaterThan(0)
+    expect(Buffer.byteLength(selected.sender.email ?? '', 'utf8')).toBeLessThanOrEqual(320)
+    expect(selected.attachments[0].filename?.length).toBeGreaterThan(0)
+    expect(Buffer.byteLength(selected.attachments[0].filename ?? '', 'utf8')).toBeLessThanOrEqual(1024)
+    expect(selected.attachments[1].mimeType?.length).toBeGreaterThan(0)
+    expect(Buffer.byteLength(selected.attachments[1].mimeType ?? '', 'utf8')).toBeLessThanOrEqual(255)
+    expect(selected.attachments.some((attachment) => attachment.byteSize === null)).toBe(true)
     expect(selected.metadataTruncated).toBe(true)
   })
 
@@ -127,6 +156,30 @@ describe('msgvaultAdapter — bounded authorized thread detail', () => {
       )
     } finally {
       raw.prepare(`UPDATE messages SET subject=NULL WHERE id=1`).run()
+    }
+    raw.exec(`UPDATE messages SET subject=CAST(x'61ff62' AS TEXT) WHERE id=1`)
+    try {
+      expect(() => getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 1 })).toThrowError(
+        expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/valid UTF-8/) }),
+      )
+    } finally {
+      raw.prepare(`UPDATE messages SET subject=NULL WHERE id=1`).run()
+    }
+    raw.exec(`UPDATE attachments SET size=CAST('bad' AS TEXT) WHERE id=1`)
+    try {
+      expect(() => getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 30 })).toThrowError(
+        expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/attachment size storage class/) }),
+      )
+    } finally {
+      raw.prepare(`UPDATE attachments SET size=1 WHERE id=1`).run()
+    }
+    raw.exec(`UPDATE attachments SET size=x'01' WHERE id=1`)
+    try {
+      expect(() => getUnifiedThreadInSnapshot(store.db, eligible, { messageId: 30 })).toThrowError(
+        expect.objectContaining({ code: 'corrupt_data', message: expect.stringMatching(/attachment size storage class/) }),
+      )
+    } finally {
+      raw.prepare(`UPDATE attachments SET size=1 WHERE id=1`).run()
     }
   })
 

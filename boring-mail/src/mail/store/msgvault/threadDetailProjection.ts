@@ -32,6 +32,7 @@ const FILENAME_FETCH_BYTES = FILENAME_BYTES + 4
 const MIME_FETCH_BYTES = MIME_BYTES + 4
 const TYPE_FETCH_BYTES = TYPE_BYTES + 4
 const EMPTY_DETAIL_SUBJECT = '(no subject)'
+const SQLITE_MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 function positiveInteger(value: unknown, name: string): number {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) {
@@ -61,15 +62,29 @@ function blobBytes(value: unknown, name: string): Uint8Array | null {
   if (value instanceof Uint8Array) return value
   throw new ProductStoreError('corrupt_data', `${name} bounded prefix must be bytes or null`)
 }
-function decodeUtf8Prefix(bytes: Uint8Array, name: string): string {
+function continuationByte(value: number): boolean { return value >= 0x80 && value <= 0xbf }
+function validTerminalUtf8Prefix(bytes: Uint8Array): boolean {
+  if (bytes.length === 1) return bytes[0]! >= 0xc2 && bytes[0]! <= 0xf4
+  if (bytes.length === 2) return bytes[0]! >= 0xe0 && bytes[0]! <= 0xf4 && continuationByte(bytes[1]!)
+  if (bytes.length === 3) return bytes[0]! >= 0xf0 && bytes[0]! <= 0xf4 && continuationByte(bytes[1]!) && continuationByte(bytes[2]!)
+  return false
+}
+function decodeUtf8Prefix(bytes: Uint8Array, name: string): { value: string; clippedTerminalBytes: boolean } {
   const decoder = new TextDecoder('utf-8', { fatal: true })
-  for (let end = bytes.length; end >= 0; end--) {
-    try { return decoder.decode(bytes.subarray(0, end)) }
-    catch {
-      if (end === 0) throw new ProductStoreError('corrupt_data', `${name} is not valid UTF-8 text`)
+  const maxClip = Math.min(3, bytes.length)
+  for (let clip = 0; clip <= maxClip; clip++) {
+    try {
+      const value = decoder.decode(bytes.subarray(0, bytes.length - clip))
+      if (clip === 0 || validTerminalUtf8Prefix(bytes.subarray(bytes.length - clip))) {
+        return { value, clippedTerminalBytes: clip > 0 }
+      }
+    } catch {
+      // Retry only the maximum UTF-8 terminal sequence width. If removing up to
+      // three terminal bytes still fails, the invalid byte is interior provider
+      // corruption, not a bounded-prefix edge.
     }
   }
-  return ''
+  throw new ProductStoreError('corrupt_data', `${name} is not valid UTF-8 text`)
 }
 interface BoundedText { value: string | null; truncated: boolean }
 function boundedProviderText(row: Record<string, unknown>, prefix: string, name: string, maxBytes: number): BoundedText {
@@ -84,8 +99,15 @@ function boundedProviderText(row: Record<string, unknown>, prefix: string, name:
     if (overflowed) return { value: null, truncated: true }
     throw new ProductStoreError('corrupt_data', `${name} text storage missing bytes`)
   }
-  const normalized = normalizeAndTruncateProviderText(decodeUtf8Prefix(bytes, name), maxBytes)
-  return { value: normalized.value, truncated: overflowed || normalized.truncated }
+  const decoded = decodeUtf8Prefix(bytes, name)
+  if (decoded.clippedTerminalBytes && !overflowed) throw new ProductStoreError('corrupt_data', `${name} is not valid UTF-8 text`)
+  const normalized = normalizeAndTruncateProviderText(decoded.value, maxBytes)
+  return { value: normalized.value, truncated: overflowed || decoded.clippedTerminalBytes || normalized.truncated }
+}
+function validMailAddress(value: string): boolean {
+  return value.length > 0 && value.length <= EMAIL_BYTES &&
+    !/[\s\x00-\x1F\x7F]/u.test(value) &&
+    value.indexOf('@') > 0 && value.indexOf('@') === value.lastIndexOf('@') && !value.endsWith('@')
 }
 function boundedProviderEmail(row: Record<string, unknown>, prefix: string, name: string): BoundedText {
   const storageClass = row[`${prefix}_type`]
@@ -96,8 +118,14 @@ function boundedProviderEmail(row: Record<string, unknown>, prefix: string, name
   if (storageClass === 'null') return { value: null, truncated: overflowed }
   const bytes = blobBytes(row[`${prefix}_blob`], name)
   if (bytes === null) return { value: null, truncated: true }
-  const normalized = normalizeAndTruncateProviderEmail(decodeUtf8Prefix(bytes, name), EMAIL_BYTES)
-  return { value: normalized.value, truncated: overflowed || normalized.truncated || normalized.value === null }
+  const decoded = decodeUtf8Prefix(bytes, name)
+  if (decoded.clippedTerminalBytes && !overflowed) throw new ProductStoreError('corrupt_data', `${name} is not valid UTF-8 text`)
+  const normalized = normalizeAndTruncateProviderEmail(decoded.value, EMAIL_BYTES)
+  const valid = normalized.value !== null && validMailAddress(normalized.value) ? normalized.value : null
+  return {
+    value: valid,
+    truncated: overflowed || decoded.clippedTerminalBytes || normalized.truncated || valid === null,
+  }
 }
 function timestampValue(row: Record<string, unknown>, prefix: string): string | null {
   const storageClass = row[`${prefix}_type`]
@@ -122,8 +150,8 @@ function timestampValue(row: Record<string, unknown>, prefix: string): string | 
 }
 function boundedBlobSelect(alias: string, column: string, output: string, maxBytes: number, fetchCeilingBytes: number): string {
   return `typeof(${alias}.${column}) AS ${output}_type,
-          CASE WHEN typeof(${alias}.${column})='text' AND octet_length(${alias}.${column})<=${fetchCeilingBytes}
-               THEN CAST(${alias}.${column} AS BLOB) ELSE NULL END AS ${output}_blob,
+          CASE WHEN typeof(${alias}.${column})='text'
+               THEN substr(CAST(${alias}.${column} AS BLOB),1,${fetchCeilingBytes}) ELSE NULL END AS ${output}_blob,
           CASE WHEN ${alias}.${column} IS NOT NULL AND octet_length(${alias}.${column})>${maxBytes} THEN 1 ELSE 0 END AS ${output}_overflow`
 }
 function boundedTimestampSelect(alias: string, column: string, output: string): string {
@@ -148,6 +176,10 @@ function eligibleSourcesJson(sources: EligibleInboxSource[]): string {
 
 interface HeaderRow extends Record<string, unknown> {}
 interface CandidateRow extends Record<string, unknown> {}
+export interface ThreadDetailProjectionHooks {
+  /** Deterministic WAL-race seam after selected-row authority has been read. */
+  afterSelectedRead?: () => void
+}
 
 function decodeSubject(row: HeaderRow): { value: string; truncated: boolean } {
   const normalized = boundedProviderText(row, 'subject', 'subject', SUBJECT_BYTES)
@@ -207,21 +239,22 @@ function candidateSql(conversationIndex: string): string {
 
 function bodySql(): string {
   return `SELECT typeof(body_text) AS body_type,
-          CASE WHEN typeof(body_text)='text' AND octet_length(body_text)<=${BODY_FETCH_BYTES}
-               THEN CAST(body_text AS BLOB) ELSE NULL END AS body_blob,
+          CASE WHEN typeof(body_text)='text'
+               THEN substr(CAST(body_text AS BLOB),1,${BODY_FETCH_BYTES}) ELSE NULL END AS body_blob,
           CASE WHEN body_text IS NOT NULL AND octet_length(body_text)>${BODY_PER_MESSAGE_BYTES} THEN 1 ELSE 0 END AS body_overflow
       FROM message_bodies WHERE message_id=?`
 }
 function recipientSql(recipientIndex: string): string {
-  return `SELECT id,
-          ${boundedBlobSelect('r', 'recipient_type', 'recipient_type', TYPE_BYTES, TYPE_FETCH_BYTES)},
+  return `SELECT ${boundedBlobSelect('r', 'recipient_type', 'recipient_type', TYPE_BYTES, TYPE_FETCH_BYTES)},
           ${boundedBlobSelect('r', 'display_name', 'recipient_name', NAME_BYTES, NAME_FETCH_BYTES)},
           ${boundedBlobSelect('r', 'email_address', 'recipient_email', EMAIL_BYTES, EMAIL_FETCH_BYTES)}
       FROM message_recipients r INDEXED BY ${quotedSqlIdentifier(recipientIndex)}
      WHERE r.message_id=? ORDER BY r.id ASC LIMIT ${METADATA_QUERY_LIMIT}`
 }
 function attachmentSql(attachmentIndex: string): string {
-  return `SELECT id, typeof(size) AS size_type, size,
+  return `SELECT typeof(size) AS size_type,
+          CASE WHEN typeof(size)='integer' AND size BETWEEN 0 AND ${SQLITE_MAX_SAFE_INTEGER} THEN size ELSE NULL END AS size_safe,
+          CASE WHEN size IS NOT NULL AND (typeof(size)!='integer' OR size<0 OR size>${SQLITE_MAX_SAFE_INTEGER}) THEN 1 ELSE 0 END AS size_invalid,
           ${boundedBlobSelect('a', 'filename', 'filename', FILENAME_BYTES, FILENAME_FETCH_BYTES)},
           ${boundedBlobSelect('a', 'mime_type', 'mime_type', MIME_BYTES, MIME_FETCH_BYTES)}
       FROM attachments a INDEXED BY ${quotedSqlIdentifier(attachmentIndex)}
@@ -234,8 +267,10 @@ function decodeBody(row: Record<string, unknown> | undefined): { text: string; u
   const overflowed = booleanSentinel(row.body_overflow, 'body_overflow')
   const bytes = blobBytes(row.body_blob, 'body_text')
   if (bytes === null) return { text: '', unavailable: false, truncated: true }
-  const normalized = normalizeAndTruncateProviderText(decodeUtf8Prefix(bytes, 'body_text'), BODY_PER_MESSAGE_BYTES)
-  return { text: normalized.value, unavailable: false, truncated: overflowed || normalized.truncated }
+  const decoded = decodeUtf8Prefix(bytes, 'body_text')
+  if (decoded.clippedTerminalBytes && !overflowed) throw new ProductStoreError('corrupt_data', 'body_text is not valid UTF-8 text')
+  const normalized = normalizeAndTruncateProviderText(decoded.value, BODY_PER_MESSAGE_BYTES)
+  return { text: normalized.value, unavailable: false, truncated: overflowed || decoded.clippedTerminalBytes || normalized.truncated }
 }
 function decodeRecipients(rows: Record<string, unknown>[]): { recipients: UnifiedThreadRecipient[]; truncated: boolean } {
   let truncated = rows.length > PER_MESSAGE_METADATA_LIMIT
@@ -270,7 +305,8 @@ function decodeAttachments(rows: Record<string, unknown>[]): { attachments: Unif
     let byteSize: number | null
     if (row.size_type === 'null') byteSize = null
     else if (row.size_type === 'integer') {
-      byteSize = Number.isSafeInteger(row.size) && Number(row.size) >= 0 ? row.size as number : null
+      byteSize = Number.isSafeInteger(row.size_safe) && Number(row.size_safe) >= 0 ? row.size_safe as number : null
+      if (booleanSentinel(row.size_invalid, 'attachment_size_invalid')) truncated = true
     } else {
       throw new ProductStoreError('corrupt_data', 'attachment size storage class must be integer or null')
     }
@@ -355,6 +391,7 @@ export function getUnifiedThreadInSnapshot(
   db: DatabaseSync,
   eligibleSources: EligibleInboxSource[],
   input: { messageId: number },
+  hooks: ThreadDetailProjectionHooks = {},
 ): UnifiedThreadDetail | null {
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
       (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null) ||
@@ -369,6 +406,10 @@ export function getUnifiedThreadInSnapshot(
   const conversationId = positiveInteger(selected.conversation_id, 'conversation_id')
   const sourceId = positiveInteger(selected.source_id, 'source_id')
   const selectedSubject = decodeSubject(selected)
+  if (hooks.afterSelectedRead !== undefined && typeof hooks.afterSelectedRead !== 'function') {
+    throw new ProductStoreError('invalid_input', 'afterSelectedRead hook must be a function')
+  }
+  hooks.afterSelectedRead?.()
 
   const candidateRows = db.prepare(candidateSql(capabilities.conversation)).all(conversationId) as CandidateRow[]
   const hasRow501 = candidateRows.length > 500

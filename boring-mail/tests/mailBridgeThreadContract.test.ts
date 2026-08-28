@@ -10,7 +10,7 @@ import type { UnifiedThreadDetail } from '../src/mail/store/product/types.js'
 function fixtureDetail(): UnifiedThreadDetail {
   return {
     selectedMessageId: 2,
-    subject: '\u0000Hello "thread" 😀',
+    subject: 'Hello "thread" 😀',
     historyTruncated: false,
     selectedOutsideRecentWindow: false,
     replyCapability: { allowed: false, reason: 'drafts_not_in_scope' },
@@ -20,7 +20,7 @@ function fixtureDetail(): UnifiedThreadDetail {
       sentAt: `2030-01-0${id} 00:00:00+00:00`,
       sender: { name: `Sender ${id}`, email: `sender-${id}@example.invalid` },
       recipients: [{ type: 'to', name: `Recipient ${id}`, email: `recipient-${id}@example.invalid` }],
-      bodyText: id === 2 ? 'selected reserve '.repeat(4096) : `body ${id} " \\ 😀 `.repeat(4096),
+      bodyText: id === 2 ? 'selected reserve '.repeat(1024) : `body ${id} " \\ 😀 `.repeat(512),
       bodyUnavailable: false,
       bodyTruncated: false,
       attachments: [{ filename: `file-${id}.txt`, mimeType: 'text/plain', byteSize: id }],
@@ -52,18 +52,28 @@ describe('mailBridgeThreadContract', () => {
     expect(Buffer.byteLength(JSON.stringify(output), 'utf8')).toBeLessThan(480 * 1024)
   })
 
+  it('rejects corrupt internal DTOs before browser mapping', () => {
+    const missingSelected = fixtureDetail()
+    missingSelected.messages = missingSelected.messages.map((message) => ({ ...message, selected: false }))
+    expect(() => mapUnifiedThreadToBrowserThread(missingSelected, 'bm1.2.fixture')).toThrow(/exactly one selected/)
+    const overBudget = fixtureDetail()
+    overBudget.messages[0].bodyText = 'x'.repeat(64 * 1024 + 1)
+    expect(() => mapUnifiedThreadToBrowserThread(overBudget, 'bm1.2.fixture')).toThrow(/64 KiB/)
+  })
+
   it('deterministically trims escaped hostile JSON while preserving the selected message body', () => {
     const detail = fixtureDetail()
+    detail.selectedMessageId = 13
     detail.messages = Array.from({ length: 25 }, (_, index) => ({
       messageId: index + 1,
       selected: index === 12,
       sentAt: `2030-01-${String(index + 1).padStart(2, '0')} 00:00:00+00:00`,
       sender: { name: '"'.repeat(512), email: `sender-${index}@example.invalid` },
-      recipients: Array.from({ length: 3 }, (_unused, recipient) => ({ type: 'to' as const, name: '😀'.repeat(128), email: `r-${index}-${recipient}@example.invalid` })),
-      bodyText: index === 12 ? 'SELECTED '.repeat(1024) : '"\\😀'.repeat(16 * 1024),
+      recipients: Array.from({ length: 2 }, (_unused, recipient) => ({ type: 'to' as const, name: '"'.repeat(512), email: `r-${index}-${recipient}@example.invalid` })),
+      bodyText: index === 12 ? 'SELECTED '.repeat(1024) : '"\\'.repeat(3072),
       bodyUnavailable: false,
       bodyTruncated: false,
-      attachments: Array.from({ length: 3 }, (_unused, attachment) => ({ filename: '"'.repeat(1024), mimeType: 'text/plain', byteSize: attachment })),
+      attachments: Array.from({ length: 2 }, (_unused, attachment) => ({ filename: '"'.repeat(1024), mimeType: 'text/plain', byteSize: attachment })),
       metadataTruncated: false,
     }))
     const output = mapUnifiedThreadToBrowserThread(detail, 'bm1.13.fixture')

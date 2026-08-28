@@ -12,6 +12,8 @@ import { ProductStoreError, type ReadSourceReconcileResult, type UnifiedInboxOpt
 export interface MsgvaultSnapshotHooks {
   /** Deterministic WAL-race seam after catalog capture/reconcile and before projection. */
   afterCatalogCapture?: () => void
+  /** Deterministic WAL-race seam after thread selected-row authority has been read. */
+  afterSelectedRead?: () => void
 }
 
 export function withMsgvaultReadSnapshot<T>(
@@ -71,7 +73,9 @@ export function getUnifiedThreadWithReconciledSnapshot(
     return withMsgvaultReadSnapshot(db, () => {
       productStore.reconcileMsgvaultReadSources(readMsgvaultGmailReadSourceSnapshot(db))
       hooks.afterCatalogCapture?.()
-      return getUnifiedThreadInSnapshot(db, productStore.connectedInboxSources(), input)
+      return getUnifiedThreadInSnapshot(db, productStore.connectedInboxSources(), input, {
+        afterSelectedRead: hooks.afterSelectedRead,
+      })
     })
   } catch (error) {
     if (error instanceof ProductStoreError && error.code === 'stale_cursor') {

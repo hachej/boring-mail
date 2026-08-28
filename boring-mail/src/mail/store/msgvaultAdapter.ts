@@ -167,7 +167,7 @@ const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
     'last_message_preview',
   ],
   participants: ['id', 'email_address', 'display_name'],
-  message_recipients: ['message_id', 'recipient_type', 'email_address'],
+  message_recipients: ['id', 'message_id', 'participant_id', 'recipient_type', 'display_name', 'email_address'],
   message_labels: ['message_id', 'label_id'],
   labels: ['id', 'name'],
   message_raw: ['message_id', 'raw_data', 'raw_format', 'compression'],
@@ -241,14 +241,17 @@ export function openMsgvaultStore(dbPath: string, opts: MsgvaultStoreOptions = {
       requireForeignKey(db, 'message_bodies', 'message_id', 'messages', 'id', columnErrors)
     }
     if (table === 'message_recipients') {
+      validateIntegerPrimaryKey(columns, table, columnErrors)
       integerAffinity(columns.find((column) => column.name === 'message_id'), 'message_recipients.message_id', true, columnErrors)
       integerAffinity(columns.find((column) => column.name === 'participant_id'), 'message_recipients.participant_id', true, columnErrors)
       textAffinity(columns.find((column) => column.name === 'recipient_type'), 'message_recipients.recipient_type', true, columnErrors)
+      textAffinity(columns.find((column) => column.name === 'display_name'), 'message_recipients.display_name', false, columnErrors)
       textAffinity(columns.find((column) => column.name === 'email_address'), 'message_recipients.email_address', false, columnErrors)
       requireForeignKey(db, 'message_recipients', 'message_id', 'messages', 'id', columnErrors)
       requireForeignKey(db, 'message_recipients', 'participant_id', 'participants', 'id', columnErrors)
     }
     if (table === 'attachments') {
+      validateIntegerPrimaryKey(columns, table, columnErrors)
       integerAffinity(columns.find((column) => column.name === 'message_id'), 'attachments.message_id', true, columnErrors)
       textAffinity(columns.find((column) => column.name === 'filename'), 'attachments.filename', false, columnErrors)
       textAffinity(columns.find((column) => column.name === 'mime_type'), 'attachments.mime_type', false, columnErrors)

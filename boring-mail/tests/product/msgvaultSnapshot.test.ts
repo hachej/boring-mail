@@ -47,7 +47,7 @@ describe('worker-owned msgvault snapshot orchestration', () => {
       expect(fresh.items.map((item) => item.messageId)).toEqual([2, 1])
       expect(getUnifiedThreadWithReconciledSnapshot(vault.db, product, { messageId: 1 })?.messages).toHaveLength(2)
       expect(() => getUnifiedThreadWithReconciledSnapshot(vault.db, product, { messageId: 1 }, {
-        afterCatalogCapture: () => writer.exec(`
+        afterSelectedRead: () => writer.exec(`
           INSERT INTO messages(id,conversation_id,source_id,rfc822_message_id,message_type,sent_at,subject,is_read,attachment_count)
             VALUES(3,1,1,'<race-detail@example.invalid>','email','2030-01-03 00:00:00+00:00','race',1,0);
         `),

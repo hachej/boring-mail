@@ -340,6 +340,24 @@ describe('msgvaultAdapter', () => {
     expect(() => openMsgvaultStore(missingRecipientsPath)).toThrow(
       /message_recipients missing column\(s\): recipient_type/,
     )
+
+    const missingRecipientDisplayNamePath = join(mkdtempSync(join(tmpdir(), 'msgvault-recipient-display-name-')), 'drift.db')
+    const missingRecipientDisplayName = new DatabaseSync(missingRecipientDisplayNamePath)
+    missingRecipientDisplayName.exec(SCHEMA.replace('  display_name TEXT,\n  email_address TEXT', '  email_address TEXT'))
+    missingRecipientDisplayName.close()
+    expect(() => openMsgvaultStore(missingRecipientDisplayNamePath)).toThrow(
+      /message_recipients missing column\(s\): display_name/,
+    )
+
+    for (const table of ['message_recipients', 'attachments'] as const) {
+      const path = join(mkdtempSync(join(tmpdir(), `msgvault-${table}-pk-`)), 'drift.db')
+      const db = new DatabaseSync(path)
+      db.exec(SCHEMA.replace(`CREATE TABLE ${table} (\n  id INTEGER PRIMARY KEY,`, `CREATE TABLE ${table} (\n  id INTEGER,`))
+      db.close()
+      expect(() => openMsgvaultStore(path)).toThrow(
+        new RegExp(`${table}\\.id must have INTEGER affinity and be the single primary key`),
+      )
+    }
     expect(() => openMsgvaultStore(join(tmpdir(), 'does-not-exist.db'))).toThrow(/REMEDIATION/)
   })
 
