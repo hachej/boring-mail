@@ -22,6 +22,66 @@ import {
 
 const SCHEMA = readFileSync(new URL('./fixtures/msgvault-v0.19.sql', import.meta.url), 'utf8')
 
+interface TableColumn { name: string; type: string; notnull: number; dflt_value: string | null; pk: number }
+interface ForeignKey { table: string; from: string; to: string; on_update: string; on_delete: string; match: string }
+const UPSTREAM_V0193_REQUIRED_COLUMNS: Record<string, string[]> = {
+  sources: ['id', 'source_type', 'identifier'],
+  participants: ['id', 'email_address', 'display_name', 'domain'],
+  conversations: ['id', 'source_id', 'source_conversation_id', 'conversation_type', 'title', 'message_count', 'unread_count', 'last_message_at', 'last_message_preview'],
+  messages: ['id', 'conversation_id', 'source_id', 'rfc822_message_id', 'message_type', 'sent_at', 'received_at', 'internal_date', 'sender_id', 'subject', 'snippet', 'is_read', 'attachment_count', 'deleted_at', 'deleted_from_source_at'],
+  account_identities: ['source_id', 'address', 'source_signal', 'confirmed_at'],
+  message_bodies: ['message_id', 'body_text', 'body_html'],
+  message_recipients: ['id', 'message_id', 'participant_id', 'recipient_type', 'display_name', 'email_address'],
+  labels: ['id', 'source_id', 'name'],
+  message_labels: ['message_id', 'label_id'],
+  message_raw: ['message_id', 'raw_data', 'raw_format', 'compression'],
+  attachments: ['id', 'message_id', 'filename', 'mime_type', 'size', 'content_hash', 'storage_path'],
+  messages_fts: ['message_id'],
+}
+const UPSTREAM_V0193_REQUIRED_PRIMARY_KEYS: Record<string, Array<{ name: string; pk: number }>> = {
+  sources: [{ name: 'id', pk: 1 }],
+  participants: [{ name: 'id', pk: 1 }],
+  conversations: [{ name: 'id', pk: 1 }],
+  messages: [{ name: 'id', pk: 1 }],
+  account_identities: [{ name: 'source_id', pk: 1 }, { name: 'address', pk: 2 }],
+  message_bodies: [{ name: 'message_id', pk: 1 }],
+  message_recipients: [{ name: 'id', pk: 1 }],
+  labels: [{ name: 'id', pk: 1 }],
+  message_labels: [{ name: 'message_id', pk: 1 }, { name: 'label_id', pk: 2 }],
+  message_raw: [{ name: 'message_id', pk: 1 }],
+  attachments: [{ name: 'id', pk: 1 }],
+}
+const UPSTREAM_V0193_REQUIRED_FOREIGN_KEYS: Record<string, ForeignKey[]> = {
+  conversations: [{ table: 'sources', from: 'source_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' }],
+  messages: [
+    { table: 'participants', from: 'sender_id', to: 'id', on_update: 'NO ACTION', on_delete: 'NO ACTION', match: 'NONE' },
+    { table: 'sources', from: 'source_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' },
+    { table: 'conversations', from: 'conversation_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' },
+  ],
+  account_identities: [{ table: 'sources', from: 'source_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' }],
+  message_bodies: [{ table: 'messages', from: 'message_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' }],
+  message_recipients: [
+    { table: 'participants', from: 'participant_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' },
+    { table: 'messages', from: 'message_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' },
+  ],
+  labels: [{ table: 'sources', from: 'source_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' }],
+  message_labels: [
+    { table: 'labels', from: 'label_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' },
+    { table: 'messages', from: 'message_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' },
+  ],
+  message_raw: [{ table: 'messages', from: 'message_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' }],
+  attachments: [{ table: 'messages', from: 'message_id', to: 'id', on_update: 'NO ACTION', on_delete: 'CASCADE', match: 'NONE' }],
+}
+
+function tableColumns(db: DatabaseSync, table: string): TableColumn[] {
+  return db.prepare(`PRAGMA table_info(${table})`).all() as unknown as TableColumn[]
+}
+function tableForeignKeys(db: DatabaseSync, table: string): ForeignKey[] {
+  return (db.prepare(`PRAGMA foreign_key_list(${table})`).all() as unknown as Array<ForeignKey & { id: number; seq: number }>)
+    .sort((left, right) => left.from.localeCompare(right.from))
+    .map(({ table, from, to, on_update, on_delete, match }) => ({ table, from, to, on_update, on_delete, match }))
+}
+
 function mimeMessage(opts: {
   from: string
   to: string
@@ -141,15 +201,23 @@ describe('msgvaultAdapter', () => {
     expect(() => openMsgvaultStore(path)).toThrow(/participants\.id must have INTEGER affinity and be the single primary key/)
   })
 
-  it('opens a structurally genuine msgvault v0.19.3 SQLite schema with required maintenance indexes', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'msgvault-genuine-v0193-')), 'genuine.db')
+  it('keeps the committed msgvault v0.19.3 fixture structurally equivalent for required tables and FKs', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'msgvault-committed-v0193-')), 'fixture.db')
     const genuine = new DatabaseSync(path)
-    genuine.exec(readFileSync('/tmp/pi-github-repos/kenn-io/msgvault@v0.19.3/internal/store/schema.sql', 'utf8'))
-    genuine.exec(readFileSync('/tmp/pi-github-repos/kenn-io/msgvault@v0.19.3/internal/store/schema_sqlite.sql', 'utf8'))
-    genuine.exec(`CREATE INDEX IF NOT EXISTS idx_messages_live_sent_at
-      ON messages(COALESCE(sent_at, received_at, internal_date) DESC, id DESC)
-      WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL`)
-    genuine.exec(`CREATE INDEX IF NOT EXISTS idx_messages_rfc822_message_id ON messages(rfc822_message_id)`)
+    genuine.exec(SCHEMA)
+    for (const [table, expectedColumns] of Object.entries(UPSTREAM_V0193_REQUIRED_COLUMNS)) {
+      const columns = tableColumns(genuine, table)
+      expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining(expectedColumns))
+    }
+    for (const [table, expectedPrimaryKeys] of Object.entries(UPSTREAM_V0193_REQUIRED_PRIMARY_KEYS)) {
+      expect(tableColumns(genuine, table).filter((column) => column.pk > 0).map((column) => ({
+        name: column.name,
+        pk: column.pk,
+      }))).toEqual(expectedPrimaryKeys)
+    }
+    for (const [table, expectedForeignKeys] of Object.entries(UPSTREAM_V0193_REQUIRED_FOREIGN_KEYS)) {
+      expect(tableForeignKeys(genuine, table)).toEqual(expectedForeignKeys.sort((left, right) => left.from.localeCompare(right.from)))
+    }
     genuine.close()
     const opened = openMsgvaultStore(path)
     opened.db.close()
