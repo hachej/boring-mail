@@ -229,14 +229,33 @@ exec sleep 10
     const executable = createExecutable(root, `console.log('Changes: 0 processed, 0 added')`)
     const hooks: Array<() => Promise<void>> = []
     const posts: string[] = []
-    const plugin = createBoringMailServerPlugin({ workspaceRoot: root, sync: { enabled: true, dbPath, executable } })
+    const plugin = createBoringMailServerPlugin({
+      workspaceRoot: root,
+      mode: 'live',
+      sync: { enabled: true, dbPath, executable },
+      mailRuntime: {
+        productDbPath: join(root, 'product', 'mail.db'),
+        msgvaultDbPath: dbPath,
+        openStore: async () => ({
+          outbox: {} as never,
+          upsertAccount: async () => undefined,
+          saveDraft: async () => { throw new Error('unused') },
+          getDraft: async () => null,
+          reconcileMsgvaultReadSources: async () => ({ inserted: 0, updated: 0, vanished: 0, generation: 'g' }),
+          setReadSourceEnabled: async () => undefined,
+          listUnifiedInbox: async () => ({ items: [], nextCursor: null }),
+          getUnifiedThread: async () => null,
+          close: async () => undefined,
+        }),
+      },
+    })
     await plugin.routes!({
-      log: { warn() {} },
+      log: { warn() {}, info() {}, error() {} },
       addHook(name: string, hook: () => Promise<void>) { if (name === 'onClose') hooks.push(hook) },
       post(path: string) { posts.push(path) },
     } as never, {} as never)
     try {
-      expect(posts).toEqual(['/api/boring-mail/drafts'])
+      expect(posts).toEqual([])
       expect(hooks).toHaveLength(1)
       expect(spawnSync('/usr/bin/flock', ['-n', '-E', '73', root, '/bin/true']).status).toBe(73)
     } finally {

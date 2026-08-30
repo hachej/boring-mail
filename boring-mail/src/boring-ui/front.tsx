@@ -3,6 +3,7 @@ import { definePlugin, type PaneProps, type WorkspaceSourceProps } from '@hachej
 import { MailSourcePane } from '../mail/client/MailSourcePane'
 import { MailThreadPanel } from '../mail/client/MailThreadPanel'
 import { MailDraftFilePanel } from '../mail/client/MailDraftFilePanel'
+import { BoringMailBridgeProvider } from '../mail/client/mailBridgeClient'
 import { findMockMailThread, mockMailThreads } from '../mail/mockData'
 import { BORING_MAIL_PLUGIN_ID, BORING_MAIL_THREAD_SURFACE_KIND } from '../mail/shared/constants'
 import type { MailThread } from '../shared/types'
@@ -63,6 +64,9 @@ export const boringMailBoringUiPlugin = definePlugin({
       component: BoringMailSource,
       source: 'app',
     },
+  ],
+  providers: [
+    { id: 'boring-mail.bridge-provider', component: BoringMailBridgeProvider },
   ],
   panels: [
     {

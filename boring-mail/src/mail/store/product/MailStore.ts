@@ -279,7 +279,7 @@ class RpcClient {
     worker.on('message', (message) => this.#message(message))
     worker.on('error', (error) => this.#fail(error))
     worker.on('exit', (code) => {
-      if (!this.#stopped) this.#fail(new Error(`mail store worker exited unexpectedly with code ${code}`))
+      if (!this.#stopped) this.#fail(new ProductStoreError('rpc_unavailable', `mail store worker exited unexpectedly with code ${code}`))
     })
   }
 
@@ -300,18 +300,19 @@ class RpcClient {
 
   #fail(error: Error): void {
     if (this.#stopped) return
+    const terminal = error instanceof ProductStoreError ? error : new ProductStoreError('rpc_unavailable', error.message)
     this.#stopped = true
     clearTimeout(this.#startupTimer)
-    this.#readyReject(error)
+    this.#readyReject(terminal)
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer)
-      pending.reject(error)
+      pending.reject(terminal)
     }
     this.#pending.clear()
-    if (error instanceof ProductStoreError && error.code === 'rpc_timeout') {
+    if (terminal instanceof ProductStoreError && (terminal.code === 'rpc_timeout' || terminal.code === 'rpc_unavailable')) {
       void this.worker.terminate(true)
     }
-    this.onFailure(error)
+    this.onFailure(terminal)
   }
 
   async call<M extends MailStoreMethod>(
@@ -319,7 +320,7 @@ class RpcClient {
     ...args: Parameters<MailStoreMethods[M]>
   ): Promise<ReturnType<MailStoreMethods[M]>> {
     await this.ready
-    if (this.#stopped) throw new Error('mail store worker is closed')
+    if (this.#stopped) throw new ProductStoreError('rpc_unavailable', 'mail store worker is closed')
     if (this.#pending.size >= this.limits.maxPendingRequests) {
       throw new ProductStoreError(
         'rpc_overloaded',
@@ -336,9 +337,8 @@ class RpcClient {
       try {
         this.worker.postMessage({ id, method, args } as RpcRequest)
       } catch (error) {
-        clearTimeout(timer)
-        this.#pending.delete(id)
-        rejectCall(error instanceof Error ? error : new Error(String(error)))
+        const terminal = new ProductStoreError('rpc_unavailable', error instanceof Error ? error.message : String(error))
+        this.#fail(terminal)
       }
     })
     return await result as ReturnType<MailStoreMethods[M]>
@@ -360,7 +360,7 @@ class RpcClient {
         clearTimeout(this.#startupTimer)
         for (const pending of this.#pending.values()) {
           clearTimeout(pending.timer)
-          pending.reject(new Error('mail store worker is closing'))
+          pending.reject(new ProductStoreError('rpc_unavailable', 'mail store worker is closing'))
         }
         this.#pending.clear()
       }
@@ -540,7 +540,7 @@ class MailStoreFacade implements MailStore {
   private async call<M extends MailStoreMethod>(
     method: M, ...args: Parameters<MailStoreMethods[M]>
   ): Promise<ReturnType<MailStoreMethods[M]>> {
-    if (this.#closed) throw new Error('MailStore reference is closed')
+    if (this.#closed) throw new ProductStoreError('rpc_unavailable', 'MailStore reference is closed')
     return this.entry.rpc.call(method, ...args)
   }
   upsertAccount(input: AccountInput): Promise<void> { return this.call('upsertAccount', input) }

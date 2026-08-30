@@ -195,6 +195,10 @@ describe('standalone deployment config', () => {
       workspaceRoot: fixtureRoot,
       trustTailnetHttp: false,
       sync: false,
+      mailRuntime: {
+        productDbPath: join(fixtureRoot, '.boring-mail', 'fixture', 'product', 'mail.db'),
+        msgvaultDbPath: join(fixtureRoot, '.boring-mail', 'fixture', 'msgvault', 'msgvault.db'),
+      },
     })
     const auth = createStandaloneHostAuth(config)
     expect(auth.viteServer.host).toBe('127.0.0.1')

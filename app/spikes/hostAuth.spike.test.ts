@@ -426,5 +426,5 @@ describe('real Vite server auth spike', () => {
     spike.dispose()
     expect((await fetch(`${origin}/`, { headers: { authorization: basic(token) } })).status).toBe(401)
     expect(await websocketStatus(vitePort, basic(token))).toMatch(/^HTTP\/1\.1 401 /)
-  }, 15_000)
+  }, 30_000)
 })

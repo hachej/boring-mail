@@ -271,6 +271,7 @@ export type ProductStoreErrorCode =
   | 'msgvault_unavailable'
   | 'stale_cursor'
   | 'rpc_timeout'
+  | 'rpc_unavailable'
   | 'rpc_overloaded'
 export class ProductStoreError extends Error {
   constructor(
