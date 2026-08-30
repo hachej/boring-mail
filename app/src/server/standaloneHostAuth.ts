@@ -43,6 +43,10 @@ export interface StandaloneDeploymentConfig {
   workspaceId: typeof OWNER_WORKSPACE_ID
   workspaceRoot: string
   sync: false | undefined
+  mailRuntime?: {
+    productDbPath: string
+    msgvaultDbPath: string
+  }
 }
 
 export interface ResolveStandaloneDeploymentOptions {
@@ -134,6 +138,7 @@ export function resolveStandaloneDeploymentConfig({ env = process.env, backendPo
   const fixtureRoot = mode === 'fixture' ? canonicalTemporaryFixtureRoot(requiredEnv(env, 'BORING_MAIL_FIXTURE_ROOT')) : undefined
   if (mode === 'fixture' && env.BORING_MAIL_TRUST_TAILNET_HTTP?.trim()) fail('BORING_MAIL_TRUST_TAILNET_HTTP is not allowed in fixture mode')
 
+  const workspaceRoot = fixtureRoot ?? resolve(defaultWorkspaceRoot)
   return {
     mode,
     tokenFile,
@@ -143,8 +148,14 @@ export function resolveStandaloneDeploymentConfig({ env = process.env, backendPo
     backendOrigin: `http://127.0.0.1:${backendPort}`,
     trustTailnetHttp: mode === 'live' && env.BORING_MAIL_TRUST_TAILNET_HTTP?.trim() === '1',
     workspaceId: OWNER_WORKSPACE_ID,
-    workspaceRoot: fixtureRoot ?? resolve(defaultWorkspaceRoot),
+    workspaceRoot,
     sync: mode === 'fixture' ? false : undefined,
+    ...(mode === 'fixture'
+      ? { mailRuntime: {
+          productDbPath: join(workspaceRoot, '.boring-mail', 'fixture', 'product', 'mail.db'),
+          msgvaultDbPath: join(workspaceRoot, '.boring-mail', 'fixture', 'msgvault', 'msgvault.db'),
+        } }
+      : {}),
   }
 }
 

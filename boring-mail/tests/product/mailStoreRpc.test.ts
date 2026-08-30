@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { EventEmitter } from 'node:events'
 import {
   linkSync,
   mkdtempSync,
@@ -29,6 +30,25 @@ const factory = (created: Worker[], workerData?: Record<string, unknown>): MailS
 }
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+class ThrowingPostTransport extends EventEmitter implements WorkerTransport {
+  terminateCalls: boolean[] = []
+
+  constructor() {
+    super()
+    queueMicrotask(() => this.emit('message', { type: 'ready' }))
+  }
+
+  postMessage(): void {
+    throw new Error('post failed')
+  }
+
+  async terminate(force?: boolean): Promise<number> {
+    this.terminateCalls.push(force === true)
+    this.emit('exit', 0)
+    return 0
+  }
+}
+
 describe('async MailStore worker RPC facade', () => {
   it('does not expose the synchronous worker implementation publicly', () => {
     expect(publicStoreApi).not.toHaveProperty('ProductStore')
@@ -47,7 +67,7 @@ describe('async MailStore worker RPC facade', () => {
     await expect(first.listUnifiedInbox({ limit: 10 })).resolves.toEqual({ items: [], nextCursor: null })
     await expect(first.getUnifiedThread({ messageId: 1 })).resolves.toBeNull()
     await first.close()
-    await expect(first.getDraft('closed-reference')).rejects.toThrow(/reference is closed/)
+    await expect(first.getDraft('closed-reference')).rejects.toMatchObject({ code: 'rpc_unavailable', message: 'MailStore reference is closed' })
     expect(await second.getDraft('still-alive')).toBeNull()
     await second.close()
     const reopened = await openMailStoreForTest({ productDbPath: db }, { workerFactory: make })
@@ -112,6 +132,27 @@ describe('async MailStore worker RPC facade', () => {
     })).rejects.toMatchObject({ code: 'rpc_timeout' })
     const healthy = await openMailStoreForTest({ productDbPath: db }, { workerFactory: factory([]) })
     await healthy.close()
+  })
+
+  it('shutdown rejects pending requests with typed rpc_unavailable', async () => {
+    const store = await openMailStoreForTest({ productDbPath: path() }, {
+      workerFactory: factory([]), requestTimeoutMs: 500,
+    })
+    const pending = store.getDraft('hang')
+    pending.catch(() => undefined)
+    await store.close()
+    await expect(pending).rejects.toMatchObject({ code: 'rpc_unavailable', message: 'mail store worker is closing' })
+  })
+
+  it('synchronous postMessage failure fail-stops, force-terminates, and permits typed reopen', async () => {
+    const db = path()
+    const broken = new ThrowingPostTransport()
+    const store = await openMailStoreForTest({ productDbPath: db }, { workerFactory: () => broken })
+    await expect(store.getDraft('post-fails')).rejects.toMatchObject({ code: 'rpc_unavailable', message: 'post failed' })
+    expect(broken.terminateCalls).toContain(true)
+    const reopened = await openMailStoreForTest({ productDbPath: db }, { workerFactory: factory([]) })
+    await store.close()
+    await reopened.close()
   })
 
   it('request timeout fail-stops all pending calls and permits reopen after disposal', async () => {

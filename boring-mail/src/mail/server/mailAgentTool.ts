@@ -15,8 +15,12 @@ export type MailToolAction =
   | 'move_draft'
   | 'mock_send'
 
+export type MailToolMode = 'live' | 'fixture'
+export const LIVE_MAIL_TOOL_REMEDIATION = 'Live mailbox reads are wired on the server bridge but are not visible in the browser until Slice 5; use this tool only for .mail.md draft-file work.'
+
 export interface MailToolOptions {
   workspaceRoot: string
+  mode?: MailToolMode
 }
 
 interface MailDraftFields {
@@ -89,11 +93,16 @@ async function listMailDrafts(root: string, dir = 'drafts'): Promise<Array<{ pat
   }
 }
 
-export function createMailAgentTool({ workspaceRoot }: MailToolOptions): AgentTool {
+export function createMailAgentTool({ workspaceRoot, mode = 'fixture' }: MailToolOptions): AgentTool {
+  const live = mode === 'live'
   return {
     name: 'mail',
-    description: 'Manage the Boring Mail workspace: search mock mail, inspect threads, and create/read/update/delete/move/send .mail.md draft files.',
-    promptSnippet: 'Use the mail tool for mail work. It supports actions: search, get_thread, list_drafts, create_draft, read_draft, update_draft, delete_draft, move_draft, mock_send. Drafts are real .mail.md files; opening them should use workspace.open.path.',
+    description: live
+      ? `Manage Boring Mail .mail.md draft files. search/get_thread are fixture-only and do not read live mail. ${LIVE_MAIL_TOOL_REMEDIATION}`
+      : 'Manage the Boring Mail workspace: search fixture mail, inspect fixture threads, and create/read/update/delete/move/send .mail.md draft files.',
+    promptSnippet: live
+      ? `Use the mail tool for .mail.md draft-file work only. search/get_thread are fixture-only and not live mailbox reads. ${LIVE_MAIL_TOOL_REMEDIATION}`
+      : 'Use the mail tool for mail work. It supports actions: search, get_thread, list_drafts, create_draft, read_draft, update_draft, delete_draft, move_draft, mock_send. Drafts are real .mail.md files; opening them should use workspace.open.path.',
     parameters: {
       type: 'object',
       required: ['action'],

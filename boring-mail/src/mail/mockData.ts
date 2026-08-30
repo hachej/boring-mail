@@ -1,4 +1,4 @@
-import type { MailThread } from '../shared/types'
+import type { MailThread } from '../shared/types.ts'
 
 const demoUser = { name: 'Alex Demo', email: 'alex.demo@example.test' }
 

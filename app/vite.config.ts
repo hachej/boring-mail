@@ -1,14 +1,14 @@
 import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import { AGENT_API_PORT, PLAYGROUND_WORKSPACE_ROOT, VITE_PORT, startBoringMailPlaygroundServer } from './src/server/dev'
-import { createStandaloneHostAuth, resolveStandaloneDeploymentConfig } from './src/server/standaloneHostAuth'
+import { AGENT_API_PORT, PLAYGROUND_WORKSPACE_ROOT, VITE_PORT, startBoringMailPlaygroundServer } from './src/server/dev.ts'
+import { createStandaloneHostAuth, resolveStandaloneDeploymentConfig } from './src/server/standaloneHostAuth.ts'
 
 const fsAllow = [
-  resolve(__dirname),
-  resolve(__dirname, '../boring-mail'),
+  resolve(import.meta.dirname),
+  resolve(import.meta.dirname, '../boring-mail'),
   // published @hachej deps live in the workspace-root node_modules
-  resolve(__dirname, '..'),
+  resolve(import.meta.dirname, '..'),
 ]
 
 export default defineConfig(({ command }) => {
@@ -32,11 +32,12 @@ export default defineConfig(({ command }) => {
       react(),
       {
         name: 'boring-mail-agent-backend',
-        async configureServer() {
-          await startBoringMailPlaygroundServer({
+        async configureServer(server) {
+          const backend = await startBoringMailPlaygroundServer({
             browserAuthPolicy: hostAuth.browserAuthPolicy,
             deployment,
           })
+          server.httpServer?.once('close', () => { void backend.close() })
         },
       },
       hostAuth.plugins[1],
