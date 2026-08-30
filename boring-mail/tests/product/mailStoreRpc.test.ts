@@ -45,6 +45,7 @@ describe('async MailStore worker RPC facade', () => {
     const result: DraftRecord | null = await first.getDraft('missing')
     expect(result).toBeNull()
     await expect(first.listUnifiedInbox({ limit: 10 })).resolves.toEqual({ items: [], nextCursor: null })
+    await expect(first.getUnifiedThread({ messageId: 1 })).resolves.toBeNull()
     await first.close()
     await expect(first.getDraft('closed-reference')).rejects.toThrow(/reference is closed/)
     expect(await second.getDraft('still-alive')).toBeNull()

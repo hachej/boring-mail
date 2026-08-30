@@ -33,6 +33,8 @@
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json && node scripts/smoke-mail-store-worker.mjs",
     "prebenchmark:unified-inbox": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json",
     "benchmark:unified-inbox": "node scripts/benchmark-unified-inbox.mjs",
+    "prebenchmark:thread-detail": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json",
+    "benchmark:thread-detail": "node scripts/benchmark-thread-detail.mjs",
     "smoke:msgvault-direct": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/smoke-msgvault-direct.mjs",
     "smoke:msgvault-direct:required": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/smoke-msgvault-required.mjs",
     "smoke:msgvault-required": "pnpm smoke:msgvault-direct:required",

@@ -1,16 +1,19 @@
 import { DatabaseSync } from 'node:sqlite'
 import {
   currentMsgvaultDataVersion,
+  getUnifiedThreadInSnapshot,
   listUnifiedInboxInSnapshot,
   type UnifiedInboxCursorAuthority,
 } from '../msgvaultAdapter.js'
 import { readMsgvaultGmailReadSourceSnapshot } from '../msgvault/readSources.js'
 import { ProductStore } from './ProductStore.js'
-import { ProductStoreError, type ReadSourceReconcileResult, type UnifiedInboxOptions, type UnifiedInboxPage } from './types.js'
+import { ProductStoreError, type ReadSourceReconcileResult, type UnifiedInboxOptions, type UnifiedInboxPage, type UnifiedThreadDetail } from './types.js'
 
 export interface MsgvaultSnapshotHooks {
   /** Deterministic WAL-race seam after catalog capture/reconcile and before projection. */
   afterCatalogCapture?: () => void
+  /** Deterministic WAL-race seam after thread selected-row authority has been read. */
+  afterSelectedRead?: () => void
 }
 
 export function withMsgvaultReadSnapshot<T>(
@@ -58,4 +61,26 @@ export function listUnifiedInboxWithReconciledSnapshot(
       options,
     )
   })
+}
+
+export function getUnifiedThreadWithReconciledSnapshot(
+  db: DatabaseSync,
+  productStore: ProductStore,
+  input: { messageId: number },
+  hooks: MsgvaultSnapshotHooks = {},
+): UnifiedThreadDetail | null {
+  try {
+    return withMsgvaultReadSnapshot(db, () => {
+      productStore.reconcileMsgvaultReadSources(readMsgvaultGmailReadSourceSnapshot(db))
+      hooks.afterCatalogCapture?.()
+      return getUnifiedThreadInSnapshot(db, productStore.connectedInboxSources(), input, {
+        afterSelectedRead: hooks.afterSelectedRead,
+      })
+    })
+  } catch (error) {
+    if (error instanceof ProductStoreError && error.code === 'stale_cursor') {
+      throw new ProductStoreError('msgvault_unavailable', 'msgvault changed while reading thread detail')
+    }
+    throw error
+  }
 }

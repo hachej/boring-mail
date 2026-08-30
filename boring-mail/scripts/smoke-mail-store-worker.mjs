@@ -148,6 +148,16 @@ try {
       !firstInboxPage.items[0].textTruncated.subject || !firstInboxPage.items[0].textTruncated.snippet) {
     throw new Error('emitted worker did not physically bound hostile provider text')
   }
+  const threadDetail = await store.getUnifiedThread({ messageId: firstInboxPage.items[0].messageId })
+  if (!threadDetail || threadDetail.selectedMessageId !== firstInboxPage.items[0].messageId ||
+      threadDetail.messages.length !== 3 || !threadDetail.messages.some((message) => message.selected) ||
+      Buffer.byteLength(threadDetail.subject, 'utf8') > 2048) {
+    throw new Error('public async thread detail did not return a bounded selected-source thread')
+  }
+  await store.getUnifiedThread({ messageId: 0 }).then(
+    () => { throw new Error('malformed thread detail id was accepted') },
+    (error) => { if (error?.code !== 'invalid_input') throw error },
+  )
   await store.listUnifiedInbox(null).then(
     () => { throw new Error('malformed unified inbox options were accepted') },
     (error) => { if (error?.code !== 'invalid_input') throw error },
@@ -306,12 +316,13 @@ try {
   const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)))
   symlinkSync(packageRoot, join(scope, 'boring-mail'), 'dir')
   writeFileSync(join(consumer, 'index.ts'), `
-    import { openMailStore, ProductStoreError, type DraftInput, type MailStore, type ReadSourceReconcileResult, type UnifiedInboxPage } from '@hachej/boring-mail/mail-store'
+    import { openMailStore, ProductStoreError, type DraftInput, type MailStore, type ReadSourceReconcileResult, type UnifiedInboxPage, type UnifiedThreadDetail } from '@hachej/boring-mail/mail-store'
     const draft: DraftInput = { kind: 'compose', path: 'x.mail.md', accountId: 'a', sendAsAddress: 'a@x', to: ['b@x'], subject: '', bodyMarkdown: '' }
     const opened: Promise<MailStore> = openMailStore({ productDbPath: '/tmp/example.db' })
     const page: Promise<UnifiedInboxPage> = opened.then((store) => store.listUnifiedInbox({ limit: 25 }))
     const reconcile: Promise<ReadSourceReconcileResult> = opened.then((store) => store.reconcileMsgvaultReadSources())
-    void draft; void opened; void page; void reconcile; void ProductStoreError
+    const thread: Promise<UnifiedThreadDetail | null> = opened.then((store) => store.getUnifiedThread({ messageId: 1 }))
+    void draft; void opened; void page; void reconcile; void thread; void ProductStoreError
   `)
   writeFileSync(join(consumer, 'tsconfig.json'), JSON.stringify({ compilerOptions: {
     strict: true, noEmit: true, target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', skipLibCheck: false,

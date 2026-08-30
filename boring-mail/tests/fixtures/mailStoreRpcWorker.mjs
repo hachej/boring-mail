@@ -27,6 +27,7 @@ if (workerData?.silentStartup) {
       reconcileMsgvaultReadSources: { inserted: 0, updated: 0, vanished: 0, generation: 'fixture' },
       setReadSourceEnabled: undefined,
       listUnifiedInbox: { items: [], nextCursor: null },
+      getUnifiedThread: null,
       listAttention: [],
       claimNext: null,
       close: undefined,

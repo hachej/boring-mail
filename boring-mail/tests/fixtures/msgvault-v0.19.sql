@@ -11,7 +11,7 @@ CREATE TABLE participants (
 );
 CREATE TABLE conversations (
   id INTEGER PRIMARY KEY,
-  source_id INTEGER NOT NULL REFERENCES sources(id),
+  source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
   source_conversation_id TEXT,
   conversation_type TEXT NOT NULL,
   title TEXT,
@@ -24,8 +24,8 @@ CREATE TABLE conversations (
 );
 CREATE TABLE messages (
   id INTEGER PRIMARY KEY,
-  conversation_id INTEGER NOT NULL REFERENCES conversations(id),
-  source_id INTEGER NOT NULL REFERENCES sources(id),
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
   source_message_id TEXT,
   rfc822_message_id TEXT,
   message_type TEXT NOT NULL,
@@ -47,21 +47,21 @@ CREATE INDEX idx_messages_live_sent_at
   ON messages(COALESCE(sent_at, received_at, internal_date) DESC, id DESC)
   WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL;
 CREATE TABLE account_identities (
-  source_id INTEGER NOT NULL,
+  source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
   address TEXT NOT NULL,
   source_signal TEXT NOT NULL DEFAULT '',
   confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY(source_id, address)
 );
 CREATE TABLE message_bodies (
-  message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+  message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
   body_text TEXT,
   body_html TEXT
 );
 CREATE TABLE message_recipients (
   id INTEGER PRIMARY KEY,
-  message_id INTEGER NOT NULL REFERENCES messages(id),
-  participant_id INTEGER NOT NULL REFERENCES participants(id),
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
   recipient_type TEXT NOT NULL,
   display_name TEXT,
   email_address TEXT
@@ -69,15 +69,15 @@ CREATE TABLE message_recipients (
 CREATE INDEX idx_message_recipients_message ON message_recipients(message_id);
 CREATE TABLE labels (
   id INTEGER PRIMARY KEY,
-  source_id INTEGER REFERENCES sources(id),
+  source_id INTEGER REFERENCES sources(id) ON DELETE CASCADE,
   source_label_id TEXT,
   name TEXT NOT NULL,
   label_type TEXT,
   system_role TEXT
 );
 CREATE TABLE message_labels (
-  message_id INTEGER NOT NULL REFERENCES messages(id),
-  label_id INTEGER NOT NULL REFERENCES labels(id),
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
   PRIMARY KEY (message_id, label_id)
 );
 CREATE TABLE message_raw (
@@ -89,7 +89,7 @@ CREATE TABLE message_raw (
 );
 CREATE TABLE attachments (
   id INTEGER PRIMARY KEY,
-  message_id INTEGER NOT NULL REFERENCES messages(id),
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
   filename TEXT,
   mime_type TEXT,
   size INTEGER,

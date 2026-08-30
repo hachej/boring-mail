@@ -29,6 +29,7 @@ import type {
   SentOutbox,
   UnifiedInboxOptions,
   UnifiedInboxPage,
+  UnifiedThreadDetail,
   UnknownOutbox,
 } from './types.js'
 import { ProductStoreError, type ProductStoreErrorCode } from './types.js'
@@ -94,6 +95,7 @@ export interface MailStore {
   reconcileMsgvaultReadSources(): Promise<ReadSourceReconcileResult>
   setReadSourceEnabled(sourceId: number, enabled: boolean): Promise<void>
   listUnifiedInbox(options?: UnifiedInboxOptions): Promise<UnifiedInboxPage>
+  getUnifiedThread(input: { messageId: number }): Promise<UnifiedThreadDetail | null>
   close(): Promise<void>
 }
 
@@ -554,6 +556,9 @@ class MailStoreFacade implements MailStore {
   }
   listUnifiedInbox(options?: UnifiedInboxOptions): Promise<UnifiedInboxPage> {
     return this.call('listUnifiedInbox', options)
+  }
+  getUnifiedThread(input: { messageId: number }): Promise<UnifiedThreadDetail | null> {
+    return this.call('getUnifiedThread', input)
   }
   async close(): Promise<void> {
     if (this.#closed) return

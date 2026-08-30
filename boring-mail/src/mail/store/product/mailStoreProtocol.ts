@@ -15,6 +15,7 @@ import type {
   SentOutbox,
   UnifiedInboxOptions,
   UnifiedInboxPage,
+  UnifiedThreadDetail,
   UnknownOutbox,
 } from './types.js'
 
@@ -30,6 +31,7 @@ export interface MailStoreMethods {
   reconcileMsgvaultReadSources: () => ReadSourceReconcileResult
   setReadSourceEnabled: (sourceId: number, enabled: boolean) => void
   listUnifiedInbox: (options?: UnifiedInboxOptions) => UnifiedInboxPage
+  getUnifiedThread: (input: { messageId: number }) => UnifiedThreadDetail | null
   getOutbox: (id: string) => OutboxRecord | null
   listAttention: (openOnly?: boolean) => AttentionItem[]
   enqueue: (draftId: string, operationKey: string) => OutboxRecord
